@@ -1,5 +1,9 @@
+mod economy;
 mod elements;
+mod goods;
 mod hex;
+mod movement;
+mod noot;
 mod rng;
 mod world;
 
@@ -7,6 +11,13 @@ use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::input::touch::Touch;
 use bevy::prelude::*;
 
+use economy::EconStats;
+use goods::{GoodCategory, GoodForm};
+use movement::tile_to_pixel;
+use noot::{
+    Brain, Home, Hunger, Inventory, Positional, Role, TilePos, Wallet, N_POSITIONAL, STARTING_BUCKS,
+};
+use rng::Rng;
 use world::{generate, ResourceRole, Terrain, World};
 
 // --- World generation knobs -------------------------------------------------
@@ -15,6 +26,10 @@ const SEED: u64 = 0xC0FFEE_1234;
 const COLS: i32 = 30;
 const ROWS: i32 = 22;
 const HEX_SIZE: f32 = 26.0;
+
+// --- Population -------------------------------------------------------------
+const N_REFINERS: usize = 6;
+const N_CONSUMERS: usize = 32;
 
 // --- Camera limits ----------------------------------------------------------
 const MIN_ZOOM: f32 = 0.3;
@@ -26,7 +41,17 @@ const BTN_HOVER: Color = Color::srgba(0.20, 0.20, 0.26, 0.92);
 const BTN_PRESSED: Color = Color::srgba(0.28, 0.45, 0.30, 0.95);
 
 #[derive(Resource)]
-struct Sim(World);
+pub struct Sim(pub World);
+
+#[derive(Resource)]
+pub struct SimRng(pub Rng);
+
+/// How tile coordinates map to world pixels (map centred on the origin).
+#[derive(Resource, Clone, Copy)]
+pub struct MapView {
+    pub offset: Vec2,
+    pub hex_size: f32,
+}
 
 #[derive(Component)]
 struct HudText;
@@ -51,11 +76,19 @@ fn main() {
             }),
             ..default()
         }))
+        .init_resource::<EconStats>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
                 simulate,
+                economy::income,
+                economy::hunger_tick,
+                movement::movement,
+                economy::extract,
+                economy::refine,
+                economy::meet_and_trade,
+                economy::consume,
                 touch_camera,
                 keyboard_mouse_camera,
                 invest_buttons,
@@ -119,9 +152,99 @@ fn setup(
         ));
     }
 
+    commands.insert_resource(MapView { offset, hex_size });
+
+    // Spawn the noots.
+    let mut sim_rng = Rng::new(world.seed ^ 0xA5A5_5A5A);
+    let noot_mesh = meshes.add(Circle::new(hex_size * 0.28));
+    let owner_mat = materials.add(Color::srgb(0.95, 0.78, 0.25));
+    let refiner_mat = materials.add(Color::srgb(0.30, 0.60, 0.95));
+    let consumer_mat = materials.add(Color::srgb(0.40, 0.85, 0.45));
+
+    // One owner seeded onto each deposit (so extraction can start).
+    for di in 0..world.deposits.len() {
+        let tile = world.deposits[di].tile;
+        let (col, row) = (world.tiles[tile].col, world.tiles[tile].row);
+        spawn_noot(
+            &mut commands,
+            noot_mesh.clone(),
+            owner_mat.clone(),
+            Role::Owner { deposit: di },
+            col,
+            row,
+            sim_rng.below(6),
+            tile_to_pixel(col, row, hex_size, offset),
+        );
+    }
+    // Refiners and consumers at random tiles.
+    for _ in 0..N_REFINERS {
+        let (col, row) = random_tile(&mut sim_rng, &world);
+        spawn_noot(
+            &mut commands,
+            noot_mesh.clone(),
+            refiner_mat.clone(),
+            Role::Refiner,
+            col,
+            row,
+            sim_rng.below(6),
+            tile_to_pixel(col, row, hex_size, offset),
+        );
+    }
+    for _ in 0..N_CONSUMERS {
+        let (col, row) = random_tile(&mut sim_rng, &world);
+        spawn_noot(
+            &mut commands,
+            noot_mesh.clone(),
+            consumer_mat.clone(),
+            Role::Consumer,
+            col,
+            row,
+            sim_rng.below(6),
+            tile_to_pixel(col, row, hex_size, offset),
+        );
+    }
+
     spawn_ui(&mut commands);
 
+    commands.insert_resource(SimRng(sim_rng));
     commands.insert_resource(Sim(world));
+}
+
+fn random_tile(rng: &mut Rng, world: &World) -> (i32, i32) {
+    (
+        rng.below(world.cols as usize) as i32,
+        rng.below(world.rows as usize) as i32,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_noot(
+    commands: &mut Commands,
+    mesh: Handle<Mesh>,
+    material: Handle<ColorMaterial>,
+    role: Role,
+    col: i32,
+    row: i32,
+    heading: usize,
+    pixel: Vec2,
+) {
+    commands.spawn((
+        Mesh2d(mesh),
+        MeshMaterial2d(material),
+        Transform::from_xyz(pixel.x, pixel.y, 2.0),
+        role,
+        TilePos { col, row },
+        Home { col, row },
+        Inventory::new(),
+        Wallet {
+            bucks: STARTING_BUCKS,
+        },
+        Hunger::starving(),
+        Positional {
+            stock: [0.0; N_POSITIONAL],
+        },
+        Brain::new(heading),
+    ));
 }
 
 fn spawn_ui(commands: &mut Commands) {
@@ -143,13 +266,13 @@ fn spawn_ui(commands: &mut Commands) {
                     padding: UiRect::all(Val::Px(8.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
             ))
             .with_children(|panel| {
                 panel.spawn((
                     Text::new("loading..."),
                     TextFont {
-                        font_size: 15.0,
+                        font_size: 14.0,
                         ..default()
                     },
                     TextColor(Color::WHITE),
@@ -272,10 +395,7 @@ fn keyboard_mouse_camera(
 /// Tapping an element button (or pressing 1-4) invests tech into that element,
 /// raising the efficiency of its deposits.
 fn invest_buttons(
-    mut buttons: Query<
-        (&Interaction, &ElementButton, &mut BackgroundColor),
-        Changed<Interaction>,
-    >,
+    mut buttons: Query<(&Interaction, &ElementButton, &mut BackgroundColor), Changed<Interaction>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut sim: ResMut<Sim>,
 ) {
@@ -311,54 +431,91 @@ fn invest(world: &mut World, slot: usize) {
 
 fn update_hud(
     sim: Res<Sim>,
+    stats: Res<EconStats>,
+    noots: Query<(&Role, &Wallet, &Hunger)>,
     mut hud: Query<&mut Text, (With<HudText>, Without<ButtonLabel>)>,
     mut labels: Query<(&mut Text, &ButtonLabel), Without<HudText>>,
 ) {
     let world = &sim.0;
 
+    // Aggregate noot stats.
+    let (mut owners, mut refiners, mut consumers) = (0u32, 0u32, 0u32);
+    let mut total_bucks = 0.0f32;
+    let mut appetite_sum = 0.0f32;
+    let mut count = 0u32;
+    for (role, wallet, hunger) in &noots {
+        match role {
+            Role::Owner { .. } => owners += 1,
+            Role::Refiner => refiners += 1,
+            Role::Consumer => consumers += 1,
+        }
+        total_bucks += wallet.bucks;
+        appetite_sum += hunger.staple.iter().sum::<f32>() / hunger.staple.len() as f32;
+        count += 1;
+    }
+    let avg_appetite = if count > 0 {
+        appetite_sum / count as f32
+    } else {
+        0.0
+    };
+
     if let Ok(mut text) = hud.single_mut() {
         let mut out = format!(
-            "econ-sim   seed {:#x}   map {}x{} hex\ndrag to pan · pinch to zoom · tap an element to invest\n\n",
-            world.seed, world.cols, world.rows
+            "econ-sim  seed {:#x}  noots {}  trades {}  in circulation ₦{:.0}\n\
+             {} owners · {} refiners · {} consumers   avg appetite {:.1}\n\
+             drag to pan · pinch to zoom · tap an element to invest in extraction\n\n",
+            world.seed, count, stats.trades_total, total_bucks, owners, refiners, consumers,
+            avg_appetite
         );
-        for (slot, element) in world.chosen.iter().enumerate() {
-            let name = elements::element(element.id).name;
-            let role = match element.role {
+        for slot in 0..4 {
+            let ce = &world.chosen[slot];
+            let elem = elements::element(ce.id);
+            let good = &world.goods.goods[slot];
+            let category = match good.category {
+                GoodCategory::Staple => "staple",
+                GoodCategory::Positional => "posit ",
+            };
+            let (form, good_name) = match good.form {
+                GoodForm::Raw => ("raw    ", elem.name),
+                GoodForm::Refined => ("refined", elem.refined),
+            };
+            let resource = match ce.role {
                 ResourceRole::Replenishable => "REPL",
                 ResourceRole::Finite => "FIN ",
             };
-            let sites = world.deposit_count(slot);
-            match world.remaining_fraction(slot) {
-                Some(frac) => out.push_str(&format!(
-                    "{}. {:<9} {}  stock {:>8.0}  x{:.2}  left {:>3.0}%  ({} sites)\n",
-                    slot + 1,
-                    name,
-                    role,
-                    element.stockpile,
-                    element.efficiency,
-                    frac * 100.0,
-                    sites
-                )),
-                None => out.push_str(&format!(
-                    "{}. {:<9} {}  stock {:>8.0}  x{:.2}            ({} sites)\n",
-                    slot + 1,
-                    name,
-                    role,
-                    element.stockpile,
-                    element.efficiency,
-                    sites
-                )),
-            }
+            let avail: f64 = world
+                .deposits
+                .iter()
+                .filter(|d| d.element_slot == slot)
+                .map(|d| d.available())
+                .sum();
+            let item = goods::item_index(slot, good.form);
+            let price = stats.last_price[item];
+            let tail = match world.remaining_fraction(slot) {
+                Some(frac) => format!("left {:>3.0}%", frac * 100.0),
+                None => format!("stock {:>4.0}", avail),
+            };
+            out.push_str(&format!(
+                "{}. {:<9} {}/{}  {}  ₦{:>3.0}  x{:.2}  {}\n",
+                slot + 1,
+                good_name,
+                category,
+                form,
+                resource,
+                price,
+                ce.efficiency,
+                tail
+            ));
         }
         text.0 = out;
     }
 
     for (mut text, label) in &mut labels {
-        if let Some(element) = world.chosen.get(label.0) {
+        if let Some(ce) = world.chosen.get(label.0) {
             text.0 = format!(
                 "{}\n+eff x{:.2}",
-                elements::element(element.id).name,
-                element.efficiency
+                elements::element(ce.id).name,
+                ce.efficiency
             );
         }
     }

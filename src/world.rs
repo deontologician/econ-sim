@@ -4,10 +4,14 @@
 //! A world draws four elements from the pool and assigns each a resource role:
 //! two are *replenishable* (regenerate at a slow steady rate, boostable by tech)
 //! and two are *finite* (a large fixed stock extracted with diminishing returns
-//! that tech can only partly offset). Roles are assigned per playthrough, so the
-//! same element can be replenishable in one world and finite in another.
+//! that tech can only partly offset). Roles are assigned per playthrough.
+//!
+//! Resources are **labor-gated**: deposits hold an extractable `stock` that
+//! `World::tick` only *regrows* (for replenishables). Turning stock into carried
+//! goods happens via [`World::extract_from`], called when an owner noot works.
 
 use crate::elements::{element_count, ElementId};
+use crate::goods::{self, WorldGoods};
 use crate::hex::neighbors;
 use crate::rng::Rng;
 
@@ -23,7 +27,7 @@ pub enum ResourceRole {
     Finite,
 }
 
-/// Difficult terrain throttles both growth and extraction.
+/// Difficult terrain throttles growth, extraction, and movement.
 pub fn terrain_factor(t: Terrain) -> f32 {
     match t {
         Terrain::Easy => 1.0,
@@ -34,10 +38,10 @@ pub fn terrain_factor(t: Terrain) -> f32 {
 pub struct ChosenElement {
     pub id: ElementId,
     pub role: ResourceRole,
-    /// Total units accumulated into the world stockpile so far.
-    pub stockpile: f64,
-    /// Tech multiplier applied to this element's deposits. Starts at 1.0.
+    /// Tech multiplier: boosts replenishable growth and finite extraction. Starts 1.0.
     pub efficiency: f32,
+    /// Cumulative units pulled out of the ground (HUD stat).
+    pub extracted_total: f64,
 }
 
 pub struct Tile {
@@ -48,14 +52,14 @@ pub struct Tile {
 }
 
 pub enum DepositKind {
-    /// Generates `rate` units/sec (before efficiency and terrain), indefinitely.
-    Replenishable { rate: f32 },
-    /// Holds a large fixed stock; extraction slows as the stock is depleted.
-    Finite {
-        remaining: f64,
-        initial: f64,
-        base_rate: f32,
+    /// Standing `stock` regrows toward `capacity` at `rate` (× efficiency × terrain).
+    Replenishable {
+        rate: f32,
+        stock: f64,
+        capacity: f64,
     },
+    /// A large fixed stock; extraction slows as it is depleted, never regrows.
+    Finite { remaining: f64, initial: f64 },
 }
 
 pub struct Deposit {
@@ -66,6 +70,16 @@ pub struct Deposit {
     pub kind: DepositKind,
 }
 
+impl Deposit {
+    /// Units currently available to extract.
+    pub fn available(&self) -> f64 {
+        match &self.kind {
+            DepositKind::Replenishable { stock, .. } => *stock,
+            DepositKind::Finite { remaining, .. } => *remaining,
+        }
+    }
+}
+
 pub struct World {
     pub seed: u64,
     pub cols: i32,
@@ -74,6 +88,7 @@ pub struct World {
     pub tiles: Vec<Tile>,
     pub chosen: Vec<ChosenElement>,
     pub deposits: Vec<Deposit>,
+    pub goods: WorldGoods,
 }
 
 const DEPOSITS_PER_ELEMENT: usize = 3;
@@ -81,37 +96,61 @@ const SMOOTHING_PASSES: usize = 4;
 const INITIAL_DIFFICULT_CHANCE: f32 = 0.45;
 
 impl World {
-    /// Advance the resource simulation by `dt` seconds.
+    /// Advance the resource simulation by `dt` seconds. Only regrows
+    /// replenishable deposits; extraction is driven by agents.
     pub fn tick(&mut self, dt: f32) {
         for di in 0..self.deposits.len() {
             let slot = self.deposits[di].element_slot;
-            let tile = self.deposits[di].tile;
-            let tf = terrain_factor(self.tiles[tile].terrain);
+            let tf = terrain_factor(self.tiles[self.deposits[di].tile].terrain);
             let eff = self.chosen[slot].efficiency;
-
-            match &mut self.deposits[di].kind {
-                DepositKind::Replenishable { rate } => {
-                    let gained = (*rate * eff * tf * dt) as f64;
-                    self.chosen[slot].stockpile += gained;
-                }
-                DepositKind::Finite {
-                    remaining,
-                    initial,
-                    base_rate,
-                } => {
-                    if *remaining > 0.0 {
-                        // Throughput falls off with the fraction remaining, so
-                        // efficiency raises the early take but the deposit still
-                        // trends toward zero and eventually runs dry.
-                        let frac = (*remaining / *initial) as f32;
-                        let mut extracted = (*base_rate * eff * tf * frac * dt) as f64;
-                        extracted = extracted.min(*remaining);
-                        *remaining -= extracted;
-                        self.chosen[slot].stockpile += extracted;
-                    }
-                }
+            if let DepositKind::Replenishable {
+                rate,
+                stock,
+                capacity,
+            } = &mut self.deposits[di].kind
+            {
+                let room = (*capacity - *stock).max(0.0);
+                // Logistic-ish: growth tapers as the deposit fills.
+                let growth =
+                    *rate as f64 * eff as f64 * tf as f64 * dt as f64 * (room / *capacity);
+                *stock = (*stock + growth).min(*capacity);
             }
         }
+    }
+
+    /// Pull up to `base_work * dt` units (scaled by efficiency/terrain, and by
+    /// remaining fraction for finite deposits) out of a deposit. Returns the
+    /// amount extracted, which the caller adds to a noot's inventory.
+    pub fn extract_from(&mut self, di: usize, base_work: f32, dt: f32) -> f64 {
+        let slot = self.deposits[di].element_slot;
+        let tf = terrain_factor(self.tiles[self.deposits[di].tile].terrain);
+        let eff = self.chosen[slot].efficiency;
+
+        let taken = match &mut self.deposits[di].kind {
+            DepositKind::Replenishable { stock, .. } => {
+                // Replenishable harvest is gated by available stock, not tech;
+                // tech instead speeds regrowth (see `tick`).
+                let want = (base_work * tf * dt) as f64;
+                let take = want.min(*stock);
+                *stock -= take;
+                take
+            }
+            DepositKind::Finite {
+                remaining, initial, ..
+            } => {
+                if *remaining <= 0.0 {
+                    0.0
+                } else {
+                    let frac = (*remaining / *initial) as f32;
+                    let want = (base_work * eff * tf * frac * dt) as f64;
+                    let take = want.min(*remaining);
+                    *remaining -= take;
+                    take
+                }
+            }
+        };
+        self.chosen[slot].extracted_total += taken;
+        taken
     }
 
     /// Aggregate fraction of finite stock remaining for an element slot, or
@@ -126,7 +165,6 @@ impl World {
             if let DepositKind::Finite {
                 remaining: r,
                 initial: i,
-                ..
             } = &dep.kind
             {
                 remaining += *r;
@@ -155,7 +193,7 @@ pub fn generate(seed: u64, cols: i32, rows: i32, hex_size: f32) -> World {
     let mut ids: Vec<usize> = (0..element_count()).collect();
     rng.shuffle(&mut ids);
 
-    // Assign roles per world: exactly two replenishable, two finite.
+    // Assign resource roles per world: exactly two replenishable, two finite.
     let mut roles = [
         ResourceRole::Replenishable,
         ResourceRole::Replenishable,
@@ -168,10 +206,13 @@ pub fn generate(seed: u64, cols: i32, rows: i32, hex_size: f32) -> World {
         .map(|i| ChosenElement {
             id: ElementId(ids[i]),
             role: roles[i],
-            stockpile: 0.0,
             efficiency: 1.0,
+            extracted_total: 0.0,
         })
         .collect();
+
+    // Assign consumption roles (staple/positional x raw/refined) to the slots.
+    let world_goods = goods::assign(&mut rng);
 
     let tiles = generate_terrain(&mut rng, cols, rows);
     let mut world = World {
@@ -182,6 +223,7 @@ pub fn generate(seed: u64, cols: i32, rows: i32, hex_size: f32) -> World {
         tiles,
         chosen,
         deposits: Vec::new(),
+        goods: world_goods,
     };
     place_deposits(&mut rng, &mut world);
     world
@@ -255,15 +297,19 @@ fn place_deposits(rng: &mut Rng, world: &mut World) {
                 break;
             };
             let kind = match role {
-                ResourceRole::Replenishable => DepositKind::Replenishable {
-                    rate: rng.range(0.6, 1.8),
-                },
+                ResourceRole::Replenishable => {
+                    let capacity = rng.range(30.0, 60.0) as f64;
+                    DepositKind::Replenishable {
+                        rate: rng.range(0.6, 1.8),
+                        stock: capacity * 0.5,
+                        capacity,
+                    }
+                }
                 ResourceRole::Finite => {
                     let initial = rng.range(800.0, 1600.0) as f64;
                     DepositKind::Finite {
                         remaining: initial,
                         initial,
-                        base_rate: rng.range(6.0, 12.0),
                     }
                 }
             };
