@@ -110,11 +110,73 @@ pub fn update_rates(time: Res<Time>, mut stats: ResMut<EconStats>) {
     }
 }
 
-pub fn income(time: Res<Time>, mut wallets: Query<&mut Wallet>) {
-    let d = BUCKS_INCOME * time.delta_secs();
+pub fn income(time: Res<Time>, ctrl: Res<IncomeControl>, mut wallets: Query<&mut Wallet>) {
+    let d = ctrl.rate * time.delta_secs();
     for mut w in &mut wallets {
         w.bucks += d;
     }
+}
+
+// --- Universal-income controller (targets a tiny sales "inflation") ---------
+/// Target growth in total sale value, minute over minute (0.1% / min).
+pub const TARGET_INFLATION_PER_MIN: f32 = 0.001;
+/// Measurement/control window — one minute, per the inflation definition.
+const INCOME_WINDOW: f32 = 60.0;
+/// Integral gain: `rate += INCOME_K * (target − measured)` each window.
+const INCOME_K: f32 = 0.4;
+/// EMA smoothing on the measured inflation (window-to-window sales are noisy).
+const INCOME_MEAS_ALPHA: f32 = 0.5;
+const INCOME_RATE_MIN: f32 = 0.0;
+const INCOME_RATE_MAX: f32 = 3.0;
+
+/// Trims the universal income so total trade value grows at roughly
+/// `TARGET_INFLATION_PER_MIN`. Inflation is measured as this minute's summed sale
+/// value vs. the previous minute's. `meet_and_trade` accumulates `this_window`.
+#[derive(Resource)]
+pub struct IncomeControl {
+    /// Current universal income (bucks/sec/noot) — what `income` pays out.
+    pub rate: f32,
+    /// Smoothed measured inflation (fractional sales growth per minute).
+    pub measured_inflation: f32,
+    /// Sale value (bucks) summed over the current window.
+    pub this_window: f64,
+    last_window: f64,
+    have_prev: bool,
+    elapsed: f32,
+}
+
+impl Default for IncomeControl {
+    fn default() -> Self {
+        Self {
+            rate: BUCKS_INCOME,
+            measured_inflation: TARGET_INFLATION_PER_MIN,
+            this_window: 0.0,
+            last_window: 0.0,
+            have_prev: false,
+            elapsed: 0.0,
+        }
+    }
+}
+
+pub fn income_controller(time: Res<Time>, mut ctrl: ResMut<IncomeControl>) {
+    ctrl.elapsed += time.delta_secs();
+    if ctrl.elapsed < INCOME_WINDOW {
+        return;
+    }
+    let this = ctrl.this_window;
+    // Need a previous (non-empty) minute to define growth; otherwise just rotate.
+    if ctrl.have_prev && ctrl.last_window > 0.0 {
+        let inflation = ((this - ctrl.last_window) / ctrl.last_window) as f32;
+        ctrl.measured_inflation += INCOME_MEAS_ALPHA * (inflation - ctrl.measured_inflation);
+        // Integral control: more income → more spending → faster sales growth, so
+        // raise income when inflation is below target and cut it when above.
+        let error = TARGET_INFLATION_PER_MIN - ctrl.measured_inflation;
+        ctrl.rate = (ctrl.rate + INCOME_K * error).clamp(INCOME_RATE_MIN, INCOME_RATE_MAX);
+    }
+    ctrl.last_window = this;
+    ctrl.have_prev = true;
+    ctrl.this_window = 0.0;
+    ctrl.elapsed = 0.0;
 }
 
 // --- Hunger-rate PID (targets a steady death rate) --------------------------
@@ -426,6 +488,7 @@ struct Tx {
 pub fn meet_and_trade(
     sim: Res<Sim>,
     mut stats: ResMut<EconStats>,
+    mut income: ResMut<IncomeControl>,
     mut q: Query<(
         Entity,
         &Transform,
@@ -495,6 +558,7 @@ pub fn meet_and_trade(
                 snaps[si].bucks += price;
                 snaps[si].inv[item] -= 1.0;
                 stats.trades_total += 1;
+                income.this_window += price as f64;
                 // EWMA of realized sale prices (lazy-init to the first sample).
                 stats.ewma_price[item] = if stats.ewma_price[item] <= 0.0 {
                     price

@@ -6,6 +6,7 @@ mod icon;
 mod movement;
 mod noot;
 mod rng;
+mod save;
 mod world;
 
 use bevy::input::mouse::AccumulatedMouseScroll;
@@ -55,8 +56,9 @@ const BTN_GAP: f32 = 8.0;
 const VALUE_BTN_TOP: f32 = PAUSE_BTN_MARGIN + PAUSE_BTN_H + BTN_GAP;
 const TERRAIN_BTN_TOP: f32 = VALUE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const NOOT_BTN_TOP: f32 = TERRAIN_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
+const NEW_BTN_TOP: f32 = NOOT_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 /// Bottom edge of the whole button column (taps above this are UI, not the map).
-const BTN_COLUMN_BOTTOM: f32 = NOOT_BTN_TOP + PAUSE_BTN_H;
+const BTN_COLUMN_BOTTOM: f32 = NEW_BTN_TOP + PAUSE_BTN_H;
 
 const BTN_OFF: Color = Color::srgba(0.12, 0.12, 0.12, 0.85);
 const VALUE_BTN_ON: Color = Color::srgba(0.62, 0.22, 0.16, 0.9);
@@ -109,6 +111,9 @@ struct TerrainButton;
 /// Cycles the noot-colouring mode (touch equivalent of the N key).
 #[derive(Component)]
 struct NootColorButton;
+/// Clears the save and rerolls a fresh world (touch equivalent of the G key).
+#[derive(Component)]
+struct NewWorldButton;
 /// Caption on the noot-colouring button, kept in sync with the active mode.
 #[derive(Component)]
 struct NootColorLabel;
@@ -214,6 +219,7 @@ fn main() {
         .init_resource::<Paused>()
         .init_resource::<Overlays>()
         .init_resource::<NootColoring>()
+        .init_resource::<economy::IncomeControl>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -225,6 +231,7 @@ fn main() {
                 (
                     simulate,
                     economy::income,
+                    economy::income_controller,
                     economy::hunger_tick,
                     economy::hunger_pid,
                     economy::age_noots,
@@ -246,6 +253,7 @@ fn main() {
                     follow_selected,
                     pause_controls,
                     overlay_controls,
+                    new_world_controls,
                     fit_camera_to_screen,
                 ),
                 (
@@ -306,7 +314,11 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut fonts: ResMut<Assets<Font>>,
 ) {
-    let world = generate(random_seed(), COLS, ROWS, HEX_SIZE);
+    // Reuse the saved world seed across reloads (so rule tweaks replay the same
+    // map); otherwise roll a fresh one and persist it. The "New" button clears it.
+    let seed = save::load().map_or_else(random_seed, |s| s.seed);
+    save::store(&save::Save { seed });
+    let world = generate(seed, COLS, ROWS, HEX_SIZE);
     let hex_size = world.hex_size;
     let n_tiles = (world.cols * world.rows) as usize;
 
@@ -635,6 +647,7 @@ fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4], font: &Handle<F
     // Overlay toggles, stacked under the pause button (same touch-target size).
     spawn_overlay_button(commands, font, "Value", VALUE_BTN_TOP, ValueButton);
     spawn_overlay_button(commands, font, "Terrain", TERRAIN_BTN_TOP, TerrainButton);
+    spawn_overlay_button(commands, font, "New", NEW_BTN_TOP, NewWorldButton);
 
     // Noot-colouring cycle button (caption shows the active mode).
     commands
@@ -984,6 +997,18 @@ fn pick_selection(
     }
 }
 
+/// G key or the "New" button: clear the saved seed and reload, starting a fresh
+/// world. (Reloading re-runs setup, which rolls and persists a new seed.)
+fn new_world_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    button: Query<&Interaction, (Changed<Interaction>, With<NewWorldButton>)>,
+) {
+    if keys.just_pressed(KeyCode::KeyG) || button.iter().any(|i| *i == Interaction::Pressed) {
+        save::clear();
+        save::reload_page();
+    }
+}
+
 /// Drive the inspection controls: V/Value toggles the value heat overlay, T/Terrain
 /// the difficulty overlay, and N/Noots cycles how noots are coloured. Keeps the
 /// hidden hex cells and the button captions/tints in sync.
@@ -1273,6 +1298,7 @@ fn update_hud(
     stats: Res<EconStats>,
     paused: Res<Paused>,
     hunger_ctrl: Res<HungerControl>,
+    income_ctrl: Res<economy::IncomeControl>,
     noots: Query<(&Wallet, &Hunger, &Trader, &Claim)>,
     mut hud: Query<&mut Text, (With<HudText>, Without<ResourceLine>)>,
     mut lines: Query<(&ResourceLine, &mut Text), Without<HudText>>,
@@ -1312,11 +1338,14 @@ fn update_hud(
              starving {}/{} ({:.0}%)   production {:.1}/s   consumption {:.1}/s\n\
              trade margin ₦{:.1}/s   utility {:.1}/s\n\
              deaths {:.2}/min → target {:.2}   hunger rate {:.2}\n\
-             drag to pan · pinch to zoom · tap a noot/deposit to follow · V/T/N overlays\n\n",
+             income ₦{:.2}/s   sales infl {:+.2}%/min → target {:.1}%\n\
+             drag to pan · pinch to zoom · tap a noot/deposit · V/T/N overlays · G new\n\n",
             world.seed, count, stats.trades_total, total_bucks, claimed, n_deposits, avg_appetite,
             avg_discount, starving, count, starving_pct, stats.production_rate,
             stats.consumption_rate, stats.merchant_profit_rate, stats.utility_rate,
-            hunger_ctrl.measured_per_min, hunger_ctrl.target_per_min, hunger_ctrl.rate
+            hunger_ctrl.measured_per_min, hunger_ctrl.target_per_min, hunger_ctrl.rate,
+            income_ctrl.rate, income_ctrl.measured_inflation * 100.0,
+            economy::TARGET_INFLATION_PER_MIN * 100.0
         );
         text.0 = out;
     }

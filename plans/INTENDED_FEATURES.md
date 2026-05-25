@@ -13,12 +13,27 @@ design. Newest first within each section.
 
 ---
 
+## Persistence
+
+### Save / load / migrations
+- **NOW**: the world **seed** is saved to `localStorage` behind a versioned,
+  migratable envelope (`save.rs`); reloads replay the same map (so you can tweak
+  rules and compare), and the "New" button / G clears it for a fresh world. Only the
+  seed is persisted — the simulation restarts on the fixed map. *(partial)*
+- **INTENDED**: snapshot live state too (noot positions/inventories/wallets/learned
+  value fields/claims, deposit stocks, controller state, stats) so a reload *resumes*
+  rather than restarts; explicit save slots; export/import. Each schema bump adds a
+  `migrate` arm so old saves upgrade in place.
+- **STATUS**: partial
+
 ## Economy
 
 ### Consumer income / wages
-- **NOW**: every noot gets a flat universal bucks trickle (`BUCKS_INCOME`/sec) so
-  consumers don't go broke and demand keeps circulating. A reborn noot restarts with
-  the starting wallet. *(stub)*
+- **NOW**: every noot gets a universal bucks trickle so consumers don't go broke and
+  demand keeps circulating. The rate is **controlled** (`IncomeControl`): an integral
+  loop trims it so total sale value grows at a target ~0.1%/min ("inflation" = this
+  minute's summed sales vs. last minute's). A reborn noot restarts with the starting
+  wallet (a separate, uncontrolled money injection). *(stub)*
 - **INTENDED**: no free money. Noots earn bucks only by producing/selling, doing
   paid work (transport, refining, hauling), or a real labor market. Bucks should
   be conserved except where minted by a defined mechanism. Retiring the trickle

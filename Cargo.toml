@@ -8,7 +8,7 @@ bevy = "0.18"
 
 # Web-only: hide the loading screen once Bevy boots, and draw an entropy seed.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "DomTokenList"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "DomTokenList", "Storage", "Location"] }
 js-sys = "0.3"
 
 # Build dependencies with optimizations even in dev so the sim runs smoothly,
