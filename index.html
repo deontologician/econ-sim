@@ -2,7 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
     <title>econ-sim</title>
     <link
       data-trunk
@@ -19,12 +22,19 @@
         height: 100%;
         overflow: hidden;
         background: #14181f;
+        /* Mobile: stop the page from scrolling/bouncing so gestures reach the game. */
+        overscroll-behavior: none;
+        -webkit-user-select: none;
+        user-select: none;
       }
       canvas {
         display: block;
         width: 100%;
         height: 100%;
         outline: none;
+        /* Let the game handle all touch gestures (pan/pinch), not the browser. */
+        touch-action: none;
+        -webkit-tap-highlight-color: transparent;
       }
     </style>
   </head>
