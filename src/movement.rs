@@ -5,23 +5,23 @@
 //! neighbour), banking any reward earned on the tile it leaves and folding it into
 //! the estimate, so productive regions pull future movement. Owners are the
 //! exception: when sold out they home to their deposit to extract a fresh load,
-//! then rejoin the value-driven wander to sell it. Merchants free-roam like
-//! everyone else, their field shaped by buy/resale rewards.
+//! then rejoin the value-driven wander to sell it. Noots without a claim free-roam,
+//! claiming the first unowned deposit they cross.
 
 use bevy::prelude::*;
 
 use crate::goods::{self, GoodForm};
 use crate::hex::{hex_center, neighbors};
-use crate::noot::{Inventory, Role, RouteMemory, TilePos};
+use crate::noot::{Claim, Inventory, RouteMemory, TilePos};
 use crate::world::{terrain_factor, World};
 use crate::{MapView, Sim, SimRng};
 
 const BASE_STEP_TIME: f32 = 0.35;
 /// Chance of a random (exploratory) step instead of the greedy value step.
 const EPSILON: f32 = 0.12;
-/// Owners extract until carrying this much raw, then tour to sell it.
+/// A claim-holder mines until carrying this much of its raw good, then tours to sell.
 const LOAD_THRESHOLD: f32 = 6.0;
-/// Owners head back to refill once their raw stock falls to this.
+/// A claim-holder heads back to its deposit to refill once raw stock falls to this.
 const SELL_DONE: f32 = 1.0;
 /// Value differences below this count as a tie (broken at random).
 const VALUE_EPS: f32 = 1e-4;
@@ -48,14 +48,14 @@ pub fn movement(
         &mut TilePos,
         &mut RouteMemory,
         &mut Transform,
-        &Role,
+        &Claim,
         &Inventory,
     )>,
 ) {
     let world = &sim.0;
     let dt = time.delta_secs();
 
-    for (mut pos, mut mem, mut transform, role, inv) in &mut noots {
+    for (mut pos, mut mem, mut transform, claim, inv) in &mut noots {
         // Smoothly glide the sprite toward the current tile centre.
         let target = tile_to_pixel(pos.col, pos.row, world.hex_size, view.offset);
         let t = (dt * 8.0).min(1.0);
@@ -68,8 +68,10 @@ pub fn movement(
         }
 
         let from = tile_idx(world, pos.col, pos.row);
-        let next = match *role {
-            Role::Owner { deposit } => {
+        let next = match claim.deposit {
+            // A noot with a claim cycles deposit ↔ buyers: mine until loaded, then
+            // value-walk to sell, then home to refill once sold out.
+            Some(deposit) => {
                 let slot = world.deposits[deposit].element_slot;
                 let raw = goods::item_index(slot, GoodForm::Raw);
                 let stock = inv.items[raw];
@@ -90,7 +92,8 @@ pub fn movement(
                     Some(value_step(&mut rng.0, world, &mem.value, pos.col, pos.row))
                 }
             }
-            _ => Some(value_step(&mut rng.0, world, &mem.value, pos.col, pos.row)),
+            // No claim yet: free-roam (and `claim_deposits` grabs any it crosses).
+            None => Some(value_step(&mut rng.0, world, &mem.value, pos.col, pos.row)),
         };
 
         if let Some((c, r)) = next {

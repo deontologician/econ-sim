@@ -14,40 +14,49 @@ pub const STAPLE_SATIATION: f32 = 10.0;
 pub const SATISFIED_FRACTION: f32 = 0.3;
 /// At or above this fraction of satiation a staple counts as "starving".
 pub const STARVING_FRACTION: f32 = 0.9;
-/// Owners stop extracting once carrying this much of their raw good.
+/// A noot stops extracting its claimed deposit once carrying this much raw good.
 pub const CARRY_CAP: f32 = 20.0;
 
-// --- Transporters (free-roaming merchant arbitrage) -------------------------
-/// A merchant's starting "fixed guess" discount on anticipated resale value — how
-/// much of a good's market price it dares pay to acquire surplus.
+// --- Trade / arbitrage (every noot can buy surplus to resell) ---------------
+/// A noot's starting "fixed guess" discount on anticipated resale value — how much
+/// of a good's market price it dares pay to acquire surplus for resale.
 pub const DISCOUNT_INIT: f32 = 0.5;
-/// Discount floor/ceiling: a merchant never pays under `MIN` or over `MAX` of a
-/// good's market ask to buy surplus.
+/// Discount floor/ceiling: a noot never pays under `MIN` or over `MAX` of a good's
+/// market ask to buy surplus.
 pub const DISCOUNT_MIN: f32 = 0.2;
 pub const DISCOUNT_MAX: f32 = 0.95;
-/// How fast the learned discount moves: up toward `MAX` on a sale (success breeds
-/// optimism), down toward `MIN` on a buy (exposure breeds caution).
+/// How fast the learned discount moves: up toward `MAX` on a profitable sale
+/// (success breeds optimism), down toward `MIN` on a buy (exposure breeds caution).
 pub const DISCOUNT_LR: f32 = 0.04;
 
-#[derive(Component, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Owner { deposit: usize },
-    Refiner,
-    Consumer,
-    Transporter,
+/// Marker on every noot entity (distinguishes them from tile/deposit/UI meshes).
+#[derive(Component)]
+pub struct Noot;
+
+/// Which deposit a noot has claimed and may mine, if any. Claims are sticky: a
+/// noot keeps its first claim and ignores other unowned deposits it passes.
+#[derive(Component)]
+pub struct Claim {
+    pub deposit: Option<usize>,
 }
 
-/// A transporter's merchant state. It buys surplus on its own account at
-/// `discount × market ask`, carries it, and resells at the market ask for the
-/// spread. `discount` is learned (see `DISCOUNT_LR`); `cost_basis` is the
-/// running average price paid per held item, so realized margin = ask − basis.
+impl Claim {
+    pub fn new(deposit: Option<usize>) -> Self {
+        Self { deposit }
+    }
+}
+
+/// Every noot's trading state. Beyond consuming, a noot with spare cash buys
+/// surplus on its own account at `discount × market ask`, carries it, and resells
+/// for the spread. `discount` is learned (see `DISCOUNT_LR`); `cost_basis` is the
+/// running average price paid per held item, so realized margin = price − basis.
 #[derive(Component)]
-pub struct Merchant {
+pub struct Trader {
     pub discount: f32,
     pub cost_basis: [f32; N_ITEMS],
 }
 
-impl Merchant {
+impl Trader {
     pub fn new() -> Self {
         Self {
             discount: DISCOUNT_INIT,
@@ -153,7 +162,7 @@ pub struct RouteMemory {
     active: Vec<usize>,
     /// Reward accrued on the current tile, credited on the next step.
     pub pending_reward: f32,
-    /// Owners only: heading back to the deposit to extract a fresh load.
+    /// For a noot with a claim: heading back to its deposit to extract a load.
     pub homing: bool,
     /// Seconds until the next tile step.
     pub move_cooldown: f32,

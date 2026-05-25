@@ -47,14 +47,13 @@ design. Newest first within each section.
   variable quantities. Base prices are still per-good constants under the discount.
 - **STATUS**: partial
 
-### Transporters (free-roaming merchants)
-- **NOW**: transporters are independent **merchants** (`Merchant`, Plan 005 —
-  replaced the old principal–agent `HaulContract`). They free-roam on their learned
-  value field, buy surplus on their own account at `discount × base_ask`, carry it,
-  and resell at `base_ask` for the spread (reservation = cost basis, so margins are
-  non-negative). The `discount` is learned: up on a sale, down on a buy, so the
-  population self-regulates around the available spread. Merchants don't eat/starve.
-  *(partial)*
+### Trade / arbitrage (no merchant role)
+- **NOW**: there is no transporter/merchant role — arbitrage is a universal noot
+  behavior (`Trader`, Plans 005→007). A fed noot with spare cash buys surplus at
+  `discount × base_ask` and resells at `base_ask` for the spread (resale floored at
+  cost basis, so margins are non-negative). The `discount` is learned: up on a
+  profitable sale, down on a buy, so noots self-sort into active arbitrageurs vs
+  cautious subsisters. The old principal–agent `HaulContract` is gone. *(partial)*
 - **INTENDED**: richer price-setting than a fixed base + learned discount (real
   bid/ask, negotiation), inventory/working-capital limits, competition and
   congestion effects, and arbitrage across genuinely spatial prices rather than the
@@ -70,10 +69,12 @@ design. Newest first within each section.
 - **STATUS**: partial
 
 ### Ownership
-- **NOW**: "start on a deposit ⇒ own it"; we deliberately seed one owner noot onto
-  each deposit so extraction can happen. *(partial)*
-- **INTENDED**: emergent land claims, buying/selling deposits, contested
-  ownership, inheritance of claims.
+- **NOW**: emergent claims (Plan 007). Deposits start unowned; a claimless noot
+  standing on an unclaimed deposit claims it (sticky — keeps its first), and only
+  the claimant may mine it. A claim frees when its holder dies. One noot is seeded
+  per deposit at spawn so mining starts immediately. *(partial)*
+- **INTENDED**: buying/selling deposits, contested ownership, inheritance of claims,
+  and richer claim lifecycles (abandonment, multiple holdings, defense).
 - **STATUS**: partial
 
 ## Agents (noots)
@@ -122,9 +123,9 @@ design. Newest first within each section.
   ε-greedily up the gradient toward where it has earned reward. Reward = staple
   welfare from eating **+** scaled selling income, banked per-tile and folded in on
   each step; the eligibility trace credits whole routes, not just the reward tile.
-  Owners home to their deposit to refill, then value-walk to sell; consumers/refiners
-  value-walk to learn where to buy and sell. Transporters still run on contracts and
-  don't train their field yet. *(partial)*
+  Every noot trains the same field (Plan 007): a claim-holder homes to its deposit
+  to refill then value-walks to sell; a claimless noot value-walks to find food,
+  buyers, and surplus to flip. *(partial)*
 - **INTENDED**: richer *state* than position alone (local memory of observed
   prices/inventories, who's nearby), function approximation instead of a full
   per-hex table, and merchant transporters that learn arbitrage routes (pass 2).

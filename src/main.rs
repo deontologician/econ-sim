@@ -15,7 +15,7 @@ use bevy::window::PrimaryWindow;
 use economy::{EconStats, HungerControl};
 use goods::{GoodCategory, GoodForm};
 use movement::tile_to_pixel;
-use noot::{Hunger, Inventory, Merchant, Role, RouteMemory, TilePos, Wallet, STARTING_BUCKS};
+use noot::{Claim, Hunger, Inventory, Noot, RouteMemory, TilePos, Trader, Wallet, STARTING_BUCKS};
 use rng::Rng;
 use world::{generate, ResourceRole, Terrain, World};
 
@@ -25,12 +25,11 @@ const ROWS: i32 = 22;
 const HEX_SIZE: f32 = 26.0;
 
 // --- Population -------------------------------------------------------------
-const N_REFINERS: usize = 6;
-const N_CONSUMERS: usize = 32;
-const N_TRANSPORTERS: usize = 6;
+/// Free-roaming noots spawned in addition to one seeded onto each deposit.
+const N_ROAMERS: usize = 44;
 
 /// Seconds a noot can sit fully starving (all staples maxed) before it dies and
-/// is reborn as a fresh agent of the same role.
+/// is reborn fresh at a random tile (its deposit claim, if any, is released).
 const DEATH_GRACE_SECS: f32 = 20.0;
 
 // --- Camera limits ----------------------------------------------------------
@@ -125,6 +124,7 @@ fn main() {
                     .run_if(sim_running),
                 (
                     movement::movement,
+                    economy::claim_deposits,
                     economy::extract,
                     economy::refine,
                     economy::meet_and_trade,
@@ -195,10 +195,10 @@ fn setup(
     let hex_size = world.hex_size;
     let n_tiles = (world.cols * world.rows) as usize;
 
-    // Mortal population (merchants don't starve): owners + refiners + consumers.
-    let n_eaters = (world.deposits.len() + N_REFINERS + N_CONSUMERS) as f32;
+    // Every noot is mortal now; the PID targets a death rate over the whole roster.
+    let n_noots = (world.deposits.len() + N_ROAMERS) as f32;
     commands.insert_resource(HungerControl::new(
-        economy::TARGET_DEATH_FRAC_PER_MIN * n_eaters,
+        economy::TARGET_DEATH_FRAC_PER_MIN * n_noots,
     ));
 
     // Centre the map on the origin and pick an initial zoom that fits a typical
@@ -259,77 +259,39 @@ fn setup(
         SelectionRing,
     ));
 
-    // Spawn the noots.
+    // Spawn the noots — one seeded onto each deposit (pre-claimed, so mining can
+    // start immediately), the rest free-roaming and unclaimed. Ownership is
+    // otherwise emergent: a roamer claims the first unclaimed deposit it crosses.
     let mut sim_rng = Rng::new(world.seed ^ 0xA5A5_5A5A);
     let noot_mesh = meshes.add(Circle::new(hex_size * 0.28));
-    let owner_mat = materials.add(Color::srgb(0.95, 0.78, 0.25));
-    let refiner_mat = materials.add(Color::srgb(0.30, 0.60, 0.95));
-    let consumer_mat = materials.add(Color::srgb(0.40, 0.85, 0.45));
-    let transporter_mat = materials.add(Color::srgb(0.85, 0.45, 0.85));
+    let noot_mat = materials.add(Color::srgb(0.40, 0.85, 0.45));
 
-    // One owner seeded onto each deposit (so extraction can start).
     for di in 0..world.deposits.len() {
         let tile = world.deposits[di].tile;
         let (col, row) = (world.tiles[tile].col, world.tiles[tile].row);
         spawn_noot(
             &mut commands,
             noot_mesh.clone(),
-            owner_mat.clone(),
-            Role::Owner { deposit: di },
+            noot_mat.clone(),
+            Some(di),
             col,
             row,
             n_tiles,
             tile_to_pixel(col, row, hex_size, offset),
         );
     }
-    // Refiners and consumers at random tiles.
-    for _ in 0..N_REFINERS {
+    for _ in 0..N_ROAMERS {
         let (col, row) = random_tile(&mut sim_rng, &world);
         spawn_noot(
             &mut commands,
             noot_mesh.clone(),
-            refiner_mat.clone(),
-            Role::Refiner,
+            noot_mat.clone(),
+            None,
             col,
             row,
             n_tiles,
             tile_to_pixel(col, row, hex_size, offset),
         );
-    }
-    for _ in 0..N_CONSUMERS {
-        let (col, row) = random_tile(&mut sim_rng, &world);
-        spawn_noot(
-            &mut commands,
-            noot_mesh.clone(),
-            consumer_mat.clone(),
-            Role::Consumer,
-            col,
-            row,
-            n_tiles,
-            tile_to_pixel(col, row, hex_size, offset),
-        );
-    }
-    // Transporters: free-roaming merchants, spawned at random tiles.
-    for _ in 0..N_TRANSPORTERS {
-        let (col, row) = random_tile(&mut sim_rng, &world);
-        commands.spawn((
-            Mesh2d(noot_mesh.clone()),
-            MeshMaterial2d(transporter_mat.clone()),
-            Transform::from_xyz(
-                tile_to_pixel(col, row, hex_size, offset).x,
-                tile_to_pixel(col, row, hex_size, offset).y,
-                2.0,
-            ),
-            Role::Transporter,
-            TilePos { col, row },
-            Inventory::new(),
-            Wallet {
-                bucks: STARTING_BUCKS,
-            },
-            Hunger::fresh(),
-            RouteMemory::new(n_tiles, false),
-            Merchant::new(),
-        ));
     }
 
     spawn_ui(&mut commands);
@@ -350,19 +312,21 @@ fn spawn_noot(
     commands: &mut Commands,
     mesh: Handle<Mesh>,
     material: Handle<ColorMaterial>,
-    role: Role,
+    claim: Option<usize>,
     col: i32,
     row: i32,
     n_tiles: usize,
     pixel: Vec2,
 ) {
-    // Owners start homed to their deposit so they extract a first load before touring.
-    let homing = matches!(role, Role::Owner { .. });
+    // A pre-claimed noot starts homed to its deposit so it mines a first load.
+    let homing = claim.is_some();
     commands.spawn((
         Mesh2d(mesh),
         MeshMaterial2d(material),
         Transform::from_xyz(pixel.x, pixel.y, 2.0),
-        role,
+        Noot,
+        Claim::new(claim),
+        Trader::new(),
         TilePos { col, row },
         Inventory::new(),
         Wallet {
@@ -485,8 +449,8 @@ fn pause_controls(
 }
 
 /// A noot that has sat fully starving for `DEATH_GRACE_SECS` dies and is reborn
-/// as a fresh agent of the same role: owners back on their deposit, everyone else
-/// at a random tile, with a full wallet, empty inventory and half hunger.
+/// fresh at a random tile — full wallet, empty inventory, half hunger, no claim
+/// (its deposit, if any, is released for someone else to claim).
 // The respawn touches most of a noot's state at once; a wide query is inherent.
 #[allow(clippy::type_complexity)]
 fn death_and_respawn(
@@ -496,11 +460,12 @@ fn death_and_respawn(
     view: Res<MapView>,
     mut ctrl: ResMut<HungerControl>,
     mut q: Query<(
-        &Role,
         &mut Hunger,
         &mut Inventory,
         &mut Wallet,
         &mut RouteMemory,
+        &mut Trader,
+        &mut Claim,
         &mut TilePos,
         &mut Transform,
     )>,
@@ -508,11 +473,8 @@ fn death_and_respawn(
     let dt = time.delta_secs();
     let world = &sim.0;
     let n_tiles = (world.cols * world.rows) as usize;
-    for (role, mut hunger, mut inv, mut wallet, mut mem, mut pos, mut tf) in &mut q {
-        // Merchants don't eat, so they never starve to death.
-        if matches!(role, Role::Transporter) {
-            continue;
-        }
+    for (mut hunger, mut inv, mut wallet, mut mem, mut trader, mut claim, mut pos, mut tf) in &mut q
+    {
         if hunger.fully_starving() {
             hunger.starving_secs += dt;
         } else {
@@ -525,21 +487,15 @@ fn death_and_respawn(
         // A death: feed it back to the hunger-rate controller.
         ctrl.deaths_since_update += 1;
 
-        // Reincarnate: a fresh agent of the same role steps in.
+        // Reincarnate a fresh, unclaimed noot at a random tile.
         *inv = Inventory::new();
         wallet.bucks = STARTING_BUCKS;
         *hunger = Hunger::fresh();
-        *mem = RouteMemory::new(n_tiles, matches!(role, Role::Owner { .. }));
-        let (col, row) = match role {
-            Role::Owner { deposit } => {
-                let t = world.deposits[*deposit].tile;
-                (world.tiles[t].col, world.tiles[t].row)
-            }
-            _ => (
-                rng.0.below(world.cols as usize) as i32,
-                rng.0.below(world.rows as usize) as i32,
-            ),
-        };
+        *mem = RouteMemory::new(n_tiles, false);
+        *trader = Trader::new();
+        claim.deposit = None;
+        let col = rng.0.below(world.cols as usize) as i32;
+        let row = rng.0.below(world.rows as usize) as i32;
         pos.col = col;
         pos.row = row;
         let p = tile_to_pixel(col, row, view.hex_size, view.offset);
@@ -636,7 +592,7 @@ fn pick_selection(
     touches: Res<Touches>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
-    noots: Query<(Entity, &Transform, &Role)>,
+    noots: Query<(Entity, &Transform), With<Noot>>,
     view: Res<MapView>,
     mut selection: ResMut<Selection>,
 ) {
@@ -685,7 +641,7 @@ fn pick_selection(
             continue;
         };
         let mut best: Option<(Entity, f32)> = None;
-        for (e, tf, _role) in &noots {
+        for (e, tf) in &noots {
             let d2 = tf.translation.truncate().distance_squared(world_pos);
             if d2 <= pick_r2 && best.is_none_or(|(_, bd)| d2 < bd) {
                 best = Some((e, d2));
@@ -698,7 +654,7 @@ fn pick_selection(
 /// Keep the camera centred on the selected noot (a manual pan clears it).
 fn follow_selected(
     selection: Res<Selection>,
-    noots: Query<&Transform, (With<Role>, Without<Camera2d>)>,
+    noots: Query<&Transform, (With<Noot>, Without<Camera2d>)>,
     mut camera: Query<&mut Transform, With<Camera2d>>,
 ) {
     let Some(e) = selection.0 else {
@@ -719,7 +675,7 @@ fn follow_selected(
 /// Show/hide and reposition the highlight ring on the selected noot.
 fn update_selection_ring(
     selection: Res<Selection>,
-    noots: Query<&Transform, (With<Role>, Without<SelectionRing>)>,
+    noots: Query<&Transform, (With<Noot>, Without<SelectionRing>)>,
     mut ring: Query<(&mut Transform, &mut Visibility), With<SelectionRing>>,
 ) {
     let Ok((mut ring_tf, mut visibility)) = ring.single_mut() else {
@@ -738,7 +694,7 @@ fn update_selection_ring(
 fn update_selection_panel(
     selection: Res<Selection>,
     sim: Res<Sim>,
-    noots: Query<(&Role, &Wallet, &Hunger, &Inventory, Option<&Merchant>)>,
+    noots: Query<(&Claim, &Trader, &Wallet, &Hunger, &Inventory)>,
     mut panel: Query<&mut Text, With<SelectionText>>,
 ) {
     let Ok(mut text) = panel.single_mut() else {
@@ -749,29 +705,25 @@ fn update_selection_panel(
         text.0 = stale.into();
         return;
     };
-    let Ok((role, wallet, hunger, inv, merchant)) = noots.get(entity) else {
+    let Ok((claim, trader, wallet, hunger, inv)) = noots.get(entity) else {
         text.0 = stale.into();
         return;
     };
 
     let world = &sim.0;
-    let role_label = match role {
-        Role::Owner { deposit } => {
-            let slot = world.deposits[*deposit].element_slot;
-            format!("owner of {}", elements::element(world.chosen[slot].id).name)
+    let claim_label = match claim.deposit {
+        Some(d) => {
+            let slot = world.deposits[d].element_slot;
+            format!("mining {}", elements::element(world.chosen[slot].id).name)
         }
-        Role::Refiner => "refiner".to_string(),
-        Role::Consumer => "consumer".to_string(),
-        Role::Transporter => {
-            let d = merchant.map_or(0.0, |m| m.discount);
-            format!("merchant — discount {:.2}", d)
-        }
+        None => "unclaimed".to_string(),
     };
 
     let utility = hunger.utility() + economy::positional_utility(&world.goods, inv);
     let mut out = format!(
-        "[selected] {}   ₦{:.0}   hunger {:.1}   utility {:.2}\n",
-        role_label,
+        "[selected] noot — {}   discount {:.2}   ₦{:.0}   hunger {:.1}   utility {:.2}\n",
+        claim_label,
+        trader.discount,
         wallet.bucks,
         hunger.staple.iter().sum::<f32>() / hunger.staple.len() as f32,
         utility,
@@ -792,8 +744,7 @@ fn update_selection_panel(
     if held.is_empty() {
         held.push_str("(nothing)");
     }
-    let label = if merchant.is_some() { "cargo" } else { "holding" };
-    out.push_str(&format!("{}: {}\n", label, held));
+    out.push_str(&format!("holding: {}\n", held));
     text.0 = out;
 }
 
@@ -802,72 +753,49 @@ fn update_hud(
     stats: Res<EconStats>,
     paused: Res<Paused>,
     hunger_ctrl: Res<HungerControl>,
-    noots: Query<(&Role, &Wallet, &Hunger)>,
-    merchants: Query<&Merchant>,
+    noots: Query<(&Wallet, &Hunger, &Trader, &Claim)>,
     mut hud: Query<&mut Text, With<HudText>>,
 ) {
     let world = &sim.0;
 
-    // Aggregate noot stats.
-    let (mut owners, mut refiners, mut consumers, mut transporters) = (0u32, 0u32, 0u32, 0u32);
+    // Aggregate noot stats over the now-uniform population.
     let mut total_bucks = 0.0f32;
     let mut appetite_sum = 0.0f32;
+    let mut discount_sum = 0.0f32;
     let mut starving = 0u32;
+    let mut claimed = 0u32;
     let mut count = 0u32;
-    let mut eaters = 0u32; // noots that actually consume (everyone but transporters)
-    for (role, wallet, hunger) in &noots {
-        match role {
-            Role::Owner { .. } => owners += 1,
-            Role::Refiner => refiners += 1,
-            Role::Consumer => consumers += 1,
-            Role::Transporter => transporters += 1,
-        }
+    for (wallet, hunger, trader, claim) in &noots {
         total_bucks += wallet.bucks;
-        count += 1;
-        // Transporters don't eat, so they're not part of hunger/starvation stats.
-        if !matches!(role, Role::Transporter) {
-            appetite_sum += hunger.staple.iter().sum::<f32>() / hunger.staple.len() as f32;
-            if hunger.is_starving() {
-                starving += 1;
-            }
-            eaters += 1;
+        appetite_sum += hunger.staple.iter().sum::<f32>() / hunger.staple.len() as f32;
+        discount_sum += trader.discount;
+        if hunger.is_starving() {
+            starving += 1;
         }
+        if claim.deposit.is_some() {
+            claimed += 1;
+        }
+        count += 1;
     }
-    let (mut discount_sum, mut merchant_count) = (0.0f32, 0u32);
-    for m in &merchants {
-        discount_sum += m.discount;
-        merchant_count += 1;
-    }
-    let avg_discount = if merchant_count > 0 {
-        discount_sum / merchant_count as f32
-    } else {
-        0.0
-    };
-    let avg_appetite = if eaters > 0 {
-        appetite_sum / eaters as f32
-    } else {
-        0.0
-    };
-    let starving_pct = if eaters > 0 {
-        starving as f32 / eaters as f32 * 100.0
-    } else {
-        0.0
-    };
+    let denom = count.max(1) as f32;
+    let avg_appetite = appetite_sum / denom;
+    let avg_discount = discount_sum / denom;
+    let starving_pct = starving as f32 / denom * 100.0;
+    let n_deposits = world.deposits.len();
 
     if let Ok(mut text) = hud.single_mut() {
         let pause_tag = if paused.0 { "[PAUSED]  " } else { "" };
         let mut out = format!(
             "{pause_tag}econ-sim  seed {:#x}  noots {}  trades {}  in circulation ₦{:.0}\n\
-             {} owners · {} refiners · {} consumers · {} merchants   avg appetite {:.1}\n\
+             {}/{} deposits claimed   avg appetite {:.1}   avg discount {:.2}\n\
              starving {}/{} ({:.0}%)   production {:.1}/s   consumption {:.1}/s\n\
-             merchant discount {:.2}   margin ₦{:.1}/s   utility {:.1}/s\n\
+             trade margin ₦{:.1}/s   utility {:.1}/s\n\
              deaths {:.2}/min → target {:.2}   hunger rate {:.2}\n\
              drag to pan · pinch to zoom · tap a noot to follow it\n\n",
-            world.seed, count, stats.trades_total, total_bucks, owners, refiners, consumers,
-            transporters, avg_appetite, starving, eaters, starving_pct, stats.production_rate,
-            stats.consumption_rate, avg_discount, stats.merchant_profit_rate,
-            stats.utility_rate, hunger_ctrl.measured_per_min, hunger_ctrl.target_per_min,
-            hunger_ctrl.rate
+            world.seed, count, stats.trades_total, total_bucks, claimed, n_deposits, avg_appetite,
+            avg_discount, starving, count, starving_pct, stats.production_rate,
+            stats.consumption_rate, stats.merchant_profit_rate, stats.utility_rate,
+            hunger_ctrl.measured_per_min, hunger_ctrl.target_per_min, hunger_ctrl.rate
         );
         for slot in 0..4 {
             let ce = &world.chosen[slot];
