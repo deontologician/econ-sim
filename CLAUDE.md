@@ -62,12 +62,12 @@ cargo clippy --target wasm32-unknown-unknown
 
 ## Git
 
-- Develop on the assigned feature branch; commit with descriptive messages and push.
-  Don't open a PR unless asked. Don't push to `main` directly.
-- **Commit on every clean compile, per logical checkpoint.** When a coherent change
-  is green (`cargo check` + `cargo clippy` both clean) *and* you reasonably believe
-  it wouldn't break `main`, commit it to the feature branch and push — don't leave
-  green work uncommitted, and don't batch many unrelated changes into one commit.
-- A clean compile is the bar to *commit*, but it does **not** verify the game runs
-  (it can't be launched here). So a commit is a checkpoint, not a release; merging
-  the branch to `main` stays a human decision after on-device verification.
+- Develop on the assigned feature branch (`claude/...`). **Commit freely to the
+  branch to checkpoint work — even if it doesn't compile.** WIP saves are expected;
+  the branch is scratch space, not a clean-history release.
+- **Merge the branch to `main` whenever the change compiles cleanly (`cargo check`
+  + `cargo clippy` both green) and you don't believe it will break `main`.** No PR
+  needed. This is the release gate, and merging to `main` triggers the Pages deploy.
+- "Won't break `main`" is a judgment on the build plus the soundness of the change:
+  the app can't be launched in this sandbox, so a clean compile is the strongest
+  automated signal but is not runtime verification.
