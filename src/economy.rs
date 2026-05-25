@@ -35,10 +35,38 @@ const POSITIONAL_VALUE: f32 = 40.0; // first-unit WTP, then /(1+stock)
 
 const TRADE_RADIUS_FACTOR: f32 = 1.7; // × hex_size
 
+/// How long each production/consumption rate sample covers (seconds).
+const RATE_WINDOW: f32 = 0.5;
+
 #[derive(Resource, Default)]
 pub struct EconStats {
     pub trades_total: u64,
     pub last_price: [f32; N_ITEMS],
+    /// Cumulative raw units extracted from deposits (the economy's supply).
+    pub produced_total: f64,
+    /// Cumulative units consumed (staples eaten + positional goods used up).
+    pub consumed_total: f64,
+    /// Most recent windowed rates, in units/sec.
+    pub production_rate: f32,
+    pub consumption_rate: f32,
+    // Accumulators for the in-progress rate window.
+    produced_window: f32,
+    consumed_window: f32,
+    window_elapsed: f32,
+}
+
+/// Convert the running production/consumption tallies into per-second rates,
+/// once per `RATE_WINDOW` so the HUD numbers don't jitter every frame.
+pub fn update_rates(time: Res<Time>, mut stats: ResMut<EconStats>) {
+    stats.window_elapsed += time.delta_secs();
+    if stats.window_elapsed >= RATE_WINDOW {
+        let inv = 1.0 / stats.window_elapsed;
+        stats.production_rate = stats.produced_window * inv;
+        stats.consumption_rate = stats.consumed_window * inv;
+        stats.produced_window = 0.0;
+        stats.consumed_window = 0.0;
+        stats.window_elapsed = 0.0;
+    }
 }
 
 pub fn income(time: Res<Time>, mut wallets: Query<&mut Wallet>) {
@@ -60,6 +88,7 @@ pub fn hunger_tick(time: Res<Time>, mut q: Query<&mut Hunger>) {
 pub fn extract(
     time: Res<Time>,
     mut sim: ResMut<Sim>,
+    mut stats: ResMut<EconStats>,
     mut q: Query<(&Role, &TilePos, &mut Inventory)>,
 ) {
     let dt = time.delta_secs();
@@ -79,6 +108,8 @@ pub fn extract(
         }
         let got = sim.0.extract_from(deposit, OWNER_WORK_RATE, dt) as f32;
         inv.items[raw] += got;
+        stats.produced_window += got;
+        stats.produced_total += got as f64;
     }
 }
 
@@ -101,8 +132,13 @@ pub fn refine(time: Res<Time>, sim: Res<Sim>, mut q: Query<(&Role, &mut Inventor
     }
 }
 
-pub fn consume(sim: Res<Sim>, mut q: Query<(&mut Inventory, &mut Hunger, &mut Positional)>) {
+pub fn consume(
+    sim: Res<Sim>,
+    mut stats: ResMut<EconStats>,
+    mut q: Query<(&mut Inventory, &mut Hunger, &mut Positional)>,
+) {
     let dt_goods = &sim.0.goods;
+    let mut eaten = 0.0f32;
     for (mut inv, mut hunger, mut positional) in &mut q {
         // Staples first (satisficing: eat only to satiation, surplus unused).
         for item in 0..N_ITEMS {
@@ -112,6 +148,7 @@ pub fn consume(sim: Res<Sim>, mut q: Query<(&mut Inventory, &mut Hunger, &mut Po
                     let eat = inv.items[item].min(needed);
                     inv.items[item] -= eat;
                     hunger.staple[sub] = (hunger.staple[sub] - eat * EAT_VALUE).max(0.0);
+                    eaten += eat;
                 }
             }
         }
@@ -123,11 +160,14 @@ pub fn consume(sim: Res<Sim>, mut q: Query<(&mut Inventory, &mut Hunger, &mut Po
                         let c = inv.items[item].min(POSITIONAL_CONSUME_RATE);
                         inv.items[item] -= c;
                         positional.stock[sub] += c;
+                        eaten += c;
                     }
                 }
             }
         }
     }
+    stats.consumed_window += eaten;
+    stats.consumed_total += eaten as f64;
 }
 
 struct Snap {

@@ -6,6 +6,10 @@ edition = "2021"
 [dependencies]
 bevy = "0.18"
 
+# Web-only: used to hide the HTML loading screen once Bevy has booted.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "DomTokenList"] }
+
 # Build dependencies with optimizations even in dev so the sim runs smoothly,
 # while keeping our own crate fast to recompile.
 [profile.dev]

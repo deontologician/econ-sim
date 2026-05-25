@@ -15,6 +15,8 @@ pub const STAPLE_SATIATION: f32 = 10.0;
 pub const HUNGER_RATE: f32 = 0.5;
 /// Below this fraction of satiation a staple counts as satisfied.
 pub const SATISFIED_FRACTION: f32 = 0.3;
+/// At or above this fraction of satiation a staple counts as "starving".
+pub const STARVING_FRACTION: f32 = 0.9;
 /// Owners stop extracting once carrying this much of their raw good.
 pub const CARRY_CAP: f32 = 20.0;
 
@@ -73,6 +75,13 @@ impl Hunger {
         self.staple
             .iter()
             .all(|&a| a < STAPLE_SATIATION * SATISFIED_FRACTION)
+    }
+
+    /// Any staple appetite at or above the starving threshold.
+    pub fn is_starving(&self) -> bool {
+        self.staple
+            .iter()
+            .any(|&a| a >= STAPLE_SATIATION * STARVING_FRACTION)
     }
 }
 

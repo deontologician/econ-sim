@@ -89,13 +89,33 @@ fn main() {
                 economy::refine,
                 economy::meet_and_trade,
                 economy::consume,
+                economy::update_rates,
                 touch_camera,
                 keyboard_mouse_camera,
                 invest_buttons,
                 update_hud,
+                hide_loading_screen,
             ),
         )
         .run();
+}
+
+/// Once Bevy has produced its first frame, fade out the HTML loading overlay by
+/// tagging it `ready`. Runs every frame but acts only once; a no-op off the web.
+fn hide_loading_screen(mut done: Local<bool>) {
+    if *done {
+        return;
+    }
+    *done = true;
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(element) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("loading"))
+        {
+            let _ = element.class_list().add_1("ready");
+        }
+    }
 }
 
 fn setup(
@@ -442,6 +462,7 @@ fn update_hud(
     let (mut owners, mut refiners, mut consumers) = (0u32, 0u32, 0u32);
     let mut total_bucks = 0.0f32;
     let mut appetite_sum = 0.0f32;
+    let mut starving = 0u32;
     let mut count = 0u32;
     for (role, wallet, hunger) in &noots {
         match role {
@@ -451,10 +472,18 @@ fn update_hud(
         }
         total_bucks += wallet.bucks;
         appetite_sum += hunger.staple.iter().sum::<f32>() / hunger.staple.len() as f32;
+        if hunger.is_starving() {
+            starving += 1;
+        }
         count += 1;
     }
     let avg_appetite = if count > 0 {
         appetite_sum / count as f32
+    } else {
+        0.0
+    };
+    let starving_pct = if count > 0 {
+        starving as f32 / count as f32 * 100.0
     } else {
         0.0
     };
@@ -463,9 +492,11 @@ fn update_hud(
         let mut out = format!(
             "econ-sim  seed {:#x}  noots {}  trades {}  in circulation ₦{:.0}\n\
              {} owners · {} refiners · {} consumers   avg appetite {:.1}\n\
+             starving {}/{} ({:.0}%)   production {:.1}/s   consumption {:.1}/s\n\
              drag to pan · pinch to zoom · tap an element to invest in extraction\n\n",
             world.seed, count, stats.trades_total, total_bucks, owners, refiners, consumers,
-            avg_appetite
+            avg_appetite, starving, count, starving_pct, stats.production_rate,
+            stats.consumption_rate
         );
         for slot in 0..4 {
             let ce = &world.chosen[slot];
