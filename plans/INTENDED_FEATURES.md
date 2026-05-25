@@ -37,24 +37,28 @@ design. Newest first within each section.
 - **STATUS**: stub
 
 ### Pricing / market clearing
-- **NOW**: a trade settles at the **seller's fixed ask** (per-good constant) when
-  the buyer's willingness-to-pay ≥ ask and they're solvent; 1 unit per meeting. *(partial)*
+- **NOW**: a trade settles at the **seller's ask** when the buyer's WTP ≥ ask and
+  they're solvent; 1 unit per meeting. The ask is now **inventory-aware**: a
+  non-merchant seller discounts a base price by `surplus_discount(held)` (Plan 005),
+  so the more glutted it is the cheaper it dumps — this is the spatial spread
+  merchants arbitrage. Merchants ask full base price. *(partial)*
 - **INTENDED**: bilateral bargaining or a local market that clears on
   supply/demand; prices emerge from scarcity, transport cost, and competition;
-  variable quantities; inventory-aware asks.
+  variable quantities. Base prices are still per-good constants under the discount.
 - **STATUS**: partial
 
-### Transporters (principal–agent hauling)
-- **NOW**: a *transporter role* (`HaulContract` state machine). An idle hauler is
-  auto-matched to the most-loaded owner (`haul_assign` — a stub for a real labor
-  market), walks to the deposit, loads `HAUL_CAPACITY` raw units, wanders selling
-  for a bounded number of steps, then returns and pays the owner `PRINCIPAL_SHARE`
-  of the take (keeping the rest); unsold cargo is returned. While a hauler keeps
-  draining an owner, the owner stays put extracting instead of touring. *(partial)*
-- **INTENDED**: negotiated contracts (not auto-assignment), trust and default
-  risk (a hauler could abscond with the goods/proceeds), competition for haulers,
-  route/price choice, and pay flowing from a real labor market rather than a
-  fixed share constant. (Plan 002.)
+### Transporters (free-roaming merchants)
+- **NOW**: transporters are independent **merchants** (`Merchant`, Plan 005 —
+  replaced the old principal–agent `HaulContract`). They free-roam on their learned
+  value field, buy surplus on their own account at `discount × base_ask`, carry it,
+  and resell at `base_ask` for the spread (reservation = cost basis, so margins are
+  non-negative). The `discount` is learned: up on a sale, down on a buy, so the
+  population self-regulates around the available spread. Merchants don't eat/starve.
+  *(partial)*
+- **INTENDED**: richer price-setting than a fixed base + learned discount (real
+  bid/ask, negotiation), inventory/working-capital limits, competition and
+  congestion effects, and arbitrage across genuinely spatial prices rather than the
+  surplus-discount proxy.
 - **STATUS**: partial
 
 ### Refining

@@ -1,18 +1,18 @@
 //! Noot locomotion + the per-hex value-learning loop.
 //!
-//! Every free-roaming noot carries a `RouteMemory` — a TD(λ) value estimate over
-//! the map. Each step it moves ε-greedily up the value gradient (toward its
-//! best-valued neighbour), banking any reward earned on the tile it leaves and
-//! folding it into the estimate, so productive regions pull future movement.
-//! Owners are the exception: when sold out they home to their deposit to extract
-//! a fresh load, then rejoin the value-driven wander to sell it. Transporters
-//! still navigate by haul-contract state.
+//! Every noot carries a `RouteMemory` — a TD(λ) value estimate over the map. Each
+//! step it moves ε-greedily up the value gradient (toward its best-valued
+//! neighbour), banking any reward earned on the tile it leaves and folding it into
+//! the estimate, so productive regions pull future movement. Owners are the
+//! exception: when sold out they home to their deposit to extract a fresh load,
+//! then rejoin the value-driven wander to sell it. Merchants free-roam like
+//! everyone else, their field shaped by buy/resale rewards.
 
 use bevy::prelude::*;
 
 use crate::goods::{self, GoodForm};
 use crate::hex::{hex_center, neighbors};
-use crate::noot::{HaulContract, HaulState, Inventory, Role, RouteMemory, TilePos, HAUL_SELL_STEPS};
+use crate::noot::{Inventory, Role, RouteMemory, TilePos};
 use crate::world::{terrain_factor, World};
 use crate::{MapView, Sim, SimRng};
 
@@ -44,18 +44,13 @@ pub fn movement(
     mut rng: ResMut<SimRng>,
     sim: Res<Sim>,
     view: Res<MapView>,
-    // Transporters move under `haul_movement`; exclude them here so the two
-    // systems' `&mut Transform`/`&mut TilePos` accesses stay provably disjoint.
-    mut noots: Query<
-        (
-            &mut TilePos,
-            &mut RouteMemory,
-            &mut Transform,
-            &Role,
-            &Inventory,
-        ),
-        Without<HaulContract>,
-    >,
+    mut noots: Query<(
+        &mut TilePos,
+        &mut RouteMemory,
+        &mut Transform,
+        &Role,
+        &Inventory,
+    )>,
 ) {
     let world = &sim.0;
     let dt = time.delta_secs();
@@ -113,82 +108,6 @@ pub fn movement(
     }
 }
 
-/// Transporters navigate by contract state rather than the value field: walk to
-/// the employer's deposit, then (once loaded) wander selling, then walk back to
-/// settle. Reuses `step_toward`/`wander`.
-pub fn haul_movement(
-    time: Res<Time>,
-    mut rng: ResMut<SimRng>,
-    sim: Res<Sim>,
-    view: Res<MapView>,
-    mut q: Query<(
-        &mut TilePos,
-        &mut Transform,
-        &mut RouteMemory,
-        &Inventory,
-        &mut HaulContract,
-    )>,
-) {
-    let world = &sim.0;
-    let dt = time.delta_secs();
-
-    for (mut pos, mut transform, mut mem, inv, mut contract) in &mut q {
-        // Glide the sprite toward the current tile centre (same as `movement`).
-        let target = tile_to_pixel(pos.col, pos.row, world.hex_size, view.offset);
-        let t = (dt * 8.0).min(1.0);
-        transform.translation.x += (target.x - transform.translation.x) * t;
-        transform.translation.y += (target.y - transform.translation.y) * t;
-
-        // Idle: waiting for assignment. Loading: waiting for `haul_loading`.
-        if matches!(contract.state, HaulState::Idle | HaulState::Loading) {
-            continue;
-        }
-
-        mem.move_cooldown -= dt;
-        if mem.move_cooldown > 0.0 {
-            continue;
-        }
-
-        let dtile = world.deposits[contract.deposit].tile;
-        let (tc, tr) = (world.tiles[dtile].col, world.tiles[dtile].row);
-        let at_deposit = pos.col == tc && pos.row == tr;
-
-        match contract.state {
-            HaulState::ToPickup => {
-                if at_deposit {
-                    contract.state = HaulState::Loading; // `haul_loading` fills cargo
-                } else {
-                    let (c, r) = step_toward(world, pos.col, pos.row, tc, tr);
-                    pos.col = c;
-                    pos.row = r;
-                }
-            }
-            HaulState::Selling => {
-                let (c, r) = wander(&mut rng.0, world, pos.col, pos.row);
-                pos.col = c;
-                pos.row = r;
-                contract.sell_steps += 1;
-                let sold_out = inv.items[contract.cargo_item] <= 0.0;
-                if sold_out || contract.sell_steps >= HAUL_SELL_STEPS {
-                    contract.state = HaulState::Returning;
-                }
-            }
-            HaulState::Returning => {
-                if !at_deposit {
-                    let (c, r) = step_toward(world, pos.col, pos.row, tc, tr);
-                    pos.col = c;
-                    pos.row = r;
-                }
-                // On arrival, `haul_settle` finalizes and resets to Idle.
-            }
-            HaulState::Idle | HaulState::Loading => {}
-        }
-
-        let tf = terrain_factor(world.tiles[tile_idx(world, pos.col, pos.row)].terrain);
-        mem.move_cooldown = BASE_STEP_TIME / tf;
-    }
-}
-
 /// ε-greedy step up the learned value gradient: usually move to the highest-value
 /// in-bounds neighbour (ties broken at random, so an all-zero field gives an
 /// unbiased walk), occasionally a random neighbour to keep exploring.
@@ -222,19 +141,6 @@ fn value_step(
         }
     }
     best[rng.below(best.len())]
-}
-
-/// A random in-bounds neighbour (transporters' selling wander).
-fn wander(rng: &mut crate::rng::Rng, world: &World, col: i32, row: i32) -> (i32, i32) {
-    let inb: Vec<(i32, i32)> = neighbors(col, row)
-        .into_iter()
-        .filter(|&(c, r)| in_bounds(world, c, r))
-        .collect();
-    if inb.is_empty() {
-        (col, row)
-    } else {
-        inb[rng.below(inb.len())]
-    }
 }
 
 fn step_toward(world: &World, col: i32, row: i32, hc: i32, hr: i32) -> (i32, i32) {

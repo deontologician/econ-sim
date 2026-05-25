@@ -42,6 +42,19 @@ const TRADE_RADIUS_FACTOR: f32 = 1.7; // × hex_size
 /// the movement reward, so a sale and a meal pull the value field comparably.
 const SELL_REWARD_SCALE: f32 = 0.15;
 
+// --- Surplus discounting (the merchant arbitrage spread) --------------------
+// These three are the main levers on whether merchants can profit: the discount
+// at a producer's typical stock must drop below a merchant's `DISCOUNT_INIT`
+// willingness-to-pay for any surplus to change hands. Tuned so a freshly-loaded
+// owner (~5–6 units, since owners leave their deposit at `LOAD_THRESHOLD`) already
+// offers below 0.5× base.
+/// Holdings a seller can carry before its ask starts discounting.
+const SURPLUS_FREE: f32 = 2.0;
+/// Steepness of the discount per unit held beyond `SURPLUS_FREE`.
+const SURPLUS_K: f32 = 0.35;
+/// A glutted seller's ask never falls below this fraction of its base ask.
+const SURPLUS_FLOOR: f32 = 0.35;
+
 /// How long each production/consumption rate sample covers (seconds).
 const RATE_WINDOW: f32 = 0.5;
 
@@ -53,24 +66,24 @@ pub struct EconStats {
     pub produced_total: f64,
     /// Cumulative units consumed (staples eaten + positional goods used up).
     pub consumed_total: f64,
-    /// Cumulative units picked up by transporters for hauling.
-    pub hauled_total: f64,
+    /// Cumulative bucks of margin realized by merchants reselling surplus.
+    pub merchant_profit_total: f64,
     /// Cumulative welfare (utility) realized through consumption.
     pub utility_total: f64,
-    /// Most recent windowed rates, in units (or utility) per second.
+    /// Most recent windowed rates, in units (or utility/bucks) per second.
     pub production_rate: f32,
     pub consumption_rate: f32,
-    pub hauled_rate: f32,
+    pub merchant_profit_rate: f32,
     pub utility_rate: f32,
     // Accumulators for the in-progress rate window.
     produced_window: f32,
     consumed_window: f32,
-    hauled_window: f32,
+    merchant_profit_window: f32,
     utility_window: f32,
     window_elapsed: f32,
 }
 
-/// Convert the running production/consumption/haul tallies into per-second
+/// Convert the running production/consumption/profit tallies into per-second
 /// rates, once per `RATE_WINDOW` so the HUD numbers don't jitter every frame.
 pub fn update_rates(time: Res<Time>, mut stats: ResMut<EconStats>) {
     stats.window_elapsed += time.delta_secs();
@@ -78,11 +91,11 @@ pub fn update_rates(time: Res<Time>, mut stats: ResMut<EconStats>) {
         let inv = 1.0 / stats.window_elapsed;
         stats.production_rate = stats.produced_window * inv;
         stats.consumption_rate = stats.consumed_window * inv;
-        stats.hauled_rate = stats.hauled_window * inv;
+        stats.merchant_profit_rate = stats.merchant_profit_window * inv;
         stats.utility_rate = stats.utility_window * inv;
         stats.produced_window = 0.0;
         stats.consumed_window = 0.0;
-        stats.hauled_window = 0.0;
+        stats.merchant_profit_window = 0.0;
         stats.utility_window = 0.0;
         stats.window_elapsed = 0.0;
     }
@@ -95,9 +108,13 @@ pub fn income(time: Res<Time>, mut wallets: Query<&mut Wallet>) {
     }
 }
 
-pub fn hunger_tick(time: Res<Time>, mut q: Query<&mut Hunger>) {
+pub fn hunger_tick(time: Res<Time>, mut q: Query<(&Role, &mut Hunger)>) {
     let d = HUNGER_RATE * time.delta_secs();
-    for mut h in &mut q {
+    for (role, mut h) in &mut q {
+        // Merchants don't eat, so they don't get hungry (and never starve).
+        if matches!(role, Role::Transporter) {
+            continue;
+        }
         for a in &mut h.staple {
             *a = (*a + d).min(STAPLE_SATIATION);
         }
@@ -207,13 +224,21 @@ struct Snap {
     bucks: f32,
     hunger: [f32; N_STAPLES],
     satisfied: bool,
+    /// Merchants only: learned discount on anticipated resale, and average price
+    /// paid per held item. Zeroed for everyone else.
+    discount: f32,
+    cost_basis: [f32; N_ITEMS],
 }
 
 /// What a noot is willing to *pay* to acquire one unit (buyer side).
 fn wtp(goods: &goods::WorldGoods, item: usize, s: &Snap) -> f32 {
-    // Transporters are pure logistics agents: they haul and sell, never buy.
+    // Merchants buy surplus to resell: they'll pay up to a learned discount on the
+    // good's market ask (their anticipated resale value).
     if matches!(s.role, Role::Transporter) {
-        return 0.0;
+        return match goods.role_of(item) {
+            ItemRole::Junk => 0.0,
+            _ => s.discount * base_ask(goods, item),
+        };
     }
     match goods.role_of(item) {
         ItemRole::Staple(sub) => STAPLE_VALUE * (s.hunger[sub] / STAPLE_SATIATION),
@@ -242,9 +267,10 @@ fn wtp(goods: &goods::WorldGoods, item: usize, s: &Snap) -> f32 {
 /// (which shrinks as holdings grow), discounted by hunger — a starving, goods-rich
 /// noot sells cheaply to buy food, while a fed one sheds only its surplus.
 fn reservation(goods: &goods::WorldGoods, item: usize, s: &Snap) -> f32 {
-    // Transporters never want their cargo; they sell whatever they carry.
+    // A merchant won't sell below what it paid: its cost basis is the floor, so
+    // every completed resale clears at a non-negative margin.
     if matches!(s.role, Role::Transporter) {
-        return 0.0;
+        return s.cost_basis[item];
     }
     match goods.role_of(item) {
         ItemRole::Staple(sub) => STAPLE_VALUE * (s.hunger[sub] / STAPLE_SATIATION),
@@ -269,7 +295,8 @@ fn reservation(goods: &goods::WorldGoods, item: usize, s: &Snap) -> f32 {
     }
 }
 
-fn ask(goods: &goods::WorldGoods, item: usize) -> f32 {
+/// The good's market price (what a fed consumer pays at full price).
+fn base_ask(goods: &goods::WorldGoods, item: usize) -> f32 {
     match goods.role_of(item) {
         ItemRole::Intermediate => ASK_INTERMEDIATE,
         ItemRole::Staple(_) | ItemRole::Positional(_) => match form_of(item) {
@@ -280,6 +307,29 @@ fn ask(goods: &goods::WorldGoods, item: usize) -> f32 {
     }
 }
 
+/// Multiplier on a glutted seller's ask: full price up to `SURPLUS_FREE` held,
+/// then falling hyperbolically toward `SURPLUS_FLOOR` as the overstock grows — the
+/// more a producer is drowning in its own good, the cheaper it dumps the surplus.
+fn surplus_discount(held: f32) -> f32 {
+    if held <= SURPLUS_FREE {
+        1.0
+    } else {
+        (1.0 / (1.0 + SURPLUS_K * (held - SURPLUS_FREE))).max(SURPLUS_FLOOR)
+    }
+}
+
+/// The price a seller offers one unit at. Merchants charge the full market ask
+/// (their margin came from buying cheap); producers discount surplus they're
+/// glutted on, opening the spread merchants live off.
+fn seller_ask(goods: &goods::WorldGoods, item: usize, role: Role, held: f32) -> f32 {
+    let base = base_ask(goods, item);
+    if matches!(role, Role::Transporter) {
+        base
+    } else {
+        base * surplus_discount(held)
+    }
+}
+
 struct Tx {
     buyer: Entity,
     seller: Entity,
@@ -287,6 +337,7 @@ struct Tx {
     price: f32,
 }
 
+#[allow(clippy::type_complexity)]
 pub fn meet_and_trade(
     sim: Res<Sim>,
     mut stats: ResMut<EconStats>,
@@ -298,10 +349,8 @@ pub fn meet_and_trade(
         &mut Wallet,
         &Hunger,
         &mut RouteMemory,
+        Option<&mut Merchant>,
     )>,
-    // Separate query (HaulContract isn't in the tuple above, so no conflict):
-    // record a hauling seller's revenue so it can settle the owner's share.
-    mut contracts: Query<&mut HaulContract>,
 ) {
     let goods = &sim.0.goods;
     let radius2 = (sim.0.hex_size * TRADE_RADIUS_FACTOR).powi(2);
@@ -309,14 +358,20 @@ pub fn meet_and_trade(
     // Snapshot (immutable read) so we can reason about pairs without aliasing.
     let mut snaps: Vec<Snap> = q
         .iter()
-        .map(|(e, t, role, inv, wal, hunger, _route)| Snap {
-            e,
-            pos: t.translation.truncate(),
-            role: *role,
-            inv: inv.items,
-            bucks: wal.bucks,
-            hunger: hunger.staple,
-            satisfied: hunger.satisfied(),
+        .map(|(e, t, role, inv, wal, hunger, _route, merchant)| {
+            let (discount, cost_basis) =
+                merchant.map_or((0.0, [0.0; N_ITEMS]), |m| (m.discount, m.cost_basis));
+            Snap {
+                e,
+                pos: t.translation.truncate(),
+                role: *role,
+                inv: inv.items,
+                bucks: wal.bucks,
+                hunger: hunger.staple,
+                satisfied: hunger.satisfied(),
+                discount,
+                cost_basis,
+            }
         })
         .collect();
 
@@ -334,7 +389,7 @@ pub fn meet_and_trade(
                     if snaps[si].inv[item] <= 0.0 {
                         continue;
                     }
-                    let price = ask(goods, item);
+                    let price = seller_ask(goods, item, snaps[si].role, snaps[si].inv[item]);
                     let buyer_wtp = wtp(goods, item, &snaps[bi]);
                     let seller_res = reservation(goods, item, &snaps[si]);
                     if buyer_wtp >= price && seller_res < price && snaps[bi].bucks >= price {
@@ -366,158 +421,41 @@ pub fn meet_and_trade(
 
     // Apply to the ECS, one entity borrow at a time.
     for tx in txs {
-        if let Ok((_, _, _, mut inv, mut wal, _, _)) = q.get_mut(tx.buyer) {
+        let base = base_ask(goods, tx.item);
+
+        // Buyer side.
+        if let Ok((_, _, _, mut inv, mut wal, _, mut route, merchant)) = q.get_mut(tx.buyer) {
+            let held_before = inv.items[tx.item];
             inv.items[tx.item] += 1.0;
             wal.bucks -= tx.price;
+            if let Some(mut m) = merchant {
+                // Merchant acquiring surplus: bank the discounted anticipated
+                // profit where it was found (so the field learns where surplus is),
+                // average in the cost, and grow more cautious (discount → MIN).
+                route.pending_reward += SELL_REWARD_SCALE * m.discount * (base - tx.price).max(0.0);
+                let total = m.cost_basis[tx.item] * held_before + tx.price;
+                m.cost_basis[tx.item] = total / (held_before + 1.0);
+                m.discount = (m.discount - DISCOUNT_LR * (m.discount - DISCOUNT_MIN)).max(DISCOUNT_MIN);
+            }
         }
-        if let Ok((_, _, role, mut inv, mut wal, _, mut route)) = q.get_mut(tx.seller) {
+
+        // Seller side.
+        if let Ok((_, _, _, mut inv, mut wal, _, mut route, merchant)) = q.get_mut(tx.seller) {
             inv.items[tx.item] -= 1.0;
             wal.bucks += tx.price;
-            // Selling income rewards the value field, teaching sellers where the
-            // buyers are. Transporters learn nothing here — they run on contracts.
-            if !matches!(role, Role::Transporter) {
-                route.pending_reward += tx.price * SELL_REWARD_SCALE;
+            match merchant {
+                Some(mut m) => {
+                    // Merchant realizing a resale: reward the actual margin where
+                    // the buyer was, and let success breed optimism (discount → MAX).
+                    let margin = tx.price - m.cost_basis[tx.item];
+                    route.pending_reward += SELL_REWARD_SCALE * margin;
+                    m.discount = (m.discount + DISCOUNT_LR * (DISCOUNT_MAX - m.discount)).min(DISCOUNT_MAX);
+                    stats.merchant_profit_window += margin.max(0.0);
+                    stats.merchant_profit_total += margin.max(0.0) as f64;
+                }
+                // Ordinary sellers learn where buyers are from the income itself.
+                None => route.pending_reward += tx.price * SELL_REWARD_SCALE,
             }
         }
-        // If the seller is a transporter mid-haul, tally the take so the owner's
-        // share can be paid back on settlement. (Borrow is separate from `q`.)
-        if let Ok(mut contract) = contracts.get_mut(tx.seller) {
-            if matches!(contract.state, HaulState::Selling | HaulState::Returning) {
-                contract.proceeds += tx.price;
-            }
-        }
-    }
-}
-
-/// Match each idle transporter to the owner most in need of hauling (the one
-/// carrying the most raw, above `MIN_HIRE`). v1 stub for a real labor market:
-/// each owner is claimed by at most one transporter per assignment pass.
-pub fn haul_assign(
-    sim: Res<Sim>,
-    mut transporters: Query<(&TilePos, &mut HaulContract)>,
-    owners: Query<(Entity, &Role, &Inventory)>,
-) {
-    // Pass 1: collect owners already being served so we don't double-book.
-    let mut claimed: Vec<Entity> = Vec::new();
-    let mut any_idle = false;
-    for (_, contract) in &transporters {
-        match contract.employer {
-            Some(e) if contract.state != HaulState::Idle => claimed.push(e),
-            _ => any_idle = true,
-        }
-    }
-    if !any_idle {
-        return;
-    }
-
-    // Candidate owners with a worthwhile load, richest first.
-    let mut candidates: Vec<(Entity, usize, f32)> = Vec::new(); // owner, deposit, raw
-    for (e, role, inv) in &owners {
-        let Role::Owner { deposit } = *role else {
-            continue;
-        };
-        let slot = sim.0.deposits[deposit].element_slot;
-        let raw = goods::item_index(slot, GoodForm::Raw);
-        if inv.items[raw] >= MIN_HIRE {
-            candidates.push((e, deposit, inv.items[raw]));
-        }
-    }
-    candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Pass 2: hand each idle transporter the best unclaimed owner.
-    for (_, mut contract) in &mut transporters {
-        if contract.state != HaulState::Idle {
-            continue;
-        }
-        let Some(&(owner, deposit, _)) = candidates.iter().find(|(e, _, _)| !claimed.contains(e))
-        else {
-            break; // no owners left to serve this pass
-        };
-        let slot = sim.0.deposits[deposit].element_slot;
-        contract.state = HaulState::ToPickup;
-        contract.employer = Some(owner);
-        contract.deposit = deposit;
-        contract.cargo_item = goods::item_index(slot, GoodForm::Raw);
-        contract.proceeds = 0.0;
-        contract.sell_steps = 0;
-        claimed.push(owner);
-    }
-}
-
-/// A transporter standing on its employer's deposit loads cargo from the
-/// owner's inventory, then sets off to sell.
-pub fn haul_loading(
-    sim: Res<Sim>,
-    mut stats: ResMut<EconStats>,
-    mut transporters: Query<(Entity, &TilePos, &mut HaulContract)>,
-    mut invs: Query<&mut Inventory>,
-) {
-    for (te, pos, mut contract) in &mut transporters {
-        if contract.state != HaulState::Loading {
-            continue;
-        }
-        let Some(employer) = contract.employer else {
-            contract.state = HaulState::Idle;
-            continue;
-        };
-        let dtile = sim.0.deposits[contract.deposit].tile;
-        if pos.col != sim.0.tiles[dtile].col || pos.row != sim.0.tiles[dtile].row {
-            continue;
-        }
-        // Two distinct entities → simultaneous mutable borrows are safe.
-        let mut loaded = 0.0f32;
-        if let Ok([mut t_inv, mut e_inv]) = invs.get_many_mut([te, employer]) {
-            let take = e_inv.items[contract.cargo_item].min(HAUL_CAPACITY);
-            e_inv.items[contract.cargo_item] -= take;
-            t_inv.items[contract.cargo_item] += take;
-            loaded = take;
-        }
-        stats.hauled_window += loaded;
-        stats.hauled_total += loaded as f64;
-        // With cargo, go sell; empty-handed, head straight back to settle.
-        contract.sell_steps = 0;
-        contract.state = if loaded > 0.0 {
-            HaulState::Selling
-        } else {
-            HaulState::Returning
-        };
-    }
-}
-
-/// A returning transporter on its employer's deposit pays the owner's share of
-/// the take, returns any unsold cargo, and goes idle (ready to be rehired).
-pub fn haul_settle(
-    sim: Res<Sim>,
-    mut transporters: Query<(Entity, &TilePos, &mut HaulContract)>,
-    mut wallets: Query<&mut Wallet>,
-    mut invs: Query<&mut Inventory>,
-) {
-    for (te, pos, mut contract) in &mut transporters {
-        if contract.state != HaulState::Returning {
-            continue;
-        }
-        let Some(employer) = contract.employer else {
-            *contract = HaulContract::idle();
-            continue;
-        };
-        let dtile = sim.0.deposits[contract.deposit].tile;
-        if pos.col != sim.0.tiles[dtile].col || pos.row != sim.0.tiles[dtile].row {
-            continue;
-        }
-
-        let payout = contract.proceeds * PRINCIPAL_SHARE;
-        if let Ok([mut t_w, mut e_w]) = wallets.get_many_mut([te, employer]) {
-            let pay = payout.min(t_w.bucks.max(0.0));
-            t_w.bucks -= pay;
-            e_w.bucks += pay;
-        }
-        if let Ok([mut t_i, mut e_i]) = invs.get_many_mut([te, employer]) {
-            let left = t_i.items[contract.cargo_item];
-            if left > 0.0 {
-                t_i.items[contract.cargo_item] -= left;
-                e_i.items[contract.cargo_item] += left;
-            }
-        }
-        *contract = HaulContract::idle();
     }
 }

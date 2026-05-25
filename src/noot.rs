@@ -19,17 +19,17 @@ pub const STARVING_FRACTION: f32 = 0.9;
 /// Owners stop extracting once carrying this much of their raw good.
 pub const CARRY_CAP: f32 = 20.0;
 
-// --- Transporters (principal–agent hauling) ---------------------------------
-/// Owner's cut of a haul's sale revenue; the transporter keeps `1 - SHARE`.
-pub const PRINCIPAL_SHARE: f32 = 0.6;
-/// Raw units a transporter loads per pickup. Kept above the owner's depart
-/// threshold so a single pickup drops the owner back below it (keeping the
-/// owner home extracting instead of touring to sell).
-pub const HAUL_CAPACITY: f32 = 12.0;
-/// Steps a transporter wanders selling before being forced to return & settle.
-pub const HAUL_SELL_STEPS: u32 = 12;
-/// Only hire a hauler for an owner carrying at least this much raw to move.
-pub const MIN_HIRE: f32 = 4.0;
+// --- Transporters (free-roaming merchant arbitrage) -------------------------
+/// A merchant's starting "fixed guess" discount on anticipated resale value — how
+/// much of a good's market price it dares pay to acquire surplus.
+pub const DISCOUNT_INIT: f32 = 0.5;
+/// Discount floor/ceiling: a merchant never pays under `MIN` or over `MAX` of a
+/// good's market ask to buy surplus.
+pub const DISCOUNT_MIN: f32 = 0.2;
+pub const DISCOUNT_MAX: f32 = 0.95;
+/// How fast the learned discount moves: up toward `MAX` on a sale (success breeds
+/// optimism), down toward `MIN` on a buy (exposure breeds caution).
+pub const DISCOUNT_LR: f32 = 0.04;
 
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -39,46 +39,21 @@ pub enum Role {
     Transporter,
 }
 
-/// A transporter's progress through one hauling contract.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum HaulState {
-    /// No contract; waiting to be matched to an owner.
-    Idle,
-    /// Walking to the employer's deposit to collect cargo.
-    ToPickup,
-    /// At the deposit, loading cargo from the employer.
-    Loading,
-    /// Wandering with cargo, selling to whoever's nearby.
-    Selling,
-    /// Walking back to the employer to hand over their share.
-    Returning,
-}
-
-/// Hauling assignment carried by every transporter (idle when unmatched).
+/// A transporter's merchant state. It buys surplus on its own account at
+/// `discount × market ask`, carries it, and resells at the market ask for the
+/// spread. `discount` is learned (see `DISCOUNT_LR`); `cost_basis` is the
+/// running average price paid per held item, so realized margin = ask − basis.
 #[derive(Component)]
-pub struct HaulContract {
-    pub state: HaulState,
-    /// The owner who hired this transporter; `None` only while `Idle`.
-    pub employer: Option<Entity>,
-    /// Index into `World::deposits` of the employer's deposit.
-    pub deposit: usize,
-    /// Raw item index being hauled.
-    pub cargo_item: usize,
-    /// Bucks banked from selling this contract's cargo (the owner's share is a
-    /// fraction of this, settled on return).
-    pub proceeds: f32,
-    pub sell_steps: u32,
+pub struct Merchant {
+    pub discount: f32,
+    pub cost_basis: [f32; N_ITEMS],
 }
 
-impl HaulContract {
-    pub fn idle() -> Self {
+impl Merchant {
+    pub fn new() -> Self {
         Self {
-            state: HaulState::Idle,
-            employer: None,
-            deposit: 0,
-            cargo_item: 0,
-            proceeds: 0.0,
-            sell_steps: 0,
+            discount: DISCOUNT_INIT,
+            cost_basis: [0.0; N_ITEMS],
         }
     }
 }

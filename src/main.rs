@@ -15,10 +15,7 @@ use bevy::window::PrimaryWindow;
 use economy::EconStats;
 use goods::{GoodCategory, GoodForm};
 use movement::tile_to_pixel;
-use noot::{
-    HaulContract, HaulState, Hunger, Inventory, Role, RouteMemory, TilePos, Wallet, PRINCIPAL_SHARE,
-    STARTING_BUCKS,
-};
+use noot::{Hunger, Inventory, Merchant, Role, RouteMemory, TilePos, Wallet, STARTING_BUCKS};
 use rng::Rng;
 use world::{generate, ResourceRole, Terrain, World};
 
@@ -116,17 +113,10 @@ fn main() {
                 // them while input/camera/HUD keep working.
                 (simulate, economy::income, economy::hunger_tick).run_if(sim_running),
                 (
-                    economy::haul_assign,
                     movement::movement,
-                    movement::haul_movement,
-                )
-                    .run_if(sim_running),
-                (
                     economy::extract,
-                    economy::haul_loading,
                     economy::refine,
                     economy::meet_and_trade,
-                    economy::haul_settle,
                 )
                     .run_if(sim_running),
                 (economy::consume, death_and_respawn, economy::update_rates).run_if(sim_running),
@@ -302,7 +292,7 @@ fn setup(
             tile_to_pixel(col, row, hex_size, offset),
         );
     }
-    // Transporters: hired haulers, spawned idle at random tiles.
+    // Transporters: free-roaming merchants, spawned at random tiles.
     for _ in 0..N_TRANSPORTERS {
         let (col, row) = random_tile(&mut sim_rng, &world);
         commands.spawn((
@@ -321,7 +311,7 @@ fn setup(
             },
             Hunger::fresh(),
             RouteMemory::new(n_tiles, false),
-            HaulContract::idle(),
+            Merchant::new(),
         ));
     }
 
@@ -495,13 +485,16 @@ fn death_and_respawn(
         &mut RouteMemory,
         &mut TilePos,
         &mut Transform,
-        Option<&mut HaulContract>,
     )>,
 ) {
     let dt = time.delta_secs();
     let world = &sim.0;
     let n_tiles = (world.cols * world.rows) as usize;
-    for (role, mut hunger, mut inv, mut wallet, mut mem, mut pos, mut tf, contract) in &mut q {
+    for (role, mut hunger, mut inv, mut wallet, mut mem, mut pos, mut tf) in &mut q {
+        // Merchants don't eat, so they never starve to death.
+        if matches!(role, Role::Transporter) {
+            continue;
+        }
         if hunger.fully_starving() {
             hunger.starving_secs += dt;
         } else {
@@ -530,9 +523,6 @@ fn death_and_respawn(
         pos.row = row;
         let p = tile_to_pixel(col, row, view.hex_size, view.offset);
         tf.translation = Vec3::new(p.x, p.y, 2.0);
-        if let Some(mut c) = contract {
-            *c = HaulContract::idle();
-        }
     }
 }
 
@@ -712,7 +702,7 @@ fn update_selection_ring(
 fn update_selection_panel(
     selection: Res<Selection>,
     sim: Res<Sim>,
-    noots: Query<(&Role, &Wallet, &Hunger, &Inventory, Option<&HaulContract>)>,
+    noots: Query<(&Role, &Wallet, &Hunger, &Inventory, Option<&Merchant>)>,
     mut panel: Query<&mut Text, With<SelectionText>>,
 ) {
     let Ok(mut text) = panel.single_mut() else {
@@ -723,7 +713,7 @@ fn update_selection_panel(
         text.0 = stale.into();
         return;
     };
-    let Ok((role, wallet, hunger, inv, contract)) = noots.get(entity) else {
+    let Ok((role, wallet, hunger, inv, merchant)) = noots.get(entity) else {
         text.0 = stale.into();
         return;
     };
@@ -737,14 +727,8 @@ fn update_selection_panel(
         Role::Refiner => "refiner".to_string(),
         Role::Consumer => "consumer".to_string(),
         Role::Transporter => {
-            let state = contract.map_or("idle", |c| match c.state {
-                HaulState::Idle => "idle",
-                HaulState::ToPickup => "to pickup",
-                HaulState::Loading => "loading",
-                HaulState::Selling => "selling",
-                HaulState::Returning => "returning",
-            });
-            format!("transporter — {}", state)
+            let d = merchant.map_or(0.0, |m| m.discount);
+            format!("merchant — discount {:.2}", d)
         }
     };
 
@@ -772,20 +756,8 @@ fn update_selection_panel(
     if held.is_empty() {
         held.push_str("(nothing)");
     }
-    if let Some(c) = contract {
-        if c.state != HaulState::Idle {
-            out.push_str(&format!(
-                "cargo: {}   take ₦{:.0}   owner's share {:.0}%\n",
-                held,
-                c.proceeds,
-                PRINCIPAL_SHARE * 100.0
-            ));
-        } else {
-            out.push_str(&format!("holding: {}\n", held));
-        }
-    } else {
-        out.push_str(&format!("holding: {}\n", held));
-    }
+    let label = if merchant.is_some() { "cargo" } else { "holding" };
+    out.push_str(&format!("{}: {}\n", label, held));
     text.0 = out;
 }
 
@@ -794,7 +766,7 @@ fn update_hud(
     stats: Res<EconStats>,
     paused: Res<Paused>,
     noots: Query<(&Role, &Wallet, &Hunger)>,
-    haulers: Query<&HaulContract>,
+    merchants: Query<&Merchant>,
     mut hud: Query<&mut Text, With<HudText>>,
 ) {
     let world = &sim.0;
@@ -824,10 +796,16 @@ fn update_hud(
             eaters += 1;
         }
     }
-    let active_hauls = haulers
-        .iter()
-        .filter(|c| c.state != HaulState::Idle)
-        .count();
+    let (mut discount_sum, mut merchant_count) = (0.0f32, 0u32);
+    for m in &merchants {
+        discount_sum += m.discount;
+        merchant_count += 1;
+    }
+    let avg_discount = if merchant_count > 0 {
+        discount_sum / merchant_count as f32
+    } else {
+        0.0
+    };
     let avg_appetite = if eaters > 0 {
         appetite_sum / eaters as f32
     } else {
@@ -843,13 +821,13 @@ fn update_hud(
         let pause_tag = if paused.0 { "[PAUSED]  " } else { "" };
         let mut out = format!(
             "{pause_tag}econ-sim  seed {:#x}  noots {}  trades {}  in circulation ₦{:.0}\n\
-             {} owners · {} refiners · {} consumers · {} transporters   avg appetite {:.1}\n\
+             {} owners · {} refiners · {} consumers · {} merchants   avg appetite {:.1}\n\
              starving {}/{} ({:.0}%)   production {:.1}/s   consumption {:.1}/s\n\
-             haulers {}/{} active   hauled {:.1}/s   utility {:.1}/s\n\
+             merchant discount {:.2}   margin ₦{:.1}/s   utility {:.1}/s\n\
              drag to pan · pinch to zoom · tap a noot to follow it\n\n",
             world.seed, count, stats.trades_total, total_bucks, owners, refiners, consumers,
             transporters, avg_appetite, starving, eaters, starving_pct, stats.production_rate,
-            stats.consumption_rate, active_hauls, transporters, stats.hauled_rate,
+            stats.consumption_rate, avg_discount, stats.merchant_profit_rate,
             stats.utility_rate
         );
         for slot in 0..4 {
