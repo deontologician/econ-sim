@@ -28,6 +28,16 @@ design. Newest first within each section.
 
 ## Economy
 
+### Food storage & productivity growth
+- **NOW**: noots keep a fixed `FOOD_RESERVE` (units they won't sell and top up toward
+  when cheap) so a surplus buffer can build, and a slow `skill_factor` raises mining/
+  refining throughput with per-individual `experience` (capped 2×). Both are flat
+  constants / a simple capped-linear curve. *(partial)*
+- **INTENDED**: a reserve sized to *expected* hunger volatility and price (not a magic
+  constant); spoilage/storage cost so hoarding has limits; per-task skills with proper
+  diminishing-returns learning curves, maybe transferable or teachable.
+- **STATUS**: partial
+
 ### Consumer income / wages
 - **NOW**: every noot gets a universal bucks trickle so consumers don't go broke and
   demand keeps circulating. The rate is **controlled** (`IncomeControl`): an integral

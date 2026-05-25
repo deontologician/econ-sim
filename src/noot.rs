@@ -38,11 +38,14 @@ pub const DISCOUNT_LR: f32 = 0.04;
 pub struct Noot;
 
 /// Per-noot life stats, surfaced by the noot-colouring overlays. `age` is seconds
-/// lived (reset on respawn); `transactions` counts trades made (buys + sells).
+/// lived (reset on respawn); `transactions` counts trades made (buys + sells);
+/// `experience` is accumulated productive work (mining + refining), driving a
+/// slow learning-by-doing speed bonus. All reset on rebirth.
 #[derive(Component)]
 pub struct NootMeta {
     pub age: f32,
     pub transactions: u32,
+    pub experience: f32,
 }
 
 impl NootMeta {
@@ -50,6 +53,7 @@ impl NootMeta {
         Self {
             age: 0.0,
             transactions: 0,
+            experience: 0.0,
         }
     }
 }

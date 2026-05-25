@@ -18,6 +18,27 @@ use crate::Sim;
 pub const WORK_RATE: f32 = 3.0;
 pub const REFINE_RATE: f32 = 2.0;
 
+// --- Learning by doing ------------------------------------------------------
+/// Experience gained per unit produced (mining + refining); experience is per
+/// individual and resets on death.
+const SKILL_PER_UNIT: f32 = 0.001;
+/// Cap on the speed bonus: at full mastery a noot works `1 + this`× as fast.
+const SKILL_BONUS_CAP: f32 = 1.0;
+
+/// Slow learning-by-doing multiplier on mining/refining throughput: 1.0 for a
+/// novice, saturating at `1 + SKILL_BONUS_CAP` after long experience.
+pub fn skill_factor(experience: f32) -> f32 {
+    1.0 + (experience * SKILL_PER_UNIT).min(SKILL_BONUS_CAP)
+}
+
+/// Units of each staple a noot keeps as a food reserve: it won't sell within this
+/// buffer, and it stocks up toward it when food is cheap — so a lean spell doesn't
+/// immediately starve it (escaping the Malthusian knife-edge).
+const FOOD_RESERVE: f32 = 4.0;
+/// What a noot will pay (as a fraction of `STAPLE_VALUE`) to top up its reserve
+/// while it has spare appetite — enough to claim glutted surplus, below full price.
+const FOOD_BUFFER_WTP_FRAC: f32 = 0.25;
+
 // STUB: universal income so consumers don't go broke. See INTENDED_FEATURES.md.
 pub const BUCKS_INCOME: f32 = 0.6;
 
@@ -274,10 +295,10 @@ pub fn extract(
     time: Res<Time>,
     mut sim: ResMut<Sim>,
     mut stats: ResMut<EconStats>,
-    mut q: Query<(&Claim, &TilePos, &mut Inventory)>,
+    mut q: Query<(&Claim, &TilePos, &mut Inventory, &mut NootMeta)>,
 ) {
     let dt = time.delta_secs();
-    for (claim, pos, mut inv) in &mut q {
+    for (claim, pos, mut inv, mut meta) in &mut q {
         let Some(deposit) = claim.deposit else {
             continue;
         };
@@ -291,8 +312,11 @@ pub fn extract(
         if inv.items[raw] >= CARRY_CAP {
             continue;
         }
-        let got = sim.0.extract_from(deposit, WORK_RATE, dt) as f32;
+        // Learning by doing: a seasoned miner pulls more per second.
+        let rate = WORK_RATE * skill_factor(meta.experience);
+        let got = sim.0.extract_from(deposit, rate, dt) as f32;
         inv.items[raw] += got;
+        meta.experience += got;
         stats.produced_window += got;
         stats.produced_total += got as f64;
     }
@@ -322,19 +346,22 @@ pub fn claim_deposits(sim: Res<Sim>, mut q: Query<(&TilePos, &mut Claim)>) {
     }
 }
 
-/// Every noot refines any intermediate it holds (refining is a universal ability).
-pub fn refine(time: Res<Time>, sim: Res<Sim>, mut q: Query<&mut Inventory>) {
+/// Every noot refines any intermediate it holds (refining is a universal ability),
+/// faster the more refining experience it has accrued.
+pub fn refine(time: Res<Time>, sim: Res<Sim>, mut q: Query<(&mut Inventory, &mut NootMeta)>) {
     let dt = time.delta_secs();
-    for mut inv in &mut q {
+    for (mut inv, mut meta) in &mut q {
+        let rate = REFINE_RATE * skill_factor(meta.experience);
         for slot in 0..4 {
             let raw = goods::item_index(slot, GoodForm::Raw);
             if sim.0.goods.role_of(raw) != ItemRole::Intermediate || inv.items[raw] <= 0.0 {
                 continue;
             }
             let refined = goods::item_index(slot, GoodForm::Refined);
-            let amount = (REFINE_RATE * dt).min(inv.items[raw]);
+            let amount = (rate * dt).min(inv.items[raw]);
             inv.items[raw] -= amount;
             inv.items[refined] += amount;
+            meta.experience += amount;
         }
     }
 }
@@ -401,7 +428,16 @@ struct Snap {
 /// learned discount on the good's market ask, what it bets it can resell for).
 fn wtp(goods: &goods::WorldGoods, item: usize, s: &Snap) -> f32 {
     let consumption = match goods.role_of(item) {
-        ItemRole::Staple(sub) => STAPLE_VALUE * (s.hunger[sub] / STAPLE_SATIATION),
+        ItemRole::Staple(sub) => {
+            let hunger_val = STAPLE_VALUE * (s.hunger[sub] / STAPLE_SATIATION);
+            // Below the reserve, also stock up (even when not hungry) so a buffer of
+            // food can accumulate when it's cheap.
+            if s.inv[item] < FOOD_RESERVE {
+                hunger_val.max(STAPLE_VALUE * FOOD_BUFFER_WTP_FRAC)
+            } else {
+                hunger_val
+            }
+        }
         // Durable luxuries are only bought once fed; marginal worth falls as the
         // noot's *held* stock of that good grows.
         ItemRole::Positional(_) => {
@@ -435,7 +471,15 @@ fn wtp(goods: &goods::WorldGoods, item: usize, s: &Snap) -> f32 {
 /// ask, so resales never clear at a loss.
 fn reservation(goods: &goods::WorldGoods, item: usize, s: &Snap) -> f32 {
     match goods.role_of(item) {
-        ItemRole::Staple(sub) => STAPLE_VALUE * (s.hunger[sub] / STAPLE_SATIATION),
+        // Won't part with food up to its reserve (held at full staple value, so the
+        // buffer never clears); only true surplus beyond it sells, cheaply when fed.
+        ItemRole::Staple(sub) => {
+            if s.inv[item] <= FOOD_RESERVE {
+                STAPLE_VALUE
+            } else {
+                STAPLE_VALUE * (s.hunger[sub] / STAPLE_SATIATION)
+            }
+        }
         ItemRole::Positional(_) => {
             let marginal = POSITIONAL_VALUE / (1.0 + s.inv[item]);
             let hunger_frac = s.hunger.iter().copied().fold(0.0f32, f32::max) / STAPLE_SATIATION;

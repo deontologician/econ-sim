@@ -1237,7 +1237,15 @@ fn update_selection_ring(
 fn update_selection_panel(
     selection: Res<Selection>,
     sim: Res<Sim>,
-    noots: Query<(&Claim, &Trader, &Wallet, &Hunger, &Inventory, &RouteMemory)>,
+    noots: Query<(
+        &Claim,
+        &Trader,
+        &Wallet,
+        &Hunger,
+        &Inventory,
+        &RouteMemory,
+        &NootMeta,
+    )>,
     mut panel: Query<&mut Text, With<SelectionText>>,
 ) {
     let Ok(mut text) = panel.single_mut() else {
@@ -1248,7 +1256,7 @@ fn update_selection_panel(
         text.0 = stale.into();
         return;
     };
-    let Ok((claim, trader, wallet, hunger, inv, mem)) = noots.get(entity) else {
+    let Ok((claim, trader, wallet, hunger, inv, mem, meta)) = noots.get(entity) else {
         text.0 = stale.into();
         return;
     };
@@ -1264,8 +1272,9 @@ fn update_selection_panel(
 
     let utility = hunger.utility() + economy::positional_utility(&world.goods, inv);
     let mut out = format!(
-        "[selected] noot — {}   discount {:.2}   explore {:.2}   ₦{:.0}   hunger {:.1}   utility {:.2}\n",
+        "[selected] noot — {}   skill {:.2}×   discount {:.2}   explore {:.2}   ₦{:.0}   hunger {:.1}   utility {:.2}\n",
         claim_label,
+        economy::skill_factor(meta.experience),
         trader.discount,
         mem.explore,
         wallet.bucks,
