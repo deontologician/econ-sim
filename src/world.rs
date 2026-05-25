@@ -16,23 +16,19 @@ use crate::hex::neighbors;
 use crate::rng::Rng;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Terrain {
-    Easy,
-    Difficult,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ResourceRole {
     Replenishable,
     Finite,
 }
 
-/// Difficult terrain throttles growth, extraction, and movement.
-pub fn terrain_factor(t: Terrain) -> f32 {
-    match t {
-        Terrain::Easy => 1.0,
-        Terrain::Difficult => 0.55,
-    }
+/// Hardest terrain runs at `1 - DIFFICULTY_SLOWDOWN` of the easiest.
+const DIFFICULTY_SLOWDOWN: f32 = 0.55;
+
+/// Speed multiplier (growth, extraction, movement) for a tile's continuous
+/// difficulty in `[0, 1]`: 1.0 on the easiest ground, falling linearly toward
+/// `1 - DIFFICULTY_SLOWDOWN` on a cliff.
+pub fn terrain_factor(difficulty: f32) -> f32 {
+    1.0 - DIFFICULTY_SLOWDOWN * difficulty.clamp(0.0, 1.0)
 }
 
 pub struct ChosenElement {
@@ -47,7 +43,8 @@ pub struct ChosenElement {
 pub struct Tile {
     pub col: i32,
     pub row: i32,
-    pub terrain: Terrain,
+    /// Continuous movement/work difficulty in `[0, 1]` (0 = easy, 1 = cliff).
+    pub difficulty: f32,
     pub deposit: Option<usize>,
 }
 
@@ -93,7 +90,11 @@ pub struct World {
 
 const DEPOSITS_PER_ELEMENT: usize = 3;
 const SMOOTHING_PASSES: usize = 4;
-const INITIAL_DIFFICULT_CHANCE: f32 = 0.45;
+/// How much a smoothing pass keeps a hex's own difficulty vs. its neighbours'
+/// mean. Lower = smoother (more strongly anchored to surroundings).
+const SMOOTH_SELF_WEIGHT: f32 = 0.35;
+/// Per-hex chance of seeding a cliff: a sharp jump to near-max difficulty.
+const CLIFF_CHANCE: f32 = 0.03;
 
 impl World {
     /// Advance the resource simulation by `dt` seconds. Only regrows
@@ -101,7 +102,7 @@ impl World {
     pub fn tick(&mut self, dt: f32) {
         for di in 0..self.deposits.len() {
             let slot = self.deposits[di].element_slot;
-            let tf = terrain_factor(self.tiles[self.deposits[di].tile].terrain);
+            let tf = terrain_factor(self.tiles[self.deposits[di].tile].difficulty);
             let eff = self.chosen[slot].efficiency;
             if let DepositKind::Replenishable {
                 rate,
@@ -123,7 +124,7 @@ impl World {
     /// amount extracted, which the caller adds to a noot's inventory.
     pub fn extract_from(&mut self, di: usize, base_work: f32, dt: f32) -> f64 {
         let slot = self.deposits[di].element_slot;
-        let tf = terrain_factor(self.tiles[self.deposits[di].tile].terrain);
+        let tf = terrain_factor(self.tiles[self.deposits[di].tile].difficulty);
         let eff = self.chosen[slot].efficiency;
 
         let taken = match &mut self.deposits[di].kind {
@@ -233,42 +234,56 @@ fn generate_terrain(rng: &mut Rng, cols: i32, rows: i32) -> Vec<Tile> {
     let count = (cols * rows) as usize;
     let idx = |c: i32, r: i32| (r * cols + c) as usize;
 
-    let mut terr: Vec<Terrain> = (0..count)
-        .map(|_| {
-            if rng.chance(INITIAL_DIFFICULT_CHANCE) {
-                Terrain::Difficult
-            } else {
-                Terrain::Easy
-            }
-        })
-        .collect();
+    // Start from white noise in [0, 1].
+    let mut d: Vec<f32> = (0..count).map(|_| rng.next_f32()).collect();
 
-    // Cellular-automata smoothing turns the noise into clustered regions of
-    // easy/difficult terrain. Out-of-bounds counts as difficult so the map
-    // gets rugged edges rather than a clean rectangle.
+    // Relax toward the neighbourhood mean so difficulty varies *continuously* and
+    // every hex is anchored to its surroundings. Out-of-bounds reads as max
+    // difficulty, giving the map rugged, hard edges.
     for _ in 0..SMOOTHING_PASSES {
-        let mut next = terr.clone();
+        let mut next = d.clone();
         for r in 0..rows {
             for c in 0..cols {
-                let mut difficult = 0;
+                let mut sum = 0.0;
+                let mut n = 0.0;
                 for (nc, nr) in neighbors(c, r) {
-                    // Out-of-bounds counts as difficult (rugged edges); the bounds
-                    // checks short-circuit before the in-bounds tile is indexed.
                     let oob = nc < 0 || nr < 0 || nc >= cols || nr >= rows;
-                    if oob || terr[idx(nc, nr)] == Terrain::Difficult {
-                        difficult += 1;
-                    }
+                    sum += if oob { 1.0 } else { d[idx(nc, nr)] };
+                    n += 1.0;
                 }
-                next[idx(c, r)] = if difficult >= 4 {
-                    Terrain::Difficult
-                } else if difficult <= 2 {
-                    Terrain::Easy
-                } else {
-                    terr[idx(c, r)]
-                };
+                let mean = sum / n;
+                next[idx(c, r)] =
+                    SMOOTH_SELF_WEIGHT * d[idx(c, r)] + (1.0 - SMOOTH_SELF_WEIGHT) * mean;
             }
         }
-        terr = next;
+        d = next;
+    }
+
+    // Smoothing compresses the range toward the mean; stretch it back to [0, 1]
+    // so the gradients use the full difficulty span.
+    let (lo, hi) = d
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+    let span = (hi - lo).max(1e-3);
+    for x in &mut d {
+        *x = (*x - lo) / span;
+    }
+
+    // Cliffs: sparse, sharp jumps that the smoothing would otherwise erase. Each
+    // seed (and, at random, some neighbours, so it reads as a short ridge rather
+    // than a dot) is pushed to near-max difficulty.
+    for r in 0..rows {
+        for c in 0..cols {
+            if rng.chance(CLIFF_CHANCE) {
+                d[idx(c, r)] = rng.range(0.85, 1.0);
+                for (nc, nr) in neighbors(c, r) {
+                    let oob = nc < 0 || nr < 0 || nc >= cols || nr >= rows;
+                    if !oob && rng.chance(0.5) {
+                        d[idx(nc, nr)] = rng.range(0.8, 1.0);
+                    }
+                }
+            }
+        }
     }
 
     let mut tiles = Vec::with_capacity(count);
@@ -277,7 +292,7 @@ fn generate_terrain(rng: &mut Rng, cols: i32, rows: i32) -> Vec<Tile> {
             tiles.push(Tile {
                 col: c,
                 row: r,
-                terrain: terr[idx(c, r)],
+                difficulty: d[idx(c, r)],
                 deposit: None,
             });
         }
@@ -289,12 +304,9 @@ fn place_deposits(rng: &mut Rng, world: &mut World) {
     for slot in 0..world.chosen.len() {
         let role = world.chosen[slot].role;
         // Replenishables thrive on easy land; finite stocks hide in hard terrain.
-        let prefer = match role {
-            ResourceRole::Replenishable => Terrain::Easy,
-            ResourceRole::Finite => Terrain::Difficult,
-        };
+        let prefer_hard = matches!(role, ResourceRole::Finite);
         for _ in 0..DEPOSITS_PER_ELEMENT {
-            let Some(tile) = pick_empty_tile(rng, &world.tiles, prefer) else {
+            let Some(tile) = pick_empty_tile(rng, &world.tiles, prefer_hard) else {
                 break;
             };
             let kind = match role {
@@ -325,7 +337,7 @@ fn place_deposits(rng: &mut Rng, world: &mut World) {
     }
 }
 
-fn pick_empty_tile(rng: &mut Rng, tiles: &[Tile], prefer: Terrain) -> Option<usize> {
+fn pick_empty_tile(rng: &mut Rng, tiles: &[Tile], prefer_hard: bool) -> Option<usize> {
     let n = tiles.len();
     let mut fallback = None;
     for _ in 0..40 {
@@ -333,7 +345,7 @@ fn pick_empty_tile(rng: &mut Rng, tiles: &[Tile], prefer: Terrain) -> Option<usi
         if tiles[t].deposit.is_some() {
             continue;
         }
-        if tiles[t].terrain == prefer {
+        if (tiles[t].difficulty > 0.5) == prefer_hard {
             return Some(t);
         }
         fallback = Some(t);

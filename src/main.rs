@@ -18,7 +18,7 @@ use goods::{GoodCategory, GoodForm};
 use movement::tile_to_pixel;
 use noot::{Claim, Hunger, Inventory, Noot, RouteMemory, TilePos, Trader, Wallet, STARTING_BUCKS};
 use rng::Rng;
-use world::{generate, terrain_factor, ResourceRole, Terrain, World};
+use world::{generate, ResourceRole, World};
 
 // --- World generation knobs -------------------------------------------------
 const COLS: i32 = 30;
@@ -287,29 +287,25 @@ fn setup(
 
     commands.spawn((Camera2d, Transform::from_scale(Vec3::splat(init_zoom))));
 
-    // Shared tile mesh + per-terrain materials. Each tile also gets two hidden,
-    // toggleable overlay cells stacked above it (z 0.4 terrain, z 1.6 value) — the
-    // value heat sits just under the noot layer (z 2.0) so noots ride on top.
+    // Tiles share one neutral material — difficulty is shown *only* via the
+    // toggleable terrain overlay, so it never fights the value heat overlay. Each
+    // tile also gets two hidden overlay cells stacked above it (z 0.4 terrain,
+    // z 1.6 value) — the value heat sits just under the noot layer (z 2.0).
     let hex_mesh = meshes.add(RegularPolygon::new(hex_size * 0.96, 6));
-    let easy_mat = materials.add(Color::srgb(0.16, 0.28, 0.20));
-    let difficult_mat = materials.add(Color::srgb(0.34, 0.24, 0.17));
+    let tile_mat = materials.add(Color::srgb(0.18, 0.20, 0.22));
     for tile in &world.tiles {
         let (x, y) = hex::hex_center(tile.col, tile.row, hex_size);
         let (px, py) = (x + offset.x, y + offset.y);
-        let material = match tile.terrain {
-            Terrain::Easy => easy_mat.clone(),
-            Terrain::Difficult => difficult_mat.clone(),
-        };
         commands.spawn((
             Mesh2d(hex_mesh.clone()),
-            MeshMaterial2d(material),
+            MeshMaterial2d(tile_mat.clone()),
             Transform::from_xyz(px, py, 0.0),
         ));
 
-        // Terrain-difficulty overlay: green (easy) → red (hard) by movement cost.
-        // A sub-1.0 alpha makes `ColorMaterial` blend, so the map shows through.
-        let d = (1.0 - terrain_factor(tile.terrain)).clamp(0.0, 1.0);
-        let terr_color = Color::srgba((0.2 + 1.6 * d).min(1.0), (0.7 - 1.2 * d).max(0.0), 0.1, 0.4);
+        // Terrain-difficulty overlay: green (easy) → red (hard), by the tile's
+        // continuous difficulty. A sub-1.0 alpha makes `ColorMaterial` blend.
+        let d = tile.difficulty.clamp(0.0, 1.0);
+        let terr_color = Color::srgba((0.2 + 1.6 * d).min(1.0), (0.7 - 1.2 * d).max(0.0), 0.1, 0.5);
         commands.spawn((
             Mesh2d(hex_mesh.clone()),
             MeshMaterial2d(materials.add(terr_color)),

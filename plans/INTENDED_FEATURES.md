@@ -145,8 +145,8 @@ design. Newest first within each section.
 - **NOW**: each world draws two **replenishable** elements (deposits regrow
   logistically toward a capacity at a per-deposit rate) and two **finite** ones
   (a large fixed stock extracted with diminishing returns as it depletes, never
-  regrowing). Roles are assigned per playthrough; replenishables favour easy
-  terrain, finite stocks hide in difficult terrain. *(partial)*
+  regrowing). Roles are assigned per playthrough; replenishables favour
+  low-difficulty ground, finite stocks hide in the rugged, cliff-strewn terrain. *(partial)*
 - **INTENDED**: richer resource dynamics — discovery/prospecting of new deposits,
   depletion driving migration and price shocks, regrowth affected by use and
   environment, and finite stocks creating long-run scarcity the economy must

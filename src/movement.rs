@@ -106,7 +106,7 @@ pub fn movement(
         }
 
         // Difficult terrain makes each step take longer.
-        let tf = terrain_factor(world.tiles[tile_idx(world, pos.col, pos.row)].terrain);
+        let tf = terrain_factor(world.tiles[tile_idx(world, pos.col, pos.row)].difficulty);
         mem.move_cooldown = BASE_STEP_TIME / tf;
     }
 }
