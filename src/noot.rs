@@ -20,11 +20,68 @@ pub const STARVING_FRACTION: f32 = 0.9;
 /// Owners stop extracting once carrying this much of their raw good.
 pub const CARRY_CAP: f32 = 20.0;
 
+// --- Transporters (principal–agent hauling) ---------------------------------
+/// Owner's cut of a haul's sale revenue; the transporter keeps `1 - SHARE`.
+pub const PRINCIPAL_SHARE: f32 = 0.6;
+/// Raw units a transporter loads per pickup. Kept above the owner's depart
+/// threshold so a single pickup drops the owner back below it (keeping the
+/// owner home extracting instead of touring to sell).
+pub const HAUL_CAPACITY: f32 = 12.0;
+/// Steps a transporter wanders selling before being forced to return & settle.
+pub const HAUL_SELL_STEPS: u32 = 12;
+/// Only hire a hauler for an owner carrying at least this much raw to move.
+pub const MIN_HIRE: f32 = 4.0;
+
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Owner { deposit: usize },
     Refiner,
     Consumer,
+    Transporter,
+}
+
+/// A transporter's progress through one hauling contract.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HaulState {
+    /// No contract; waiting to be matched to an owner.
+    Idle,
+    /// Walking to the employer's deposit to collect cargo.
+    ToPickup,
+    /// At the deposit, loading cargo from the employer.
+    Loading,
+    /// Wandering with cargo, selling to whoever's nearby.
+    Selling,
+    /// Walking back to the employer to hand over their share.
+    Returning,
+}
+
+/// Hauling assignment carried by every transporter (idle when unmatched).
+#[derive(Component)]
+pub struct HaulContract {
+    pub state: HaulState,
+    /// The owner who hired this transporter; `None` only while `Idle`.
+    pub employer: Option<Entity>,
+    /// Index into `World::deposits` of the employer's deposit.
+    pub deposit: usize,
+    /// Raw item index being hauled.
+    pub cargo_item: usize,
+    /// Bucks banked from selling this contract's cargo (the owner's share is a
+    /// fraction of this, settled on return).
+    pub proceeds: f32,
+    pub sell_steps: u32,
+}
+
+impl HaulContract {
+    pub fn idle() -> Self {
+        Self {
+            state: HaulState::Idle,
+            employer: None,
+            deposit: 0,
+            cargo_item: 0,
+            proceeds: 0.0,
+            sell_steps: 0,
+        }
+    }
 }
 
 #[derive(Component, Clone, Copy)]
@@ -83,12 +140,28 @@ impl Hunger {
             .iter()
             .any(|&a| a >= STAPLE_SATIATION * STARVING_FRACTION)
     }
+
+    /// Welfare from *not* being hungry: 1.0 per fully-fed staple, 0.0 when a
+    /// staple is fully starving.
+    pub fn utility(&self) -> f32 {
+        self.staple
+            .iter()
+            .map(|&a| (STAPLE_SATIATION - a) / STAPLE_SATIATION)
+            .sum()
+    }
 }
 
 /// Accumulated stock of each positional good (drives logarithmic utility).
 #[derive(Component)]
 pub struct Positional {
     pub stock: [f32; N_POSITIONAL],
+}
+
+impl Positional {
+    /// Diminishing (logarithmic) welfare from accumulated positional goods.
+    pub fn utility(&self) -> f32 {
+        self.stock.iter().map(|&s| (1.0 + s).ln()).sum()
+    }
 }
 
 /// Simple per-noot learning + walk state.
@@ -101,7 +174,10 @@ pub struct Brain {
     pub trip_step: u32,
     /// True while walking out, false while returning home.
     pub outbound: bool,
-    pub sold_this_trip: bool,
+    /// Welfare (utility) gained this trip — the reinforcement signal. Earned by
+    /// consuming what you acquired, so buying to eat is rewarded just like
+    /// selling was.
+    pub trip_reward: f32,
     /// Seconds until the next tile step.
     pub move_cooldown: f32,
 }
@@ -113,7 +189,7 @@ impl Brain {
             weights: [1.0; 6],
             trip_step: 0,
             outbound: true,
-            sold_this_trip: false,
+            trip_reward: 0.0,
             move_cooldown: 0.0,
         }
     }

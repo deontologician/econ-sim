@@ -17,10 +17,23 @@ design. Newest first within each section.
 
 ### Consumer income / wages
 - **NOW**: every noot gets a flat universal bucks trickle (`BUCKS_INCOME`/sec) so
-  consumers don't go broke and demand keeps circulating. *(stub)*
+  consumers don't go broke and demand keeps circulating. Transporters are the
+  first *earned* income (a share of haul revenue), but the universal trickle is
+  still on. *(stub)*
 - **INTENDED**: no free money. Noots earn bucks only by producing/selling, doing
   paid work (transport, refining, hauling), or a real labor market. Bucks should
-  be conserved except where minted by a defined mechanism.
+  be conserved except where minted by a defined mechanism. Retiring the trickle
+  needs a consumer-side way to earn (e.g. labor) so demand doesn't collapse.
+- **STATUS**: stub
+
+### Extraction efficiency
+- **NOW**: each element carries a single `efficiency` multiplier (fixed at 1.0)
+  that scales replenishable regrowth and finite extraction. The old player
+  "invest" buttons that bumped it have been removed as a dead end. *(stub)*
+- **INTENDED**: efficiency is a property of the **extractor**, not a global or
+  per-resource setting — owners improve their own extraction over time (learning,
+  capital, tooling), so productivity varies between extractors and emerges from
+  play rather than a slider.
 - **STATUS**: stub
 
 ### Pricing / market clearing
@@ -32,11 +45,17 @@ design. Newest first within each section.
 - **STATUS**: partial
 
 ### Transporters (principal–agent hauling)
-- **NOW**: not present. *(deferred)*
-- **INTENDED**: an owner can hire a non-owner to carry goods elsewhere and sell;
-  the transporter keeps a cut and returns the owner's share. Contracts, trust,
-  default risk, route choice. (Plan 002.)
-- **STATUS**: deferred
+- **NOW**: a *transporter role* (`HaulContract` state machine). An idle hauler is
+  auto-matched to the most-loaded owner (`haul_assign` — a stub for a real labor
+  market), walks to the deposit, loads `HAUL_CAPACITY` raw units, wanders selling
+  for a bounded number of steps, then returns and pays the owner `PRINCIPAL_SHARE`
+  of the take (keeping the rest); unsold cargo is returned. While a hauler keeps
+  draining an owner, the owner stays put extracting instead of touring. *(partial)*
+- **INTENDED**: negotiated contracts (not auto-assignment), trust and default
+  risk (a hauler could abscond with the goods/proceeds), competition for haulers,
+  route/price choice, and pay flowing from a real labor market rather than a
+  fixed share constant. (Plan 002.)
+- **STATUS**: partial
 
 ### Refining
 - **NOW**: a *refiner role* converts a raw intermediate into the element's
@@ -55,21 +74,48 @@ design. Newest first within each section.
 
 ## Agents (noots)
 
+### Welfare / utility
+- **NOW**: a noot's utility = "not starving" (per staple, `(satiation−appetite)/
+  satiation`) + diminishing positional welfare (`Σ ln(1+stock)`). Realized at
+  consumption; shown per-noot in the selection panel and economy-wide as a
+  utility/sec rate. *(partial)*
+- **INTENDED**: utility should drive more decisions — willingness-to-pay,
+  labor-supply and role choices, savings — not just the movement reward and a
+  readout. Tune the staple/positional weighting and add more want categories.
+- **STATUS**: partial
+
 ### Movement learning (RL)
-- **NOW**: a simple per-noot heading bandit — reinforce the outbound heading if a
-  sale happened, ε-greedy exploration, hardcoded straight-ish return home. *(partial)*
+- **NOW**: a per-noot heading bandit reinforced by the **welfare gained that
+  trip** (consuming what was bought/sold-for), so buyers are rewarded for buying
+  just as sellers were for selling; ε-greedy exploration, greedy return home.
+  *(partial)*
 - **INTENDED**: richer policy (state = local memory of where buyers/sellers/prices
   were), value estimates per region, proper exploration/exploitation, maybe
-  learned routes.
+  learned routes. Consumers in particular should learn *where to buy*, not just a
+  heading.
 - **STATUS**: partial
 
 ## World
 
 ### Seeding / variety
-- **NOW**: fixed `SEED` constant ⇒ every load is the same world. *(stub)*
-- **INTENDED**: seed from entropy (or a UI seed field) for per-playthrough variety;
-  shareable seeds.
-- **STATUS**: stub
+- **NOW**: the seed is drawn from entropy each load (`js_sys` time+random on web,
+  `SystemTime` natively), so every visit is a different world. The run stays
+  reproducible from the drawn seed, which the HUD prints. *(partial)*
+- **INTENDED**: a UI seed field to enter/replay a specific seed; shareable seed
+  links.
+- **STATUS**: partial
+
+### Renewable vs finite resources
+- **NOW**: each world draws two **replenishable** elements (deposits regrow
+  logistically toward a capacity at a per-deposit rate) and two **finite** ones
+  (a large fixed stock extracted with diminishing returns as it depletes, never
+  regrowing). Roles are assigned per playthrough; replenishables favour easy
+  terrain, finite stocks hide in difficult terrain. *(partial)*
+- **INTENDED**: richer resource dynamics — discovery/prospecting of new deposits,
+  depletion driving migration and price shocks, regrowth affected by use and
+  environment, and finite stocks creating long-run scarcity the economy must
+  adapt to.
+- **STATUS**: partial
 
 ## Rendering / UI
 

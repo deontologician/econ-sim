@@ -8,7 +8,7 @@ use bevy::prelude::*;
 
 use crate::goods::{self, GoodForm};
 use crate::hex::{hex_center, neighbors};
-use crate::noot::{Brain, Home, Inventory, Role, TilePos};
+use crate::noot::{Brain, HaulContract, HaulState, Home, Inventory, Role, TilePos, HAUL_SELL_STEPS};
 use crate::world::{terrain_factor, World};
 use crate::{MapView, Sim, SimRng};
 
@@ -17,6 +17,8 @@ const BASE_STEP_TIME: f32 = 0.35;
 const HEADING_BIAS: f32 = 0.7;
 const EPSILON: f32 = 0.15;
 const WEIGHT_DECAY: f32 = 0.98;
+/// Cap on a single trip's reinforcement so weights stay bounded.
+const REWARD_CAP: f32 = 3.0;
 /// Owners stay on their deposit, extracting, until they carry this much to sell.
 const LOAD_THRESHOLD: f32 = 6.0;
 
@@ -38,14 +40,19 @@ pub fn movement(
     mut rng: ResMut<SimRng>,
     sim: Res<Sim>,
     view: Res<MapView>,
-    mut noots: Query<(
-        &mut TilePos,
-        &Home,
-        &mut Brain,
-        &mut Transform,
-        &Role,
-        &Inventory,
-    )>,
+    // Transporters move under `haul_movement`; exclude them here so the two
+    // systems' `&mut Transform`/`&mut TilePos` accesses stay provably disjoint.
+    mut noots: Query<
+        (
+            &mut TilePos,
+            &Home,
+            &mut Brain,
+            &mut Transform,
+            &Role,
+            &Inventory,
+        ),
+        Without<HaulContract>,
+    >,
 ) {
     let world = &sim.0;
     let dt = time.delta_secs();
@@ -86,6 +93,82 @@ pub fn movement(
         }
 
         // Difficult terrain makes each step take longer.
+        let tf = terrain_factor(world.tiles[tile_idx(world, pos.col, pos.row)].terrain);
+        brain.move_cooldown = BASE_STEP_TIME / tf;
+    }
+}
+
+/// Transporters navigate by contract state rather than the learned-heading
+/// wander: walk to the employer's deposit, then (once loaded) wander selling,
+/// then walk back to settle. Reuses `step_toward`/`choose_outbound`.
+pub fn haul_movement(
+    time: Res<Time>,
+    mut rng: ResMut<SimRng>,
+    sim: Res<Sim>,
+    view: Res<MapView>,
+    mut q: Query<(
+        &mut TilePos,
+        &mut Transform,
+        &mut Brain,
+        &Inventory,
+        &mut HaulContract,
+    )>,
+) {
+    let world = &sim.0;
+    let dt = time.delta_secs();
+
+    for (mut pos, mut transform, mut brain, inv, mut contract) in &mut q {
+        // Glide the sprite toward the current tile centre (same as `movement`).
+        let target = tile_to_pixel(pos.col, pos.row, world.hex_size, view.offset);
+        let t = (dt * 8.0).min(1.0);
+        transform.translation.x += (target.x - transform.translation.x) * t;
+        transform.translation.y += (target.y - transform.translation.y) * t;
+
+        // Idle: waiting for assignment. Loading: waiting for `haul_loading`.
+        if matches!(contract.state, HaulState::Idle | HaulState::Loading) {
+            continue;
+        }
+
+        brain.move_cooldown -= dt;
+        if brain.move_cooldown > 0.0 {
+            continue;
+        }
+
+        let dtile = world.deposits[contract.deposit].tile;
+        let (tc, tr) = (world.tiles[dtile].col, world.tiles[dtile].row);
+        let at_deposit = pos.col == tc && pos.row == tr;
+
+        match contract.state {
+            HaulState::ToPickup => {
+                if at_deposit {
+                    contract.state = HaulState::Loading; // `haul_loading` fills cargo
+                } else {
+                    let (c, r) = step_toward(world, pos.col, pos.row, tc, tr);
+                    pos.col = c;
+                    pos.row = r;
+                }
+            }
+            HaulState::Selling => {
+                let (c, r) = choose_outbound(&mut rng.0, world, pos.col, pos.row, brain.heading);
+                pos.col = c;
+                pos.row = r;
+                contract.sell_steps += 1;
+                let sold_out = inv.items[contract.cargo_item] <= 0.0;
+                if sold_out || contract.sell_steps >= HAUL_SELL_STEPS {
+                    contract.state = HaulState::Returning;
+                }
+            }
+            HaulState::Returning => {
+                if !at_deposit {
+                    let (c, r) = step_toward(world, pos.col, pos.row, tc, tr);
+                    pos.col = c;
+                    pos.row = r;
+                }
+                // On arrival, `haul_settle` finalizes and resets to Idle.
+            }
+            HaulState::Idle | HaulState::Loading => {}
+        }
+
         let tf = terrain_factor(world.tiles[tile_idx(world, pos.col, pos.row)].terrain);
         brain.move_cooldown = BASE_STEP_TIME / tf;
     }
@@ -146,8 +229,10 @@ fn step_toward(world: &World, col: i32, row: i32, hc: i32, hr: i32) -> (i32, i32
 }
 
 fn reinforce_and_reset(brain: &mut Brain, rng: &mut crate::rng::Rng) {
-    if brain.sold_this_trip {
-        brain.weights[brain.heading] += 1.0;
+    // Reinforce the heading by the welfare this trip produced (consuming what
+    // was bought/sold-for), so productive directions are favoured next time.
+    if brain.trip_reward > 0.0 {
+        brain.weights[brain.heading] += brain.trip_reward.min(REWARD_CAP);
     }
     for w in &mut brain.weights {
         *w *= WEIGHT_DECAY;
@@ -160,7 +245,7 @@ fn reinforce_and_reset(brain: &mut Brain, rng: &mut crate::rng::Rng) {
     };
     brain.trip_step = 0;
     brain.outbound = true;
-    brain.sold_this_trip = false;
+    brain.trip_reward = 0.0;
 }
 
 fn argmax(weights: &[f32; 6]) -> usize {

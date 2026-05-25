@@ -46,25 +46,37 @@ pub struct EconStats {
     pub produced_total: f64,
     /// Cumulative units consumed (staples eaten + positional goods used up).
     pub consumed_total: f64,
-    /// Most recent windowed rates, in units/sec.
+    /// Cumulative units picked up by transporters for hauling.
+    pub hauled_total: f64,
+    /// Cumulative welfare (utility) realized through consumption.
+    pub utility_total: f64,
+    /// Most recent windowed rates, in units (or utility) per second.
     pub production_rate: f32,
     pub consumption_rate: f32,
+    pub hauled_rate: f32,
+    pub utility_rate: f32,
     // Accumulators for the in-progress rate window.
     produced_window: f32,
     consumed_window: f32,
+    hauled_window: f32,
+    utility_window: f32,
     window_elapsed: f32,
 }
 
-/// Convert the running production/consumption tallies into per-second rates,
-/// once per `RATE_WINDOW` so the HUD numbers don't jitter every frame.
+/// Convert the running production/consumption/haul tallies into per-second
+/// rates, once per `RATE_WINDOW` so the HUD numbers don't jitter every frame.
 pub fn update_rates(time: Res<Time>, mut stats: ResMut<EconStats>) {
     stats.window_elapsed += time.delta_secs();
     if stats.window_elapsed >= RATE_WINDOW {
         let inv = 1.0 / stats.window_elapsed;
         stats.production_rate = stats.produced_window * inv;
         stats.consumption_rate = stats.consumed_window * inv;
+        stats.hauled_rate = stats.hauled_window * inv;
+        stats.utility_rate = stats.utility_window * inv;
         stats.produced_window = 0.0;
         stats.consumed_window = 0.0;
+        stats.hauled_window = 0.0;
+        stats.utility_window = 0.0;
         stats.window_elapsed = 0.0;
     }
 }
@@ -135,11 +147,17 @@ pub fn refine(time: Res<Time>, sim: Res<Sim>, mut q: Query<(&Role, &mut Inventor
 pub fn consume(
     sim: Res<Sim>,
     mut stats: ResMut<EconStats>,
-    mut q: Query<(&mut Inventory, &mut Hunger, &mut Positional)>,
+    mut q: Query<(&Role, &mut Inventory, &mut Hunger, &mut Positional, &mut Brain)>,
 ) {
     let dt_goods = &sim.0.goods;
     let mut eaten = 0.0f32;
-    for (mut inv, mut hunger, mut positional) in &mut q {
+    let mut utility_gained = 0.0f32;
+    for (role, mut inv, mut hunger, mut positional, mut brain) in &mut q {
+        // Transporters carry goods for others; they don't eat the cargo.
+        if matches!(role, Role::Transporter) {
+            continue;
+        }
+        let mut reward = 0.0f32;
         // Staples first (satisficing: eat only to satiation, surplus unused).
         for item in 0..N_ITEMS {
             if let ItemRole::Staple(sub) = dt_goods.role_of(item) {
@@ -149,6 +167,8 @@ pub fn consume(
                     inv.items[item] -= eat;
                     hunger.staple[sub] = (hunger.staple[sub] - eat * EAT_VALUE).max(0.0);
                     eaten += eat;
+                    // Welfare from no longer being hungry.
+                    reward += (eat * EAT_VALUE) / STAPLE_SATIATION;
                 }
             }
         }
@@ -158,16 +178,23 @@ pub fn consume(
                 if let ItemRole::Positional(sub) = dt_goods.role_of(item) {
                     if inv.items[item] > 0.0 {
                         let c = inv.items[item].min(POSITIONAL_CONSUME_RATE);
+                        let before = (1.0 + positional.stock[sub]).ln();
                         inv.items[item] -= c;
                         positional.stock[sub] += c;
                         eaten += c;
+                        // Diminishing (log) welfare from the new positional stock.
+                        reward += (1.0 + positional.stock[sub]).ln() - before;
                     }
                 }
             }
         }
+        brain.trip_reward += reward;
+        utility_gained += reward;
     }
     stats.consumed_window += eaten;
     stats.consumed_total += eaten as f64;
+    stats.utility_window += utility_gained;
+    stats.utility_total += utility_gained as f64;
 }
 
 struct Snap {
@@ -182,6 +209,10 @@ struct Snap {
 }
 
 fn wtp(goods: &goods::WorldGoods, item: usize, s: &Snap) -> f32 {
+    // Transporters are pure logistics agents: they haul and sell, never buy.
+    if matches!(s.role, Role::Transporter) {
+        return 0.0;
+    }
     match goods.role_of(item) {
         ItemRole::Staple(sub) => STAPLE_VALUE * (s.hunger[sub] / STAPLE_SATIATION),
         ItemRole::Positional(sub) => {
@@ -231,8 +262,10 @@ pub fn meet_and_trade(
         &mut Wallet,
         &Hunger,
         &Positional,
-        &mut Brain,
     )>,
+    // Separate query (HaulContract isn't in the tuple above, so no conflict):
+    // record a hauling seller's revenue so it can settle the owner's share.
+    mut contracts: Query<&mut HaulContract>,
 ) {
     let goods = &sim.0.goods;
     let radius2 = (sim.0.hex_size * TRADE_RADIUS_FACTOR).powi(2);
@@ -240,7 +273,7 @@ pub fn meet_and_trade(
     // Snapshot (immutable read) so we can reason about pairs without aliasing.
     let mut snaps: Vec<Snap> = q
         .iter()
-        .map(|(e, t, role, inv, wal, hunger, pos, _brain)| Snap {
+        .map(|(e, t, role, inv, wal, hunger, pos)| Snap {
             e,
             pos: t.translation.truncate(),
             role: *role,
@@ -298,14 +331,153 @@ pub fn meet_and_trade(
 
     // Apply to the ECS, one entity borrow at a time.
     for tx in txs {
-        if let Ok((_, _, _, mut inv, mut wal, _, _, _)) = q.get_mut(tx.buyer) {
+        if let Ok((_, _, _, mut inv, mut wal, _, _)) = q.get_mut(tx.buyer) {
             inv.items[tx.item] += 1.0;
             wal.bucks -= tx.price;
         }
-        if let Ok((_, _, _, mut inv, mut wal, _, _, mut brain)) = q.get_mut(tx.seller) {
+        if let Ok((_, _, _, mut inv, mut wal, _, _)) = q.get_mut(tx.seller) {
             inv.items[tx.item] -= 1.0;
             wal.bucks += tx.price;
-            brain.sold_this_trip = true;
         }
+        // If the seller is a transporter mid-haul, tally the take so the owner's
+        // share can be paid back on settlement. (Borrow is separate from `q`.)
+        if let Ok(mut contract) = contracts.get_mut(tx.seller) {
+            if matches!(contract.state, HaulState::Selling | HaulState::Returning) {
+                contract.proceeds += tx.price;
+            }
+        }
+    }
+}
+
+/// Match each idle transporter to the owner most in need of hauling (the one
+/// carrying the most raw, above `MIN_HIRE`). v1 stub for a real labor market:
+/// each owner is claimed by at most one transporter per assignment pass.
+pub fn haul_assign(
+    sim: Res<Sim>,
+    mut transporters: Query<(&TilePos, &mut HaulContract)>,
+    owners: Query<(Entity, &Role, &Inventory)>,
+) {
+    // Pass 1: collect owners already being served so we don't double-book.
+    let mut claimed: Vec<Entity> = Vec::new();
+    let mut any_idle = false;
+    for (_, contract) in &transporters {
+        match contract.employer {
+            Some(e) if contract.state != HaulState::Idle => claimed.push(e),
+            _ => any_idle = true,
+        }
+    }
+    if !any_idle {
+        return;
+    }
+
+    // Candidate owners with a worthwhile load, richest first.
+    let mut candidates: Vec<(Entity, usize, f32)> = Vec::new(); // owner, deposit, raw
+    for (e, role, inv) in &owners {
+        let Role::Owner { deposit } = *role else {
+            continue;
+        };
+        let slot = sim.0.deposits[deposit].element_slot;
+        let raw = goods::item_index(slot, GoodForm::Raw);
+        if inv.items[raw] >= MIN_HIRE {
+            candidates.push((e, deposit, inv.items[raw]));
+        }
+    }
+    candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Pass 2: hand each idle transporter the best unclaimed owner.
+    for (_, mut contract) in &mut transporters {
+        if contract.state != HaulState::Idle {
+            continue;
+        }
+        let Some(&(owner, deposit, _)) = candidates.iter().find(|(e, _, _)| !claimed.contains(e))
+        else {
+            break; // no owners left to serve this pass
+        };
+        let slot = sim.0.deposits[deposit].element_slot;
+        contract.state = HaulState::ToPickup;
+        contract.employer = Some(owner);
+        contract.deposit = deposit;
+        contract.cargo_item = goods::item_index(slot, GoodForm::Raw);
+        contract.proceeds = 0.0;
+        contract.sell_steps = 0;
+        claimed.push(owner);
+    }
+}
+
+/// A transporter standing on its employer's deposit loads cargo from the
+/// owner's inventory, then sets off to sell.
+pub fn haul_loading(
+    sim: Res<Sim>,
+    mut stats: ResMut<EconStats>,
+    mut transporters: Query<(Entity, &TilePos, &mut HaulContract)>,
+    mut invs: Query<&mut Inventory>,
+) {
+    for (te, pos, mut contract) in &mut transporters {
+        if contract.state != HaulState::Loading {
+            continue;
+        }
+        let Some(employer) = contract.employer else {
+            contract.state = HaulState::Idle;
+            continue;
+        };
+        let dtile = sim.0.deposits[contract.deposit].tile;
+        if pos.col != sim.0.tiles[dtile].col || pos.row != sim.0.tiles[dtile].row {
+            continue;
+        }
+        // Two distinct entities → simultaneous mutable borrows are safe.
+        let mut loaded = 0.0f32;
+        if let Ok([mut t_inv, mut e_inv]) = invs.get_many_mut([te, employer]) {
+            let take = e_inv.items[contract.cargo_item].min(HAUL_CAPACITY);
+            e_inv.items[contract.cargo_item] -= take;
+            t_inv.items[contract.cargo_item] += take;
+            loaded = take;
+        }
+        stats.hauled_window += loaded;
+        stats.hauled_total += loaded as f64;
+        // With cargo, go sell; empty-handed, head straight back to settle.
+        contract.sell_steps = 0;
+        contract.state = if loaded > 0.0 {
+            HaulState::Selling
+        } else {
+            HaulState::Returning
+        };
+    }
+}
+
+/// A returning transporter on its employer's deposit pays the owner's share of
+/// the take, returns any unsold cargo, and goes idle (ready to be rehired).
+pub fn haul_settle(
+    sim: Res<Sim>,
+    mut transporters: Query<(Entity, &TilePos, &mut HaulContract)>,
+    mut wallets: Query<&mut Wallet>,
+    mut invs: Query<&mut Inventory>,
+) {
+    for (te, pos, mut contract) in &mut transporters {
+        if contract.state != HaulState::Returning {
+            continue;
+        }
+        let Some(employer) = contract.employer else {
+            *contract = HaulContract::idle();
+            continue;
+        };
+        let dtile = sim.0.deposits[contract.deposit].tile;
+        if pos.col != sim.0.tiles[dtile].col || pos.row != sim.0.tiles[dtile].row {
+            continue;
+        }
+
+        let payout = contract.proceeds * PRINCIPAL_SHARE;
+        if let Ok([mut t_w, mut e_w]) = wallets.get_many_mut([te, employer]) {
+            let pay = payout.min(t_w.bucks.max(0.0));
+            t_w.bucks -= pay;
+            e_w.bucks += pay;
+        }
+        if let Ok([mut t_i, mut e_i]) = invs.get_many_mut([te, employer]) {
+            let left = t_i.items[contract.cargo_item];
+            if left > 0.0 {
+                t_i.items[contract.cargo_item] -= left;
+                e_i.items[contract.cargo_item] += left;
+            }
+        }
+        *contract = HaulContract::idle();
     }
 }
