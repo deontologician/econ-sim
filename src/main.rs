@@ -58,7 +58,14 @@ pub struct SimRng(pub Rng);
 pub struct MapView {
     pub offset: Vec2,
     pub hex_size: f32,
+    /// Full map extent in world units, used to fit the camera on launch.
+    pub map_w: f32,
+    pub map_h: f32,
 }
+
+/// How long after launch the camera keeps re-fitting the map, so the wasm canvas
+/// (which resizes to its parent post-launch) settles before zoom is left to the user.
+const FIT_SETTLE_SECS: f32 = 0.3;
 
 /// The noot currently selected and followed, if any.
 #[derive(Resource, Default)]
@@ -167,6 +174,7 @@ fn main() {
                     follow_selected,
                     pause_controls,
                     overlay_controls,
+                    fit_camera_to_screen,
                 ),
                 (
                     update_hud,
@@ -234,8 +242,9 @@ fn setup(
         economy::TARGET_DEATH_FRAC_PER_MIN * n_noots,
     ));
 
-    // Centre the map on the origin and pick an initial zoom that fits a typical
-    // phone screen in portrait, so the whole world is visible on first load.
+    // Centre the map on the origin. `fit_camera_to_screen` does the real framing
+    // once the window size is known; this is just a sane portrait fallback for the
+    // first frames (fill the tighter axis — the looser one overflows and can be panned).
     let mut min = Vec2::splat(f32::MAX);
     let mut max = Vec2::splat(f32::MIN);
     for tile in &world.tiles {
@@ -246,7 +255,7 @@ fn setup(
     let offset = -(min + max) * 0.5;
     let map_w = (max.x - min.x) + hex_size * 2.0;
     let map_h = (max.y - min.y) + hex_size * 2.0;
-    let init_zoom = (map_w / 400.0).max(map_h / 800.0).clamp(MIN_ZOOM, MAX_ZOOM);
+    let init_zoom = (map_w / 400.0).min(map_h / 800.0).clamp(MIN_ZOOM, MAX_ZOOM);
 
     commands.spawn((Camera2d, Transform::from_scale(Vec3::splat(init_zoom))));
 
@@ -315,7 +324,12 @@ fn setup(
         ));
     }
 
-    commands.insert_resource(MapView { offset, hex_size });
+    commands.insert_resource(MapView {
+        offset,
+        hex_size,
+        map_w,
+        map_h,
+    });
 
     // Highlight ring for the selected noot (hidden until something is picked).
     let ring_mesh = meshes.add(Annulus::new(hex_size * 0.34, hex_size * 0.46));
@@ -654,6 +668,35 @@ fn keyboard_mouse_camera(
         let factor = if scroll.delta.y > 0.0 { 0.9 } else { 1.1 };
         transform.scale = Vec3::splat((scale * factor).clamp(MIN_ZOOM, MAX_ZOOM));
     }
+}
+
+/// Fit the map to the real window for the first `FIT_SETTLE_SECS` after launch
+/// (long enough for the wasm canvas to settle into its parent), then hand zoom to
+/// the user. Scale fills the tighter screen axis — fit to width or height by
+/// whichever needs the smaller zoom — so the looser axis overflows and can be panned.
+fn fit_camera_to_screen(
+    time: Res<Time>,
+    view: Res<MapView>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut camera: Query<&mut Transform, With<Camera2d>>,
+    mut elapsed: Local<f32>,
+) {
+    if *elapsed > FIT_SETTLE_SECS {
+        return;
+    }
+    *elapsed += time.delta_secs();
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let (w, h) = (window.width(), window.height());
+    if w < 1.0 || h < 1.0 {
+        return;
+    }
+    let Ok(mut transform) = camera.single_mut() else {
+        return;
+    };
+    let zoom = (view.map_w / w).min(view.map_h / h).clamp(MIN_ZOOM, MAX_ZOOM);
+    transform.scale = Vec3::splat(zoom);
 }
 
 /// A tap (touch) or left-click that didn't pan selects the nearest noot under
