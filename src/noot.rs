@@ -37,6 +37,23 @@ pub const DISCOUNT_LR: f32 = 0.04;
 #[derive(Component)]
 pub struct Noot;
 
+/// Per-noot life stats, surfaced by the noot-colouring overlays. `age` is seconds
+/// lived (reset on respawn); `transactions` counts trades made (buys + sells).
+#[derive(Component)]
+pub struct NootMeta {
+    pub age: f32,
+    pub transactions: u32,
+}
+
+impl NootMeta {
+    pub fn new() -> Self {
+        Self {
+            age: 0.0,
+            transactions: 0,
+        }
+    }
+}
+
 /// Which deposit a noot has claimed and may mine, if any. Claims are sticky: a
 /// noot keeps its first claim and ignores other unowned deposits it passes.
 #[derive(Component)]

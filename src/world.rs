@@ -89,12 +89,18 @@ pub struct World {
 }
 
 const DEPOSITS_PER_ELEMENT: usize = 3;
-const SMOOTHING_PASSES: usize = 4;
+const SMOOTHING_PASSES: usize = 5;
 /// How much a smoothing pass keeps a hex's own difficulty vs. its neighbours'
-/// mean. Lower = smoother (more strongly anchored to surroundings).
-const SMOOTH_SELF_WEIGHT: f32 = 0.35;
+/// mean. Lower = smoother, so terrain clumps into larger regions.
+const SMOOTH_SELF_WEIGHT: f32 = 0.25;
+/// Exponent applied to the normalized field (>1 skews toward easy ground, so
+/// really rough terrain is rarer).
+const ROUGHNESS_GAMMA: f32 = 1.7;
 /// Per-hex chance of seeding a cliff: a sharp jump to near-max difficulty.
-const CLIFF_CHANCE: f32 = 0.03;
+const CLIFF_CHANCE: f32 = 0.018;
+/// Number of low-difficulty corridors carved across the map (passable channels
+/// even through otherwise rough terrain).
+const N_CHANNELS: usize = 3;
 
 impl World {
     /// Advance the resource simulation by `dt` seconds. Only regrows
@@ -266,7 +272,8 @@ fn generate_terrain(rng: &mut Rng, cols: i32, rows: i32) -> Vec<Tile> {
         .fold((f32::MAX, f32::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
     let span = (hi - lo).max(1e-3);
     for x in &mut d {
-        *x = (*x - lo) / span;
+        // Normalize, then skew toward easy ground so really rough terrain is rare.
+        *x = ((*x - lo) / span).powf(ROUGHNESS_GAMMA);
     }
 
     // Cliffs: sparse, sharp jumps that the smoothing would otherwise erase. Each
@@ -278,13 +285,17 @@ fn generate_terrain(rng: &mut Rng, cols: i32, rows: i32) -> Vec<Tile> {
                 d[idx(c, r)] = rng.range(0.85, 1.0);
                 for (nc, nr) in neighbors(c, r) {
                     let oob = nc < 0 || nr < 0 || nc >= cols || nr >= rows;
-                    if !oob && rng.chance(0.5) {
+                    if !oob && rng.chance(0.4) {
                         d[idx(nc, nr)] = rng.range(0.8, 1.0);
                     }
                 }
             }
         }
     }
+
+    // Channels: meandering low-difficulty corridors carved last, so they stay
+    // passable even where they cut through cliffs and rough patches.
+    carve_channels(rng, cols, rows, &mut d);
 
     let mut tiles = Vec::with_capacity(count);
     for r in 0..rows {
@@ -298,6 +309,41 @@ fn generate_terrain(rng: &mut Rng, cols: i32, rows: i32) -> Vec<Tile> {
         }
     }
     tiles
+}
+
+/// Carve `N_CHANNELS` meandering low-difficulty corridors edge to edge. Each
+/// advances along one axis and wanders on the other, widening by one hex so the
+/// channel is comfortably walkable.
+fn carve_channels(rng: &mut Rng, cols: i32, rows: i32, d: &mut [f32]) {
+    let idx = |c: i32, r: i32| (r * cols + c) as usize;
+    let mut clear = |c: i32, r: i32, rng: &mut Rng| {
+        if c >= 0 && r >= 0 && c < cols && r < rows {
+            d[idx(c, r)] = rng.range(0.05, 0.2);
+        }
+    };
+    for _ in 0..N_CHANNELS {
+        if rng.chance(0.5) {
+            // Horizontal corridor: sweep across columns, wander on the row.
+            let mut r = rng.below(rows as usize) as i32;
+            for c in 0..cols {
+                clear(c, r, rng);
+                clear(c, r + 1, rng);
+                if rng.chance(0.45) {
+                    r = (r + if rng.chance(0.5) { 1 } else { -1 }).clamp(0, rows - 1);
+                }
+            }
+        } else {
+            // Vertical corridor: sweep down rows, wander on the column.
+            let mut c = rng.below(cols as usize) as i32;
+            for r in 0..rows {
+                clear(c, r, rng);
+                clear(c + 1, r, rng);
+                if rng.chance(0.45) {
+                    c = (c + if rng.chance(0.5) { 1 } else { -1 }).clamp(0, cols - 1);
+                }
+            }
+        }
+    }
 }
 
 fn place_deposits(rng: &mut Rng, world: &mut World) {

@@ -16,7 +16,9 @@ use bevy::window::PrimaryWindow;
 use economy::{EconStats, HungerControl};
 use goods::{GoodCategory, GoodForm};
 use movement::tile_to_pixel;
-use noot::{Claim, Hunger, Inventory, Noot, RouteMemory, TilePos, Trader, Wallet, STARTING_BUCKS};
+use noot::{
+    Claim, Hunger, Inventory, Noot, NootMeta, RouteMemory, TilePos, Trader, Wallet, STARTING_BUCKS,
+};
 use rng::Rng;
 use world::{generate, ResourceRole, World};
 
@@ -45,14 +47,15 @@ const DESELECT_PAN_SLOP: f32 = 1.5;
 
 // --- Top-right button column layout (shared by spawn_ui and the pick guard) -
 // Pause sits at the top; the two overlay toggles stack below it.
-const PAUSE_BTN_W: f32 = 96.0;
+const PAUSE_BTN_W: f32 = 120.0;
 const PAUSE_BTN_H: f32 = 44.0;
 const PAUSE_BTN_MARGIN: f32 = 10.0;
 const BTN_GAP: f32 = 8.0;
 const VALUE_BTN_TOP: f32 = PAUSE_BTN_MARGIN + PAUSE_BTN_H + BTN_GAP;
 const TERRAIN_BTN_TOP: f32 = VALUE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
+const NOOT_BTN_TOP: f32 = TERRAIN_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 /// Bottom edge of the whole button column (taps above this are UI, not the map).
-const BTN_COLUMN_BOTTOM: f32 = TERRAIN_BTN_TOP + PAUSE_BTN_H;
+const BTN_COLUMN_BOTTOM: f32 = NOOT_BTN_TOP + PAUSE_BTN_H;
 
 const BTN_OFF: Color = Color::srgba(0.12, 0.12, 0.12, 0.85);
 const VALUE_BTN_ON: Color = Color::srgba(0.62, 0.22, 0.16, 0.9);
@@ -102,6 +105,49 @@ struct PauseLabel;
 struct ValueButton;
 #[derive(Component)]
 struct TerrainButton;
+/// Cycles the noot-colouring mode (touch equivalent of the N key).
+#[derive(Component)]
+struct NootColorButton;
+/// Caption on the noot-colouring button, kept in sync with the active mode.
+#[derive(Component)]
+struct NootColorLabel;
+
+/// How noots are tinted on the map. Ownership is the default; the rest rank the
+/// population on a property and scale white (low) → blue (high).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum NootColorMode {
+    #[default]
+    Ownership,
+    Age,
+    Bucks,
+    Positional,
+    Transactions,
+}
+
+impl NootColorMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Ownership => Self::Age,
+            Self::Age => Self::Bucks,
+            Self::Bucks => Self::Positional,
+            Self::Positional => Self::Transactions,
+            Self::Transactions => Self::Ownership,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ownership => "Noots: owner",
+            Self::Age => "Noots: age",
+            Self::Bucks => "Noots: bucks",
+            Self::Positional => "Noots: posit",
+            Self::Transactions => "Noots: trades",
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+struct NootColoring(NootColorMode);
 
 #[derive(Component)]
 struct HudText;
@@ -166,6 +212,7 @@ fn main() {
         .init_resource::<Selection>()
         .init_resource::<Paused>()
         .init_resource::<Overlays>()
+        .init_resource::<NootColoring>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -179,6 +226,7 @@ fn main() {
                     economy::income,
                     economy::hunger_tick,
                     economy::hunger_pid,
+                    economy::age_noots,
                 )
                     .run_if(sim_running),
                 (
@@ -255,10 +303,18 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut fonts: ResMut<Assets<Font>>,
 ) {
     let world = generate(random_seed(), COLS, ROWS, HEX_SIZE);
     let hex_size = world.hex_size;
     let n_tiles = (world.cols * world.rows) as usize;
+
+    // Embed a full-coverage monospace font so Unicode glyphs (₦, →, ·, —) render —
+    // Bevy's built-in default font is a tiny ASCII subset that shows them as tofu.
+    let ui_font = fonts.add(
+        Font::try_from_bytes(include_bytes!("../assets/fonts/DejaVuSansMono.ttf").to_vec())
+            .expect("embedded UI font should parse"),
+    );
 
     // One thematic icon texture per chosen element (used on the map and in the HUD).
     let icons: [Handle<Image>; 4] =
@@ -410,7 +466,7 @@ fn setup(
         );
     }
 
-    spawn_ui(&mut commands, &icons);
+    spawn_ui(&mut commands, &icons, &ui_font);
 
     commands.insert_resource(SimRng(sim_rng));
     commands.insert_resource(Sim(world));
@@ -444,6 +500,7 @@ fn spawn_noot(
         Noot,
         Claim::new(claim),
         Trader::new(),
+        NootMeta::new(),
         TilePos { col, row },
         Inventory::new(),
         Wallet {
@@ -454,7 +511,7 @@ fn spawn_noot(
     ));
 }
 
-fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4]) {
+fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4], font: &Handle<Font>) {
     commands
         .spawn(Node {
             width: Val::Percent(100.0),
@@ -481,6 +538,7 @@ fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4]) {
                 panel.spawn((
                     Text::new("loading..."),
                     TextFont {
+                        font: font.clone(),
                         font_size: 14.0,
                         ..default()
                     },
@@ -507,6 +565,7 @@ fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4]) {
                             row.spawn((
                                 Text::new(""),
                                 TextFont {
+                                    font: font.clone(),
                                     font_size: 13.0,
                                     ..default()
                                 },
@@ -531,6 +590,7 @@ fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4]) {
                 panel.spawn((
                     Text::new("tap a noot to follow it"),
                     TextFont {
+                        font: font.clone(),
                         font_size: 13.0,
                         ..default()
                     },
@@ -562,6 +622,7 @@ fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4]) {
             b.spawn((
                 Text::new("Pause"),
                 TextFont {
+                    font: font.clone(),
                     font_size: 18.0,
                     ..default()
                 },
@@ -571,12 +632,48 @@ fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4]) {
         });
 
     // Overlay toggles, stacked under the pause button (same touch-target size).
-    spawn_overlay_button(commands, "Value", VALUE_BTN_TOP, ValueButton);
-    spawn_overlay_button(commands, "Terrain", TERRAIN_BTN_TOP, TerrainButton);
+    spawn_overlay_button(commands, font, "Value", VALUE_BTN_TOP, ValueButton);
+    spawn_overlay_button(commands, font, "Terrain", TERRAIN_BTN_TOP, TerrainButton);
+
+    // Noot-colouring cycle button (caption shows the active mode).
+    commands
+        .spawn((
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(PAUSE_BTN_MARGIN),
+                top: Val::Px(NOOT_BTN_TOP),
+                width: Val::Px(PAUSE_BTN_W),
+                height: Val::Px(PAUSE_BTN_H),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(BTN_OFF),
+            NootColorButton,
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(NootColorMode::default().label()),
+                TextFont {
+                    font: font.clone(),
+                    font_size: 15.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+                NootColorLabel,
+            ));
+        });
 }
 
 /// Spawn one top-right overlay toggle button at vertical offset `top`.
-fn spawn_overlay_button(commands: &mut Commands, label: &str, top: f32, marker: impl Component) {
+fn spawn_overlay_button(
+    commands: &mut Commands,
+    font: &Handle<Font>,
+    label: &str,
+    top: f32,
+    marker: impl Component,
+) {
     commands
         .spawn((
             Button,
@@ -597,6 +694,7 @@ fn spawn_overlay_button(commands: &mut Commands, label: &str, top: f32, marker: 
             b.spawn((
                 Text::new(label),
                 TextFont {
+                    font: font.clone(),
                     font_size: 16.0,
                     ..default()
                 },
@@ -646,6 +744,7 @@ fn death_and_respawn(
         &mut Wallet,
         &mut RouteMemory,
         &mut Trader,
+        &mut NootMeta,
         &mut Claim,
         &mut TilePos,
         &mut Transform,
@@ -654,7 +753,8 @@ fn death_and_respawn(
     let dt = time.delta_secs();
     let world = &sim.0;
     let n_tiles = (world.cols * world.rows) as usize;
-    for (mut hunger, mut inv, mut wallet, mut mem, mut trader, mut claim, mut pos, mut tf) in &mut q
+    for (mut hunger, mut inv, mut wallet, mut mem, mut trader, mut meta, mut claim, mut pos, mut tf) in
+        &mut q
     {
         if hunger.fully_starving() {
             hunger.starving_secs += dt;
@@ -674,6 +774,7 @@ fn death_and_respawn(
         *hunger = Hunger::fresh(&mut rng.0);
         *mem = RouteMemory::new(n_tiles, false);
         *trader = Trader::new();
+        *meta = NootMeta::new();
         claim.deposit = None;
         let col = rng.0.below(world.cols as usize) as i32;
         let row = rng.0.below(world.rows as usize) as i32;
@@ -881,35 +982,44 @@ fn pick_selection(
     }
 }
 
-/// Toggle the value-field heat overlay (V key or Value button) and the terrain
-/// overlay (T key or Terrain button), flipping the hidden hex cells and keeping the
-/// buttons tinted to show which overlay is live.
+/// Drive the inspection controls: V/Value toggles the value heat overlay, T/Terrain
+/// the difficulty overlay, and N/Noots cycles how noots are coloured. Keeps the
+/// hidden hex cells and the button captions/tints in sync.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn overlay_controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut overlays: ResMut<Overlays>,
+    mut coloring: ResMut<NootColoring>,
     value_btn: Query<&Interaction, (Changed<Interaction>, With<ValueButton>)>,
     terrain_btn: Query<&Interaction, (Changed<Interaction>, With<TerrainButton>)>,
+    noot_btn: Query<&Interaction, (Changed<Interaction>, With<NootColorButton>)>,
     mut value_cells: Query<&mut Visibility, (With<ValueOverlay>, Without<TerrainOverlay>)>,
     mut terrain_cells: Query<&mut Visibility, (With<TerrainOverlay>, Without<ValueOverlay>)>,
     mut value_bg: Query<&mut BackgroundColor, (With<ValueButton>, Without<TerrainButton>)>,
     mut terrain_bg: Query<&mut BackgroundColor, (With<TerrainButton>, Without<ValueButton>)>,
+    mut noot_label: Query<&mut Text, With<NootColorLabel>>,
 ) {
-    let value_tap = value_btn.iter().any(|i| *i == Interaction::Pressed);
-    let terrain_tap = terrain_btn.iter().any(|i| *i == Interaction::Pressed);
+    // Cycling noot colouring is independent of the hex overlays.
+    if keys.just_pressed(KeyCode::KeyN) || noot_btn.iter().any(|i| *i == Interaction::Pressed) {
+        coloring.0 = coloring.0.next();
+        if let Ok(mut text) = noot_label.single_mut() {
+            text.0 = coloring.0.label().into();
+        }
+    }
 
     let mut changed = false;
-    if keys.just_pressed(KeyCode::KeyV) || value_tap {
+    if keys.just_pressed(KeyCode::KeyV) || value_btn.iter().any(|i| *i == Interaction::Pressed) {
         overlays.value = !overlays.value;
         changed = true;
     }
-    if keys.just_pressed(KeyCode::KeyT) || terrain_tap {
+    if keys.just_pressed(KeyCode::KeyT) || terrain_btn.iter().any(|i| *i == Interaction::Pressed) {
         overlays.terrain = !overlays.terrain;
         changed = true;
     }
     if !changed {
         return;
     }
+    // Only touch the (many) hex cells and button tints when a toggle flipped.
     let to = |on: bool| {
         if on {
             Visibility::Visible
@@ -931,21 +1041,68 @@ fn overlay_controls(
     }
 }
 
-/// Tint each noot by ownership: amber once it holds a deposit claim, green while
-/// claimless. Only fires when a `Claim` actually changes (spawn, grab, release).
+/// Tint each noot per the active colouring mode: by ownership (amber claim / green
+/// claimless), or by ranking a property across the population and scaling white
+/// (low) → blue (high). Rebuilt each frame since the ranking shifts as noots act.
 fn update_noot_color(
+    coloring: Res<NootColoring>,
+    sim: Res<Sim>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    noots: Query<(&Claim, &MeshMaterial2d<ColorMaterial>), Changed<Claim>>,
+    noots: Query<(
+        &Claim,
+        &Wallet,
+        &Inventory,
+        &NootMeta,
+        &MeshMaterial2d<ColorMaterial>,
+    )>,
 ) {
-    for (claim, mat) in &noots {
-        if let Some(m) = materials.get_mut(&mat.0) {
-            m.color = if claim.deposit.is_some() {
-                NOOT_OWNER
-            } else {
-                NOOT_UNCLAIMED
-            };
+    if let NootColorMode::Ownership = coloring.0 {
+        for (claim, _, _, _, mat) in &noots {
+            if let Some(m) = materials.get_mut(&mat.0) {
+                m.color = if claim.deposit.is_some() {
+                    NOOT_OWNER
+                } else {
+                    NOOT_UNCLAIMED
+                };
+            }
+        }
+        return;
+    }
+
+    // Gather the ranked property, then min-max scale it across the population.
+    let goods = &sim.0.goods;
+    let property = |wallet: &Wallet, inv: &Inventory, meta: &NootMeta| -> f32 {
+        match coloring.0 {
+            NootColorMode::Age => meta.age,
+            NootColorMode::Bucks => wallet.bucks,
+            NootColorMode::Transactions => meta.transactions as f32,
+            NootColorMode::Positional => (0..goods::N_ITEMS)
+                .filter(|&i| matches!(goods.role_of(i), goods::ItemRole::Positional(_)))
+                .map(|i| inv.items[i])
+                .sum(),
+            NootColorMode::Ownership => 0.0,
+        }
+    };
+    let mut data: Vec<(Handle<ColorMaterial>, f32)> = Vec::new();
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for (_, wallet, inv, meta, mat) in &noots {
+        let v = property(wallet, inv, meta);
+        lo = lo.min(v);
+        hi = hi.max(v);
+        data.push((mat.0.clone(), v));
+    }
+    let span = (hi - lo).max(1e-3);
+    for (handle, v) in data {
+        if let Some(m) = materials.get_mut(&handle) {
+            m.color = rank_color((v - lo) / span);
         }
     }
+}
+
+/// White (low) → blue (high) ramp for the ranked noot-colouring overlays.
+fn rank_color(t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color::srgb(1.0 - 0.8 * t, 1.0 - 0.7 * t, 1.0 - 0.05 * t)
 }
 
 /// Recolour the value-heat cells from the summed per-hex value across all noots,
@@ -1152,7 +1309,7 @@ fn update_hud(
              starving {}/{} ({:.0}%)   production {:.1}/s   consumption {:.1}/s\n\
              trade margin ₦{:.1}/s   utility {:.1}/s\n\
              deaths {:.2}/min → target {:.2}   hunger rate {:.2}\n\
-             drag to pan · pinch to zoom · tap a noot (or deposit) to follow · V/T overlays\n\n",
+             drag to pan · pinch to zoom · tap a noot/deposit to follow · V/T/N overlays\n\n",
             world.seed, count, stats.trades_total, total_bucks, claimed, n_deposits, avg_appetite,
             avg_discount, starving, count, starving_pct, stats.production_rate,
             stats.consumption_rate, stats.merchant_profit_rate, stats.utility_rate,
@@ -1194,7 +1351,7 @@ fn resource_line(world: &World, stats: &EconStats, slot: usize) -> String {
         .map(|d| d.available())
         .sum();
     let item = goods::item_index(slot, good.form);
-    let price = stats.last_price[item];
+    let price = stats.ewma_price[item];
     let tail = match world.remaining_fraction(slot) {
         Some(frac) => format!("left {:>3.0}%", frac * 100.0),
         None => format!("stock {:>4.0}", avail),

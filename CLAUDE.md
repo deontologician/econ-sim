@@ -43,7 +43,11 @@ cargo clippy --target wasm32-unknown-unknown
   reproducible from a single seed. Don't reach for `rand` etc.
 - **Comments explain *why*, not *what*** — hidden constraints, invariants,
   short-circuit-order assumptions. Skip narration of obvious code. No emojis.
-- Currency is rendered with `₦` (falls back to `N` if the font lacks the glyph).
+- Currency is rendered with `₦`. The UI text uses an **embedded** font
+  (`assets/fonts/DejaVuSansMono.ttf`, pulled in via `include_bytes!` in `main.rs`)
+  because Bevy's built-in default font is a tiny ASCII subset that renders `₦`, `→`,
+  `·`, `—` as tofu. Embedding (vs. loading through the asset server) keeps it robust
+  on the Pages subpath. Stick to glyphs that font covers, or extend the font.
 
 ## Where things live
 

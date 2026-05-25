@@ -24,6 +24,9 @@ pub const BUCKS_INCOME: f32 = 0.6;
 // Consumption.
 const EAT_VALUE: f32 = 4.0; // appetite removed per staple unit eaten
 
+/// Smoothing for the per-item sale-price EWMA (higher = tracks recent trades faster).
+const PRICE_EWMA_ALPHA: f32 = 0.12;
+
 // Asking prices (bucks) by item kind.
 const ASK_RAW_CONSUMABLE: f32 = 6.0;
 const ASK_INTERMEDIATE: f32 = 5.0;
@@ -66,7 +69,8 @@ const RATE_WINDOW: f32 = 0.5;
 #[derive(Resource, Default)]
 pub struct EconStats {
     pub trades_total: u64,
-    pub last_price: [f32; N_ITEMS],
+    /// Exponentially weighted moving average of actual sale prices, per item.
+    pub ewma_price: [f32; N_ITEMS],
     /// Cumulative raw units extracted from deposits (the economy's supply).
     pub produced_total: f64,
     /// Cumulative units consumed (staples eaten + positional goods used up).
@@ -185,6 +189,14 @@ pub fn hunger_pid(time: Res<Time>, mut ctrl: ResMut<HungerControl>) {
     ctrl.prev_error = error;
     ctrl.deaths_since_update = 0;
     ctrl.elapsed = 0.0;
+}
+
+/// Age every noot by the simulated time elapsed (frozen while paused).
+pub fn age_noots(time: Res<Time>, mut q: Query<&mut NootMeta>) {
+    let dt = time.delta_secs();
+    for mut m in &mut q {
+        m.age += dt;
+    }
 }
 
 pub fn hunger_tick(time: Res<Time>, ctrl: Res<HungerControl>, mut q: Query<&mut Hunger>) {
@@ -422,6 +434,7 @@ pub fn meet_and_trade(
         &Hunger,
         &mut RouteMemory,
         &mut Trader,
+        &mut NootMeta,
     )>,
 ) {
     let goods = &sim.0.goods;
@@ -430,7 +443,7 @@ pub fn meet_and_trade(
     // Snapshot (immutable read) so we can reason about pairs without aliasing.
     let mut snaps: Vec<Snap> = q
         .iter()
-        .map(|(e, t, inv, wal, hunger, _route, trader)| Snap {
+        .map(|(e, t, inv, wal, hunger, _route, trader, _meta)| Snap {
             e,
             pos: t.translation.truncate(),
             inv: inv.items,
@@ -482,7 +495,12 @@ pub fn meet_and_trade(
                 snaps[si].bucks += price;
                 snaps[si].inv[item] -= 1.0;
                 stats.trades_total += 1;
-                stats.last_price[item] = price;
+                // EWMA of realized sale prices (lazy-init to the first sample).
+                stats.ewma_price[item] = if stats.ewma_price[item] <= 0.0 {
+                    price
+                } else {
+                    stats.ewma_price[item] + PRICE_EWMA_ALPHA * (price - stats.ewma_price[item])
+                };
             }
         }
     }
@@ -493,7 +511,9 @@ pub fn meet_and_trade(
 
         // Buyer side: bank the "good deal" (a discounted view of resale headroom)
         // where it was found, average in the cost, and grow more cautious.
-        if let Ok((_, _, mut inv, mut wal, _, mut route, mut trader)) = q.get_mut(tx.buyer) {
+        if let Ok((_, _, mut inv, mut wal, _, mut route, mut trader, mut meta)) =
+            q.get_mut(tx.buyer)
+        {
             let held_before = inv.items[tx.item];
             inv.items[tx.item] += 1.0;
             wal.bucks -= tx.price;
@@ -502,11 +522,14 @@ pub fn meet_and_trade(
             trader.cost_basis[tx.item] = total / (held_before + 1.0);
             trader.discount = (trader.discount - DISCOUNT_LR * (trader.discount - DISCOUNT_MIN))
                 .max(DISCOUNT_MIN);
+            meta.transactions += 1;
         }
 
         // Seller side: reward the realized margin (≈ income for a producer with
         // near-zero cost, the spread for a flipper), and let success breed optimism.
-        if let Ok((_, _, mut inv, mut wal, _, mut route, mut trader)) = q.get_mut(tx.seller) {
+        if let Ok((_, _, mut inv, mut wal, _, mut route, mut trader, mut meta)) =
+            q.get_mut(tx.seller)
+        {
             inv.items[tx.item] -= 1.0;
             wal.bucks += tx.price;
             let margin = tx.price - trader.cost_basis[tx.item];
@@ -517,6 +540,7 @@ pub fn meet_and_trade(
             }
             stats.merchant_profit_window += margin.max(0.0);
             stats.merchant_profit_total += margin.max(0.0) as f64;
+            meta.transactions += 1;
         }
     }
 }
