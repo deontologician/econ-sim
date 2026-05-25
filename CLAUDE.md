@@ -1,6 +1,7 @@
 # econ-sim — working notes for Claude
 
-A Bevy (0.18) agent-based economy sim that deploys to the web as WebAssembly.
+A **mobile-first** Bevy (0.18) agent-based economy sim that deploys to the web as
+WebAssembly — the primary target is a phone in portrait, played by touch.
 Noots (the agents) extract, refine, trade, consume, learn where to go, and die of
 starvation. No gameplay input beyond pan/zoom/pause and tapping a noot to follow it.
 
@@ -32,6 +33,11 @@ cargo clippy --target wasm32-unknown-unknown
 
 ## Conventions
 
+- **Mobile-first / touch-first.** Assume a phone in portrait as the primary device.
+  Every control needs an on-screen, finger-sized tap target — keyboard shortcuts are
+  extras, never the only way to reach a feature. The camera fits the map to the
+  screen on launch; gameplay input stays limited to pan / pinch-zoom / pause / tap.
+  Design and reason about touch ergonomics before desktop.
 - **No external crates beyond Bevy** (plus `web-sys`/`js-sys` on wasm). The PRNG is
   hand-rolled (`rng.rs`, SplitMix64) to keep the bundle small and worldgen
   reproducible from a single seed. Don't reach for `rand` etc.
