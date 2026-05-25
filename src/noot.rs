@@ -4,6 +4,7 @@
 use bevy::prelude::*;
 
 use crate::goods::N_ITEMS;
+use crate::rng::Rng;
 
 pub const N_STAPLES: usize = 2;
 
@@ -14,6 +15,9 @@ pub const STAPLE_SATIATION: f32 = 10.0;
 pub const SATISFIED_FRACTION: f32 = 0.3;
 /// At or above this fraction of satiation a staple counts as "starving".
 pub const STARVING_FRACTION: f32 = 0.9;
+/// A (re)spawned noot's appetite is drawn uniformly from `[0, this × satiation)` —
+/// wide enough to decorrelate lifecycles, capped below the starving threshold.
+pub const FRESH_HUNGER_SPREAD: f32 = 0.7;
 /// A noot stops extracting its claimed deposit once carrying this much raw good.
 pub const CARRY_CAP: f32 = 20.0;
 
@@ -98,11 +102,16 @@ pub struct Hunger {
 }
 
 impl Hunger {
-    /// A freshly (re)spawned noot: moderately hungry, not yet starving, so it
-    /// gets a fair window to find food before the death timer can bite.
-    pub fn fresh() -> Self {
+    /// A freshly (re)spawned noot: each staple's appetite is randomized over a wide
+    /// spread (never high enough to start starving). The jitter decorrelates noot
+    /// lifecycles so the population doesn't march to starvation in lockstep — deaths
+    /// trickle continuously instead of arriving in synchronized waves, which is what
+    /// the hunger-rate PID needs to regulate smoothly.
+    pub fn fresh(rng: &mut Rng) -> Self {
         Self {
-            staple: [STAPLE_SATIATION * 0.5; N_STAPLES],
+            staple: std::array::from_fn(|_| {
+                rng.range(0.0, STAPLE_SATIATION * FRESH_HUNGER_SPREAD)
+            }),
             starving_secs: 0.0,
         }
     }

@@ -271,6 +271,7 @@ fn setup(
         let (col, row) = (world.tiles[tile].col, world.tiles[tile].row);
         spawn_noot(
             &mut commands,
+            &mut sim_rng,
             noot_mesh.clone(),
             noot_mat.clone(),
             Some(di),
@@ -284,6 +285,7 @@ fn setup(
         let (col, row) = random_tile(&mut sim_rng, &world);
         spawn_noot(
             &mut commands,
+            &mut sim_rng,
             noot_mesh.clone(),
             noot_mat.clone(),
             None,
@@ -310,6 +312,7 @@ fn random_tile(rng: &mut Rng, world: &World) -> (i32, i32) {
 #[allow(clippy::too_many_arguments)]
 fn spawn_noot(
     commands: &mut Commands,
+    rng: &mut Rng,
     mesh: Handle<Mesh>,
     material: Handle<ColorMaterial>,
     claim: Option<usize>,
@@ -332,7 +335,7 @@ fn spawn_noot(
         Wallet {
             bucks: STARTING_BUCKS,
         },
-        Hunger::fresh(),
+        Hunger::fresh(rng),
         RouteMemory::new(n_tiles, homing),
     ));
 }
@@ -490,7 +493,7 @@ fn death_and_respawn(
         // Reincarnate a fresh, unclaimed noot at a random tile.
         *inv = Inventory::new();
         wallet.bucks = STARTING_BUCKS;
-        *hunger = Hunger::fresh();
+        *hunger = Hunger::fresh(&mut rng.0);
         *mem = RouteMemory::new(n_tiles, false);
         *trader = Trader::new();
         claim.deposit = None;
