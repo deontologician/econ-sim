@@ -38,6 +38,10 @@ const POSITIONAL_SELL_URGENCY: f32 = 0.9;
 
 const TRADE_RADIUS_FACTOR: f32 = 1.7; // × hex_size
 
+/// Selling income is scaled to roughly staple-welfare magnitude before it feeds
+/// the movement reward, so a sale and a meal pull the value field comparably.
+const SELL_REWARD_SCALE: f32 = 0.15;
+
 /// How long each production/consumption rate sample covers (seconds).
 const RATE_WINDOW: f32 = 0.5;
 
@@ -150,12 +154,12 @@ pub fn refine(time: Res<Time>, sim: Res<Sim>, mut q: Query<(&Role, &mut Inventor
 pub fn consume(
     sim: Res<Sim>,
     mut stats: ResMut<EconStats>,
-    mut q: Query<(&Role, &mut Inventory, &mut Hunger, &mut Brain)>,
+    mut q: Query<(&Role, &mut Inventory, &mut Hunger, &mut RouteMemory)>,
 ) {
     let dt_goods = &sim.0.goods;
     let mut eaten = 0.0f32;
     let mut utility_gained = 0.0f32;
-    for (role, mut inv, mut hunger, mut brain) in &mut q {
+    for (role, mut inv, mut hunger, mut mem) in &mut q {
         // Transporters carry goods for others; they don't eat the cargo.
         if matches!(role, Role::Transporter) {
             continue;
@@ -177,7 +181,7 @@ pub fn consume(
                 }
             }
         }
-        brain.trip_reward += reward;
+        mem.pending_reward += reward;
         utility_gained += reward;
     }
     stats.consumed_window += eaten;
@@ -293,6 +297,7 @@ pub fn meet_and_trade(
         &mut Inventory,
         &mut Wallet,
         &Hunger,
+        &mut RouteMemory,
     )>,
     // Separate query (HaulContract isn't in the tuple above, so no conflict):
     // record a hauling seller's revenue so it can settle the owner's share.
@@ -304,7 +309,7 @@ pub fn meet_and_trade(
     // Snapshot (immutable read) so we can reason about pairs without aliasing.
     let mut snaps: Vec<Snap> = q
         .iter()
-        .map(|(e, t, role, inv, wal, hunger)| Snap {
+        .map(|(e, t, role, inv, wal, hunger, _route)| Snap {
             e,
             pos: t.translation.truncate(),
             role: *role,
@@ -361,13 +366,18 @@ pub fn meet_and_trade(
 
     // Apply to the ECS, one entity borrow at a time.
     for tx in txs {
-        if let Ok((_, _, _, mut inv, mut wal, _)) = q.get_mut(tx.buyer) {
+        if let Ok((_, _, _, mut inv, mut wal, _, _)) = q.get_mut(tx.buyer) {
             inv.items[tx.item] += 1.0;
             wal.bucks -= tx.price;
         }
-        if let Ok((_, _, _, mut inv, mut wal, _)) = q.get_mut(tx.seller) {
+        if let Ok((_, _, role, mut inv, mut wal, _, mut route)) = q.get_mut(tx.seller) {
             inv.items[tx.item] -= 1.0;
             wal.bucks += tx.price;
+            // Selling income rewards the value field, teaching sellers where the
+            // buyers are. Transporters learn nothing here — they run on contracts.
+            if !matches!(role, Role::Transporter) {
+                route.pending_reward += tx.price * SELL_REWARD_SCALE;
+            }
         }
         // If the seller is a transporter mid-haul, tally the take so the owner's
         // share can be paid back on settlement. (Borrow is separate from `q`.)

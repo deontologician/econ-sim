@@ -89,12 +89,6 @@ pub struct TilePos {
     pub row: i32,
 }
 
-#[derive(Component, Clone, Copy)]
-pub struct Home {
-    pub col: i32,
-    pub row: i32,
-}
-
 #[derive(Component)]
 pub struct Inventory {
     pub items: [f32; N_ITEMS],
@@ -160,33 +154,68 @@ impl Hunger {
     }
 }
 
-/// Simple per-noot learning + walk state.
+// --- Route learning (per-hex TD(λ) value estimates) -------------------------
+/// TD learning rate.
+const TD_ALPHA: f32 = 0.1;
+/// Discount applied to the next tile's value.
+const TD_GAMMA: f32 = 0.9;
+/// Eligibility-trace decay (the λ in TD(λ)) — spreads credit back along the
+/// path so reward at a destination raises the value of the hexes that led there.
+const TD_LAMBDA: f32 = 0.8;
+/// Drop a tile from the live trace once its eligibility falls below this.
+const TRACE_CUTOFF: f32 = 0.02;
+
+/// A noot's learned sense of *where good things happen*: a per-hex value estimate
+/// over the whole map, trained online with TD(λ). Reward earned on a tile
+/// (welfare from eating, income from selling) is banked in `pending_reward` and
+/// folded into the estimate on the next step, so high-value regions pull future
+/// movement up the gradient.
 #[derive(Component)]
-pub struct Brain {
-    /// Preferred outbound hex direction (0..6).
-    pub heading: usize,
-    /// Reinforcement weight per direction.
-    pub weights: [f32; 6],
-    pub trip_step: u32,
-    /// True while walking out, false while returning home.
-    pub outbound: bool,
-    /// Welfare (utility) gained this trip — the reinforcement signal. Earned by
-    /// consuming what you acquired, so buying to eat is rewarded just like
-    /// selling was.
-    pub trip_reward: f32,
+pub struct RouteMemory {
+    /// Value estimate per tile, indexed `row * cols + col`.
+    pub value: Vec<f32>,
+    /// Eligibility trace per tile; only entries listed in `active` are non-zero.
+    elig: Vec<f32>,
+    /// Tiles whose eligibility trace is currently live.
+    active: Vec<usize>,
+    /// Reward accrued on the current tile, credited on the next step.
+    pub pending_reward: f32,
+    /// Owners only: heading back to the deposit to extract a fresh load.
+    pub homing: bool,
     /// Seconds until the next tile step.
     pub move_cooldown: f32,
 }
 
-impl Brain {
-    pub fn new(heading: usize) -> Self {
+impl RouteMemory {
+    pub fn new(n_tiles: usize, homing: bool) -> Self {
         Self {
-            heading,
-            weights: [1.0; 6],
-            trip_step: 0,
-            outbound: true,
-            trip_reward: 0.0,
+            value: vec![0.0; n_tiles],
+            elig: vec![0.0; n_tiles],
+            active: Vec::new(),
+            pending_reward: 0.0,
+            homing,
             move_cooldown: 0.0,
         }
+    }
+
+    /// TD(λ) update for a step from tile `from` to tile `to`, crediting the
+    /// `reward` accrued while sitting on `from`.
+    pub fn learn(&mut self, from: usize, to: usize, reward: f32) {
+        let delta = reward + TD_GAMMA * self.value[to] - self.value[from];
+        if self.elig[from] == 0.0 {
+            self.active.push(from);
+        }
+        self.elig[from] = 1.0; // replacing trace
+        let mut active = std::mem::take(&mut self.active);
+        active.retain(|&t| {
+            self.value[t] += TD_ALPHA * delta * self.elig[t];
+            self.elig[t] *= TD_GAMMA * TD_LAMBDA;
+            let live = self.elig[t] >= TRACE_CUTOFF;
+            if !live {
+                self.elig[t] = 0.0;
+            }
+            live
+        });
+        self.active = active;
     }
 }

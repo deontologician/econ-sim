@@ -111,14 +111,17 @@ design. Newest first within each section.
 - **STATUS**: partial
 
 ### Movement learning (RL)
-- **NOW**: a per-noot heading bandit reinforced by the **welfare gained that
-  trip** (consuming what was bought/sold-for), so buyers are rewarded for buying
-  just as sellers were for selling; ε-greedy exploration, greedy return home.
-  *(partial)*
-- **INTENDED**: richer policy (state = local memory of where buyers/sellers/prices
-  were), value estimates per region, proper exploration/exploitation, maybe
-  learned routes. Consumers in particular should learn *where to buy*, not just a
-  heading.
+- **NOW**: per-noot **per-hex value learning** (`RouteMemory`, Plan 004). Each noot
+  trains a TD(λ) value estimate over the whole map (α=0.1, γ=0.9, λ=0.8) and moves
+  ε-greedily up the gradient toward where it has earned reward. Reward = staple
+  welfare from eating **+** scaled selling income, banked per-tile and folded in on
+  each step; the eligibility trace credits whole routes, not just the reward tile.
+  Owners home to their deposit to refill, then value-walk to sell; consumers/refiners
+  value-walk to learn where to buy and sell. Transporters still run on contracts and
+  don't train their field yet. *(partial)*
+- **INTENDED**: richer *state* than position alone (local memory of observed
+  prices/inventories, who's nearby), function approximation instead of a full
+  per-hex table, and merchant transporters that learn arbitrage routes (pass 2).
 - **STATUS**: partial
 
 ## World

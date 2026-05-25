@@ -1,26 +1,30 @@
-//! Noot locomotion + the simple reinforcement loop.
+//! Noot locomotion + the per-hex value-learning loop.
 //!
-//! Outbound: step hex-to-hex, biased toward a learned `heading`, for `TRIP_LEN`
-//! steps. Then return home greedily. On arrival, reinforce the heading if the
-//! trip produced a sale, then pick the next heading ε-greedily.
+//! Every free-roaming noot carries a `RouteMemory` — a TD(λ) value estimate over
+//! the map. Each step it moves ε-greedily up the value gradient (toward its
+//! best-valued neighbour), banking any reward earned on the tile it leaves and
+//! folding it into the estimate, so productive regions pull future movement.
+//! Owners are the exception: when sold out they home to their deposit to extract
+//! a fresh load, then rejoin the value-driven wander to sell it. Transporters
+//! still navigate by haul-contract state.
 
 use bevy::prelude::*;
 
 use crate::goods::{self, GoodForm};
 use crate::hex::{hex_center, neighbors};
-use crate::noot::{Brain, HaulContract, HaulState, Home, Inventory, Role, TilePos, HAUL_SELL_STEPS};
+use crate::noot::{HaulContract, HaulState, Inventory, Role, RouteMemory, TilePos, HAUL_SELL_STEPS};
 use crate::world::{terrain_factor, World};
 use crate::{MapView, Sim, SimRng};
 
-const TRIP_LEN: u32 = 8;
 const BASE_STEP_TIME: f32 = 0.35;
-const HEADING_BIAS: f32 = 0.7;
-const EPSILON: f32 = 0.15;
-const WEIGHT_DECAY: f32 = 0.98;
-/// Cap on a single trip's reinforcement so weights stay bounded.
-const REWARD_CAP: f32 = 3.0;
-/// Owners stay on their deposit, extracting, until they carry this much to sell.
+/// Chance of a random (exploratory) step instead of the greedy value step.
+const EPSILON: f32 = 0.12;
+/// Owners extract until carrying this much raw, then tour to sell it.
 const LOAD_THRESHOLD: f32 = 6.0;
+/// Owners head back to refill once their raw stock falls to this.
+const SELL_DONE: f32 = 1.0;
+/// Value differences below this count as a tie (broken at random).
+const VALUE_EPS: f32 = 1e-4;
 
 pub fn tile_to_pixel(col: i32, row: i32, hex_size: f32, offset: Vec2) -> Vec2 {
     let (x, y) = hex_center(col, row, hex_size);
@@ -45,8 +49,7 @@ pub fn movement(
     mut noots: Query<
         (
             &mut TilePos,
-            &Home,
-            &mut Brain,
+            &mut RouteMemory,
             &mut Transform,
             &Role,
             &Inventory,
@@ -57,50 +60,62 @@ pub fn movement(
     let world = &sim.0;
     let dt = time.delta_secs();
 
-    for (mut pos, home, mut brain, mut transform, role, inv) in &mut noots {
+    for (mut pos, mut mem, mut transform, role, inv) in &mut noots {
         // Smoothly glide the sprite toward the current tile centre.
         let target = tile_to_pixel(pos.col, pos.row, world.hex_size, view.offset);
         let t = (dt * 8.0).min(1.0);
         transform.translation.x += (target.x - transform.translation.x) * t;
         transform.translation.y += (target.y - transform.translation.y) * t;
 
-        brain.move_cooldown -= dt;
-        if brain.move_cooldown > 0.0 {
+        mem.move_cooldown -= dt;
+        if mem.move_cooldown > 0.0 {
             continue;
         }
 
-        if brain.outbound {
-            // Owners linger on their deposit (the `extract` system runs while
-            // they wait) until they have a load worth touring with.
-            let at_home = pos.col == home.col && pos.row == home.row;
-            if brain.trip_step == 0 && at_home && !ready_to_depart(world, role, inv) {
-                brain.move_cooldown = BASE_STEP_TIME;
-                continue;
+        let from = tile_idx(world, pos.col, pos.row);
+        let next = match *role {
+            Role::Owner { deposit } => {
+                let slot = world.deposits[deposit].element_slot;
+                let raw = goods::item_index(slot, GoodForm::Raw);
+                let stock = inv.items[raw];
+                if mem.homing && stock >= LOAD_THRESHOLD {
+                    mem.homing = false;
+                } else if !mem.homing && stock <= SELL_DONE {
+                    mem.homing = true;
+                }
+                if mem.homing {
+                    let dtile = world.deposits[deposit].tile;
+                    let (dc, dr) = (world.tiles[dtile].col, world.tiles[dtile].row);
+                    if pos.col == dc && pos.row == dr {
+                        None // sit on the deposit; `extract` fills the load
+                    } else {
+                        Some(step_toward(world, pos.col, pos.row, dc, dr))
+                    }
+                } else {
+                    Some(value_step(&mut rng.0, world, &mem.value, pos.col, pos.row))
+                }
             }
-            let (c, r) = choose_outbound(&mut rng.0, world, pos.col, pos.row, brain.heading);
-            pos.col = c;
-            pos.row = r;
-            brain.trip_step += 1;
-            if brain.trip_step >= TRIP_LEN {
-                brain.outbound = false;
-            }
-        } else if pos.col == home.col && pos.row == home.row {
-            reinforce_and_reset(&mut brain, &mut rng.0);
-        } else {
-            let (c, r) = step_toward(world, pos.col, pos.row, home.col, home.row);
+            _ => Some(value_step(&mut rng.0, world, &mem.value, pos.col, pos.row)),
+        };
+
+        if let Some((c, r)) = next {
+            let to = tile_idx(world, c, r);
+            let reward = mem.pending_reward;
+            mem.pending_reward = 0.0;
+            mem.learn(from, to, reward);
             pos.col = c;
             pos.row = r;
         }
 
         // Difficult terrain makes each step take longer.
         let tf = terrain_factor(world.tiles[tile_idx(world, pos.col, pos.row)].terrain);
-        brain.move_cooldown = BASE_STEP_TIME / tf;
+        mem.move_cooldown = BASE_STEP_TIME / tf;
     }
 }
 
-/// Transporters navigate by contract state rather than the learned-heading
-/// wander: walk to the employer's deposit, then (once loaded) wander selling,
-/// then walk back to settle. Reuses `step_toward`/`choose_outbound`.
+/// Transporters navigate by contract state rather than the value field: walk to
+/// the employer's deposit, then (once loaded) wander selling, then walk back to
+/// settle. Reuses `step_toward`/`wander`.
 pub fn haul_movement(
     time: Res<Time>,
     mut rng: ResMut<SimRng>,
@@ -109,7 +124,7 @@ pub fn haul_movement(
     mut q: Query<(
         &mut TilePos,
         &mut Transform,
-        &mut Brain,
+        &mut RouteMemory,
         &Inventory,
         &mut HaulContract,
     )>,
@@ -117,7 +132,7 @@ pub fn haul_movement(
     let world = &sim.0;
     let dt = time.delta_secs();
 
-    for (mut pos, mut transform, mut brain, inv, mut contract) in &mut q {
+    for (mut pos, mut transform, mut mem, inv, mut contract) in &mut q {
         // Glide the sprite toward the current tile centre (same as `movement`).
         let target = tile_to_pixel(pos.col, pos.row, world.hex_size, view.offset);
         let t = (dt * 8.0).min(1.0);
@@ -129,8 +144,8 @@ pub fn haul_movement(
             continue;
         }
 
-        brain.move_cooldown -= dt;
-        if brain.move_cooldown > 0.0 {
+        mem.move_cooldown -= dt;
+        if mem.move_cooldown > 0.0 {
             continue;
         }
 
@@ -149,7 +164,7 @@ pub fn haul_movement(
                 }
             }
             HaulState::Selling => {
-                let (c, r) = choose_outbound(&mut rng.0, world, pos.col, pos.row, brain.heading);
+                let (c, r) = wander(&mut rng.0, world, pos.col, pos.row);
                 pos.col = c;
                 pos.row = r;
                 contract.sell_steps += 1;
@@ -170,44 +185,56 @@ pub fn haul_movement(
         }
 
         let tf = terrain_factor(world.tiles[tile_idx(world, pos.col, pos.row)].terrain);
-        brain.move_cooldown = BASE_STEP_TIME / tf;
+        mem.move_cooldown = BASE_STEP_TIME / tf;
     }
 }
 
-fn ready_to_depart(world: &World, role: &Role, inv: &Inventory) -> bool {
-    match role {
-        Role::Owner { deposit } => {
-            let slot = world.deposits[*deposit].element_slot;
-            let raw = goods::item_index(slot, GoodForm::Raw);
-            inv.items[raw] >= LOAD_THRESHOLD
-        }
-        _ => true,
-    }
-}
-
-fn choose_outbound(
+/// ε-greedy step up the learned value gradient: usually move to the highest-value
+/// in-bounds neighbour (ties broken at random, so an all-zero field gives an
+/// unbiased walk), occasionally a random neighbour to keep exploring.
+fn value_step(
     rng: &mut crate::rng::Rng,
     world: &World,
+    value: &[f32],
     col: i32,
     row: i32,
-    heading: usize,
 ) -> (i32, i32) {
-    let ns = neighbors(col, row);
-    let in_bound: Vec<(i32, i32)> = ns
-        .iter()
-        .copied()
+    let inb: Vec<(i32, i32)> = neighbors(col, row)
+        .into_iter()
         .filter(|&(c, r)| in_bounds(world, c, r))
         .collect();
-    if in_bound.is_empty() {
+    if inb.is_empty() {
         return (col, row);
     }
-
-    // Bias toward the preferred heading when that neighbour is on the map.
-    let preferred = ns[heading];
-    if in_bounds(world, preferred.0, preferred.1) && rng.chance(HEADING_BIAS) {
-        return preferred;
+    if rng.chance(EPSILON) {
+        return inb[rng.below(inb.len())];
     }
-    in_bound[rng.below(in_bound.len())]
+    let mut best_val = f32::MIN;
+    let mut best: Vec<(i32, i32)> = Vec::new();
+    for (c, r) in inb {
+        let v = value[tile_idx(world, c, r)];
+        if v > best_val + VALUE_EPS {
+            best_val = v;
+            best.clear();
+            best.push((c, r));
+        } else if v >= best_val - VALUE_EPS {
+            best.push((c, r));
+        }
+    }
+    best[rng.below(best.len())]
+}
+
+/// A random in-bounds neighbour (transporters' selling wander).
+fn wander(rng: &mut crate::rng::Rng, world: &World, col: i32, row: i32) -> (i32, i32) {
+    let inb: Vec<(i32, i32)> = neighbors(col, row)
+        .into_iter()
+        .filter(|&(c, r)| in_bounds(world, c, r))
+        .collect();
+    if inb.is_empty() {
+        (col, row)
+    } else {
+        inb[rng.below(inb.len())]
+    }
 }
 
 fn step_toward(world: &World, col: i32, row: i32, hc: i32, hr: i32) -> (i32, i32) {
@@ -223,36 +250,6 @@ fn step_toward(world: &World, col: i32, row: i32, hc: i32, hr: i32) -> (i32, i32
         if d2 < best_d2 {
             best_d2 = d2;
             best = (c, r);
-        }
-    }
-    best
-}
-
-fn reinforce_and_reset(brain: &mut Brain, rng: &mut crate::rng::Rng) {
-    // Reinforce the heading by the welfare this trip produced (consuming what
-    // was bought/sold-for), so productive directions are favoured next time.
-    if brain.trip_reward > 0.0 {
-        brain.weights[brain.heading] += brain.trip_reward.min(REWARD_CAP);
-    }
-    for w in &mut brain.weights {
-        *w *= WEIGHT_DECAY;
-    }
-
-    brain.heading = if rng.chance(EPSILON) {
-        rng.below(6)
-    } else {
-        argmax(&brain.weights)
-    };
-    brain.trip_step = 0;
-    brain.outbound = true;
-    brain.trip_reward = 0.0;
-}
-
-fn argmax(weights: &[f32; 6]) -> usize {
-    let mut best = 0;
-    for i in 1..6 {
-        if weights[i] > weights[best] {
-            best = i;
         }
     }
     best

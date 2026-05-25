@@ -16,7 +16,7 @@ use economy::EconStats;
 use goods::{GoodCategory, GoodForm};
 use movement::tile_to_pixel;
 use noot::{
-    Brain, HaulContract, HaulState, Home, Hunger, Inventory, Role, TilePos, Wallet, PRINCIPAL_SHARE,
+    HaulContract, HaulState, Hunger, Inventory, Role, RouteMemory, TilePos, Wallet, PRINCIPAL_SHARE,
     STARTING_BUCKS,
 };
 use rng::Rng;
@@ -192,6 +192,7 @@ fn setup(
 ) {
     let world = generate(random_seed(), COLS, ROWS, HEX_SIZE);
     let hex_size = world.hex_size;
+    let n_tiles = (world.cols * world.rows) as usize;
 
     // Centre the map on the origin and pick an initial zoom that fits a typical
     // phone screen in portrait, so the whole world is visible on first load.
@@ -270,7 +271,7 @@ fn setup(
             Role::Owner { deposit: di },
             col,
             row,
-            sim_rng.below(6),
+            n_tiles,
             tile_to_pixel(col, row, hex_size, offset),
         );
     }
@@ -284,7 +285,7 @@ fn setup(
             Role::Refiner,
             col,
             row,
-            sim_rng.below(6),
+            n_tiles,
             tile_to_pixel(col, row, hex_size, offset),
         );
     }
@@ -297,7 +298,7 @@ fn setup(
             Role::Consumer,
             col,
             row,
-            sim_rng.below(6),
+            n_tiles,
             tile_to_pixel(col, row, hex_size, offset),
         );
     }
@@ -314,13 +315,12 @@ fn setup(
             ),
             Role::Transporter,
             TilePos { col, row },
-            Home { col, row },
             Inventory::new(),
             Wallet {
                 bucks: STARTING_BUCKS,
             },
             Hunger::fresh(),
-            Brain::new(sim_rng.below(6)),
+            RouteMemory::new(n_tiles, false),
             HaulContract::idle(),
         ));
     }
@@ -346,22 +346,23 @@ fn spawn_noot(
     role: Role,
     col: i32,
     row: i32,
-    heading: usize,
+    n_tiles: usize,
     pixel: Vec2,
 ) {
+    // Owners start homed to their deposit so they extract a first load before touring.
+    let homing = matches!(role, Role::Owner { .. });
     commands.spawn((
         Mesh2d(mesh),
         MeshMaterial2d(material),
         Transform::from_xyz(pixel.x, pixel.y, 2.0),
         role,
         TilePos { col, row },
-        Home { col, row },
         Inventory::new(),
         Wallet {
             bucks: STARTING_BUCKS,
         },
         Hunger::fresh(),
-        Brain::new(heading),
+        RouteMemory::new(n_tiles, homing),
     ));
 }
 
@@ -489,18 +490,16 @@ fn death_and_respawn(
         &mut Hunger,
         &mut Inventory,
         &mut Wallet,
-        &mut Brain,
+        &mut RouteMemory,
         &mut TilePos,
         &mut Transform,
-        &mut Home,
         Option<&mut HaulContract>,
     )>,
 ) {
     let dt = time.delta_secs();
     let world = &sim.0;
-    for (role, mut hunger, mut inv, mut wallet, mut brain, mut pos, mut tf, mut home, contract) in
-        &mut q
-    {
+    let n_tiles = (world.cols * world.rows) as usize;
+    for (role, mut hunger, mut inv, mut wallet, mut mem, mut pos, mut tf, contract) in &mut q {
         if hunger.fully_starving() {
             hunger.starving_secs += dt;
         } else {
@@ -514,7 +513,7 @@ fn death_and_respawn(
         *inv = Inventory::new();
         wallet.bucks = STARTING_BUCKS;
         *hunger = Hunger::fresh();
-        *brain = Brain::new(rng.0.below(6));
+        *mem = RouteMemory::new(n_tiles, matches!(role, Role::Owner { .. }));
         let (col, row) = match role {
             Role::Owner { deposit } => {
                 let t = world.deposits[*deposit].tile;
@@ -527,8 +526,6 @@ fn death_and_respawn(
         };
         pos.col = col;
         pos.row = row;
-        home.col = col;
-        home.row = row;
         let p = tile_to_pixel(col, row, view.hex_size, view.offset);
         tf.translation = Vec3::new(p.x, p.y, 2.0);
         if let Some(mut c) = contract {
