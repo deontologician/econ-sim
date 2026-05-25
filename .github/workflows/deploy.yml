@@ -16,6 +16,14 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
+env:
+  # Incremental compilation only pays off across rebuilds on one machine. In CI
+  # it just bloats the cache, so disable it and lean on the dependency cache.
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -26,11 +34,29 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      # The slow part is compiling Bevy and its ~500 dependencies. This caches
+      # the cargo registry plus the dependency build artifacts under target/,
+      # so later runs only recompile our own crate and the final LTO link.
+      # cache-on-failure keeps that work even if a later step fails.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm-release
+          cache-on-failure: true
+
+      # Trunk downloads matching wasm-bindgen and wasm-opt binaries into
+      # ~/.cache/trunk on first build; cache them so they are not re-fetched.
+      # Keyed on Cargo.lock since the wasm-bindgen version tracks the lockfile.
+      - name: Cache Trunk tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trunk
+          key: trunk-tools-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            trunk-tools-${{ runner.os }}-
 
       - uses: jetli/trunk-action@v0.5.0
         with:
-          version: latest
+          version: v0.21.14
 
       # Project pages are served from a subpath, so assets must resolve
       # relative to /econ-sim/.
