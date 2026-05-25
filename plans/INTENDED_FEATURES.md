@@ -17,9 +17,8 @@ design. Newest first within each section.
 
 ### Consumer income / wages
 - **NOW**: every noot gets a flat universal bucks trickle (`BUCKS_INCOME`/sec) so
-  consumers don't go broke and demand keeps circulating. Death is a partial **money
-  sink** — a noot's bucks are cleared (not refilled) on rebirth, so its hoard leaves
-  circulation. Still net-inflationary while the trickle is on. *(stub)*
+  consumers don't go broke and demand keeps circulating. A reborn noot restarts with
+  the starting wallet. *(stub)*
 - **INTENDED**: no free money. Noots earn bucks only by producing/selling, doing
   paid work (transport, refining, hauling), or a real labor market. Bucks should
   be conserved except where minted by a defined mechanism. Retiring the trickle

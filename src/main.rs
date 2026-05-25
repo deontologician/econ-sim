@@ -769,10 +769,10 @@ fn death_and_respawn(
         // A death: feed it back to the hunger-rate controller.
         ctrl.deaths_since_update += 1;
 
-        // Reincarnate a fresh, unclaimed noot at a random tile: its hoard dies with
-        // it (cleared, not refilled — a money sink), and it draws a new temperament.
+        // Reincarnate a fresh, unclaimed noot at a random tile with the starting
+        // wallet, and draw a new temperament.
         *inv = Inventory::new();
-        wallet.bucks = 0.0;
+        wallet.bucks = STARTING_BUCKS;
         *hunger = Hunger::fresh(&mut rng.0);
         *mem = RouteMemory::new(n_tiles, false, rng.0.range(EXPLORE_MIN, EXPLORE_MAX));
         *trader = Trader::new();
