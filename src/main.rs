@@ -2,6 +2,7 @@ mod economy;
 mod elements;
 mod goods;
 mod hex;
+mod icon;
 mod movement;
 mod noot;
 mod rng;
@@ -104,6 +105,12 @@ struct TerrainButton;
 
 #[derive(Component)]
 struct HudText;
+
+/// One per-resource HUD row's text (paired with its element icon); `slot` is 0..4.
+#[derive(Component)]
+struct ResourceLine {
+    slot: usize,
+}
 
 /// Text of the bottom panel describing the selected noot.
 #[derive(Component)]
@@ -247,10 +254,15 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     let world = generate(random_seed(), COLS, ROWS, HEX_SIZE);
     let hex_size = world.hex_size;
     let n_tiles = (world.cols * world.rows) as usize;
+
+    // One thematic icon texture per chosen element (used on the map and in the HUD).
+    let icons: [Handle<Image>; 4] =
+        std::array::from_fn(|slot| images.add(icon::render_icon(world.chosen[slot].id.0)));
 
     // Every noot is mortal now; the PID targets a death rate over the whole roster.
     let n_noots = (world.deposits.len() + N_ROAMERS) as f32;
@@ -318,18 +330,26 @@ fn setup(
         ));
     }
 
-    // Deposit markers (coloured by element) with a hidden claim outline above them.
-    let deposit_mesh = meshes.add(RegularPolygon::new(hex_size * 0.5, 6));
+    // Deposit markers: a dark backing disc carrying the element's thematic icon,
+    // with a hidden claim outline ringing it.
+    let disc_mesh = meshes.add(Circle::new(hex_size * 0.5));
     let outline_mesh = meshes.add(Annulus::new(hex_size * 0.54, hex_size * 0.62));
     for (di, deposit) in world.deposits.iter().enumerate() {
         let tile = &world.tiles[deposit.tile];
         let (x, y) = hex::hex_center(tile.col, tile.row, hex_size);
         let (px, py) = (x + offset.x, y + offset.y);
-        let (r, g, b) = elements::element(world.chosen[deposit.element_slot].id).color;
         commands.spawn((
-            Mesh2d(deposit_mesh.clone()),
-            MeshMaterial2d(materials.add(Color::srgb(r, g, b))),
+            Mesh2d(disc_mesh.clone()),
+            MeshMaterial2d(materials.add(Color::srgba(0.08, 0.08, 0.10, 0.88))),
             Transform::from_xyz(px, py, 1.0),
+        ));
+        commands.spawn((
+            Sprite {
+                image: icons[deposit.element_slot].clone(),
+                custom_size: Some(Vec2::splat(hex_size * 0.85)),
+                ..default()
+            },
+            Transform::from_xyz(px, py, 1.05),
         ));
         commands.spawn((
             Mesh2d(outline_mesh.clone()),
@@ -394,7 +414,7 @@ fn setup(
         );
     }
 
-    spawn_ui(&mut commands);
+    spawn_ui(&mut commands, &icons);
 
     commands.insert_resource(SimRng(sim_rng));
     commands.insert_resource(Sim(world));
@@ -438,7 +458,7 @@ fn spawn_noot(
     ));
 }
 
-fn spawn_ui(commands: &mut Commands) {
+fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4]) {
     commands
         .spawn(Node {
             width: Val::Percent(100.0),
@@ -449,11 +469,13 @@ fn spawn_ui(commands: &mut Commands) {
             ..default()
         })
         .with_children(|root| {
-            // Status panel (top).
+            // Status panel (top): summary text, then one icon+text row per resource.
             root.spawn((
                 Node {
                     align_self: AlignSelf::FlexStart,
                     max_width: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(2.0),
                     padding: UiRect::all(Val::Px(8.0)),
                     ..default()
                 },
@@ -469,6 +491,34 @@ fn spawn_ui(commands: &mut Commands) {
                     TextColor(Color::WHITE),
                     HudText,
                 ));
+                for (slot, icon) in icons.iter().enumerate() {
+                    panel
+                        .spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: Val::Px(6.0),
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            row.spawn((
+                                ImageNode::new(icon.clone()),
+                                Node {
+                                    width: Val::Px(18.0),
+                                    height: Val::Px(18.0),
+                                    ..default()
+                                },
+                            ));
+                            row.spawn((
+                                Text::new(""),
+                                TextFont {
+                                    font_size: 13.0,
+                                    ..default()
+                                },
+                                TextColor(Color::WHITE),
+                                ResourceLine { slot },
+                            ));
+                        });
+                }
             });
 
             // Selection panel (bottom): details of the followed noot.
@@ -1061,13 +1111,15 @@ fn update_selection_panel(
     text.0 = out;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_hud(
     sim: Res<Sim>,
     stats: Res<EconStats>,
     paused: Res<Paused>,
     hunger_ctrl: Res<HungerControl>,
     noots: Query<(&Wallet, &Hunger, &Trader, &Claim)>,
-    mut hud: Query<&mut Text, With<HudText>>,
+    mut hud: Query<&mut Text, (With<HudText>, Without<ResourceLine>)>,
+    mut lines: Query<(&ResourceLine, &mut Text), Without<HudText>>,
 ) {
     let world = &sim.0;
 
@@ -1098,7 +1150,7 @@ fn update_hud(
 
     if let Ok(mut text) = hud.single_mut() {
         let pause_tag = if paused.0 { "[PAUSED]  " } else { "" };
-        let mut out = format!(
+        let out = format!(
             "{pause_tag}econ-sim  seed {:#x}  noots {}  trades {}  in circulation ₦{:.0}\n\
              {}/{} deposits claimed   avg appetite {:.1}   avg discount {:.2}\n\
              starving {}/{} ({:.0}%)   production {:.1}/s   consumption {:.1}/s\n\
@@ -1110,45 +1162,46 @@ fn update_hud(
             stats.consumption_rate, stats.merchant_profit_rate, stats.utility_rate,
             hunger_ctrl.measured_per_min, hunger_ctrl.target_per_min, hunger_ctrl.rate
         );
-        for slot in 0..4 {
-            let ce = &world.chosen[slot];
-            let elem = elements::element(ce.id);
-            let good = &world.goods.goods[slot];
-            let category = match good.category {
-                GoodCategory::Staple => "staple",
-                GoodCategory::Positional => "posit ",
-            };
-            let (form, good_name) = match good.form {
-                GoodForm::Raw => ("raw    ", elem.name),
-                GoodForm::Refined => ("refined", elem.refined),
-            };
-            let resource = match ce.role {
-                ResourceRole::Replenishable => "REPL",
-                ResourceRole::Finite => "FIN ",
-            };
-            let avail: f64 = world
-                .deposits
-                .iter()
-                .filter(|d| d.element_slot == slot)
-                .map(|d| d.available())
-                .sum();
-            let item = goods::item_index(slot, good.form);
-            let price = stats.last_price[item];
-            let tail = match world.remaining_fraction(slot) {
-                Some(frac) => format!("left {:>3.0}%", frac * 100.0),
-                None => format!("stock {:>4.0}", avail),
-            };
-            out.push_str(&format!(
-                "{}. {:<9} {}/{}  {}  ₦{:>3.0}  {}\n",
-                slot + 1,
-                good_name,
-                category,
-                form,
-                resource,
-                price,
-                tail
-            ));
-        }
         text.0 = out;
     }
+
+    // Per-resource rows, each beside its element icon.
+    for (line, mut text) in &mut lines {
+        let want = resource_line(world, &stats, line.slot);
+        if text.0 != want {
+            text.0 = want;
+        }
+    }
+}
+
+/// One resource's HUD line (the leading icon identifies which element it is).
+fn resource_line(world: &World, stats: &EconStats, slot: usize) -> String {
+    let ce = &world.chosen[slot];
+    let elem = elements::element(ce.id);
+    let good = &world.goods.goods[slot];
+    let category = match good.category {
+        GoodCategory::Staple => "staple",
+        GoodCategory::Positional => "posit ",
+    };
+    let (form, good_name) = match good.form {
+        GoodForm::Raw => ("raw    ", elem.name),
+        GoodForm::Refined => ("refined", elem.refined),
+    };
+    let resource = match ce.role {
+        ResourceRole::Replenishable => "REPL",
+        ResourceRole::Finite => "FIN ",
+    };
+    let avail: f64 = world
+        .deposits
+        .iter()
+        .filter(|d| d.element_slot == slot)
+        .map(|d| d.available())
+        .sum();
+    let item = goods::item_index(slot, good.form);
+    let price = stats.last_price[item];
+    let tail = match world.remaining_fraction(slot) {
+        Some(frac) => format!("left {:>3.0}%", frac * 100.0),
+        None => format!("stock {:>4.0}", avail),
+    };
+    format!("{good_name:<9} {category}/{form}  {resource}  ₦{price:>3.0}  {tail}")
 }

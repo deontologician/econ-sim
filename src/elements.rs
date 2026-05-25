@@ -1,6 +1,6 @@
 //! The pool of ~25 candidate "elements". Each playthrough draws four of these
-//! to be the building blocks of that world. Colours are sRGB and used to tint
-//! the deposit markers on the map.
+//! to be the building blocks of that world. Colours are sRGB and used as each
+//! element's theme colour for its procedural icon (`icon.rs`).
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ElementId(pub usize);

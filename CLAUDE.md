@@ -49,13 +49,20 @@ cargo clippy --target wasm32-unknown-unknown
 
 - `world.rs` — hex map, terrain, deposits, resource regrowth/depletion.
 - `goods.rs` / `elements.rs` — per-world good identity, item roles, element data.
-- `noot.rs` — agent ECS components (`Role`, `Inventory`, `Wallet`, `Hunger`,
-  `RouteMemory`, `HaulContract`).
-- `economy.rs` — extraction, refining, trade (`meet_and_trade`), consumption,
-  reward plumbing, `EconStats`.
+- `icon.rs` — procedural thematic element icons (SDF shapes → RGBA texture), shared
+  by the map sprites and the HUD images.
+- `noot.rs` — agent ECS components. **No roles**: every noot is one unified type
+  (`Noot` marker) carrying `Claim` (which deposit it owns, if any), `Trader`
+  (learned arbitrage discount + cost basis), `Inventory`, `Wallet`, `Hunger`,
+  `RouteMemory`.
+- `economy.rs` — emergent claiming (`claim_deposits`), extraction, universal
+  refining, trade (`meet_and_trade`, unified consumption+arbitrage valuation),
+  consumption, the hunger-rate PID, reward plumbing, `EconStats`.
 - `movement.rs` — locomotion + the per-hex **TD(λ) value-learning** navigation
-  (`RouteMemory`); transporters move by haul-contract state.
-- `main.rs` — Bevy app wiring, spawn/respawn, camera/input, HUD, pause.
+  (`RouteMemory`); a claim-holder homes to its deposit to refill then value-walks to
+  sell, a claimless noot just roams the value gradient.
+- `main.rs` — Bevy app wiring, spawn/respawn, camera fit/input, HUD, pause, the
+  value/terrain overlays, deposit-claim outlines, and per-noot ownership colour.
 
 ## Plans & the feature ledger
 
