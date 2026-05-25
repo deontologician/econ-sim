@@ -6,7 +6,6 @@ use bevy::prelude::*;
 use crate::goods::N_ITEMS;
 
 pub const N_STAPLES: usize = 2;
-pub const N_POSITIONAL: usize = 2;
 
 pub const STARTING_BUCKS: f32 = 100.0;
 /// Appetite at which a noot is "starving"; 0 means fully fed.
@@ -118,12 +117,17 @@ pub struct Wallet {
 #[derive(Component)]
 pub struct Hunger {
     pub staple: [f32; N_STAPLES],
+    /// Seconds spent fully starving (all staples maxed); drives death.
+    pub starving_secs: f32,
 }
 
 impl Hunger {
-    pub fn starving() -> Self {
+    /// A freshly (re)spawned noot: moderately hungry, not yet starving, so it
+    /// gets a fair window to find food before the death timer can bite.
+    pub fn fresh() -> Self {
         Self {
-            staple: [STAPLE_SATIATION; N_STAPLES],
+            staple: [STAPLE_SATIATION * 0.5; N_STAPLES],
+            starving_secs: 0.0,
         }
     }
 
@@ -141,6 +145,11 @@ impl Hunger {
             .any(|&a| a >= STAPLE_SATIATION * STARVING_FRACTION)
     }
 
+    /// Every staple pinned at maximum appetite — utterly out of food.
+    pub fn fully_starving(&self) -> bool {
+        self.staple.iter().all(|&a| a >= STAPLE_SATIATION - 1e-3)
+    }
+
     /// Welfare from *not* being hungry: 1.0 per fully-fed staple, 0.0 when a
     /// staple is fully starving.
     pub fn utility(&self) -> f32 {
@@ -148,19 +157,6 @@ impl Hunger {
             .iter()
             .map(|&a| (STAPLE_SATIATION - a) / STAPLE_SATIATION)
             .sum()
-    }
-}
-
-/// Accumulated stock of each positional good (drives logarithmic utility).
-#[derive(Component)]
-pub struct Positional {
-    pub stock: [f32; N_POSITIONAL],
-}
-
-impl Positional {
-    /// Diminishing (logarithmic) welfare from accumulated positional goods.
-    pub fn utility(&self) -> f32 {
-        self.stock.iter().map(|&s| (1.0 + s).ln()).sum()
     }
 }
 

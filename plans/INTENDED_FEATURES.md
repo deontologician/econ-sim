@@ -76,12 +76,38 @@ design. Newest first within each section.
 
 ### Welfare / utility
 - **NOW**: a noot's utility = "not starving" (per staple, `(satiation−appetite)/
-  satiation`) + diminishing positional welfare (`Σ ln(1+stock)`). Realized at
-  consumption; shown per-noot in the selection panel and economy-wide as a
-  utility/sec rate. *(partial)*
+  satiation`) + diminishing positional welfare (`Σ ln(1+held)`) from the durable
+  positional goods it *holds* (no longer consumed). Staple welfare is realized at
+  consumption and reported economy-wide as a utility/sec rate; positional welfare
+  is a stock shown per-noot in the selection panel. *(partial)*
 - **INTENDED**: utility should drive more decisions — willingness-to-pay,
   labor-supply and role choices, savings — not just the movement reward and a
   readout. Tune the staple/positional weighting and add more want categories.
+- **STATUS**: partial
+
+### Durable goods & voluntary selling
+- **NOW**: positional (luxury) goods are **durable** — held in inventory as wealth,
+  never auto-consumed. A noot buys them only once its staples are satisfied, and
+  sells from its holdings when its reservation price — the marginal worth of
+  keeping one (`POSITIONAL_VALUE/(1+held)`), discounted by hunger via
+  `POSITIONAL_SELL_URGENCY` — falls below the buyer-facing ask. So the
+  hungry-and-goods-rich liquidate wealth for food money while the fed shed only
+  surplus: a self-balancing loop. Staples stay perishable food. *(partial)*
+- **INTENDED**: a real asset / secondhand market — durable goods depreciate, span
+  more types (tools, housing, capital), price inventory-aware, and feed production
+  (capital) rather than only welfare.
+- **STATUS**: partial
+
+### Mortality (starvation death)
+- **NOW**: a noot that sits fully starving (all staples maxed) for
+  `DEATH_GRACE_SECS` dies and is immediately reborn as a fresh agent of the same
+  role — owners back on their deposit, everyone else at a random tile — with a
+  full wallet, empty inventory and half hunger, so the population stays fixed.
+  *(partial)*
+- **INTENDED**: real demographics — births/deaths move the population, claims and
+  wealth pass on or revert (inheritance, abandoned deposits), causes of death
+  beyond starvation, and an economy that adapts to a changing headcount instead of
+  a fixed roster.
 - **STATUS**: partial
 
 ### Movement learning (RL)

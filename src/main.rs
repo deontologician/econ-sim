@@ -16,8 +16,8 @@ use economy::EconStats;
 use goods::{GoodCategory, GoodForm};
 use movement::tile_to_pixel;
 use noot::{
-    Brain, HaulContract, HaulState, Home, Hunger, Inventory, Positional, Role, TilePos, Wallet,
-    N_POSITIONAL, PRINCIPAL_SHARE, STARTING_BUCKS,
+    Brain, HaulContract, HaulState, Home, Hunger, Inventory, Role, TilePos, Wallet, PRINCIPAL_SHARE,
+    STARTING_BUCKS,
 };
 use rng::Rng;
 use world::{generate, ResourceRole, Terrain, World};
@@ -31,6 +31,10 @@ const HEX_SIZE: f32 = 26.0;
 const N_REFINERS: usize = 6;
 const N_CONSUMERS: usize = 32;
 const N_TRANSPORTERS: usize = 6;
+
+/// Seconds a noot can sit fully starving (all staples maxed) before it dies and
+/// is reborn as a fresh agent of the same role.
+const DEATH_GRACE_SECS: f32 = 20.0;
 
 // --- Camera limits ----------------------------------------------------------
 const MIN_ZOOM: f32 = 0.3;
@@ -59,6 +63,21 @@ pub struct MapView {
 #[derive(Resource, Default)]
 struct Selection(Option<Entity>);
 
+/// When true the simulation systems are frozen; input/camera/HUD keep running.
+#[derive(Resource, Default)]
+struct Paused(bool);
+
+/// Whether the simulation should advance this frame (a Bevy run condition).
+fn sim_running(paused: Res<Paused>) -> bool {
+    !paused.0
+}
+
+/// The on-screen pause toggle and its caption.
+#[derive(Component)]
+struct PauseButton;
+#[derive(Component)]
+struct PauseLabel;
+
 #[derive(Component)]
 struct HudText;
 
@@ -86,31 +105,37 @@ fn main() {
         }))
         .init_resource::<EconStats>()
         .init_resource::<Selection>()
+        .init_resource::<Paused>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
                 // Nested into sub-tuples purely to stay under the 20-system
-                // tuple-arity limit; grouping imposes no ordering.
-                (simulate, economy::income, economy::hunger_tick),
+                // tuple-arity limit; grouping imposes no ordering. The simulation
+                // groups are gated by `sim_running` so the pause button freezes
+                // them while input/camera/HUD keep working.
+                (simulate, economy::income, economy::hunger_tick).run_if(sim_running),
                 (
                     economy::haul_assign,
                     movement::movement,
                     movement::haul_movement,
-                ),
+                )
+                    .run_if(sim_running),
                 (
                     economy::extract,
                     economy::haul_loading,
                     economy::refine,
                     economy::meet_and_trade,
                     economy::haul_settle,
-                ),
-                (economy::consume, economy::update_rates),
+                )
+                    .run_if(sim_running),
+                (economy::consume, death_and_respawn, economy::update_rates).run_if(sim_running),
                 (
                     pick_selection,
                     touch_camera,
                     keyboard_mouse_camera,
                     follow_selected,
+                    pause_controls,
                 ),
                 (
                     update_hud,
@@ -294,10 +319,7 @@ fn setup(
             Wallet {
                 bucks: STARTING_BUCKS,
             },
-            Hunger::starving(),
-            Positional {
-                stock: [0.0; N_POSITIONAL],
-            },
+            Hunger::fresh(),
             Brain::new(sim_rng.below(6)),
             HaulContract::idle(),
         ));
@@ -338,10 +360,7 @@ fn spawn_noot(
         Wallet {
             bucks: STARTING_BUCKS,
         },
-        Hunger::starving(),
-        Positional {
-            stock: [0.0; N_POSITIONAL],
-        },
+        Hunger::fresh(),
         Brain::new(heading),
     ));
 }
@@ -401,10 +420,121 @@ fn spawn_ui(commands: &mut Commands) {
                 ));
             });
         });
+
+    // Pause toggle, pinned top-right (absolute so it floats over the panels).
+    // Large enough to be a comfortable touch target on mobile.
+    commands
+        .spawn((
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(10.0),
+                top: Val::Px(10.0),
+                width: Val::Px(96.0),
+                height: Val::Px(44.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.12, 0.12, 0.12, 0.85)),
+            PauseButton,
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new("Pause"),
+                TextFont {
+                    font_size: 18.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+                PauseLabel,
+            ));
+        });
 }
 
 fn simulate(time: Res<Time>, mut sim: ResMut<Sim>) {
     sim.0.tick(time.delta_secs());
+}
+
+/// Toggle pause from the spacebar or the on-screen button, and keep the button
+/// caption in sync. Runs every frame (never gated) so the sim can be unpaused.
+fn pause_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut paused: ResMut<Paused>,
+    button: Query<&Interaction, (Changed<Interaction>, With<PauseButton>)>,
+    mut label: Query<&mut Text, With<PauseLabel>>,
+) {
+    let pressed_button = button.iter().any(|i| *i == Interaction::Pressed);
+    if keys.just_pressed(KeyCode::Space) || pressed_button {
+        paused.0 = !paused.0;
+    }
+    if let Ok(mut text) = label.single_mut() {
+        let want = if paused.0 { "Play" } else { "Pause" };
+        if text.0 != want {
+            text.0 = want.into();
+        }
+    }
+}
+
+/// A noot that has sat fully starving for `DEATH_GRACE_SECS` dies and is reborn
+/// as a fresh agent of the same role: owners back on their deposit, everyone else
+/// at a random tile, with a full wallet, empty inventory and half hunger.
+fn death_and_respawn(
+    time: Res<Time>,
+    mut rng: ResMut<SimRng>,
+    sim: Res<Sim>,
+    view: Res<MapView>,
+    mut q: Query<(
+        &Role,
+        &mut Hunger,
+        &mut Inventory,
+        &mut Wallet,
+        &mut Brain,
+        &mut TilePos,
+        &mut Transform,
+        &mut Home,
+        Option<&mut HaulContract>,
+    )>,
+) {
+    let dt = time.delta_secs();
+    let world = &sim.0;
+    for (role, mut hunger, mut inv, mut wallet, mut brain, mut pos, mut tf, mut home, contract) in
+        &mut q
+    {
+        if hunger.fully_starving() {
+            hunger.starving_secs += dt;
+        } else {
+            hunger.starving_secs = 0.0;
+        }
+        if hunger.starving_secs < DEATH_GRACE_SECS {
+            continue;
+        }
+
+        // Reincarnate: a fresh agent of the same role steps in.
+        *inv = Inventory::new();
+        wallet.bucks = STARTING_BUCKS;
+        *hunger = Hunger::fresh();
+        *brain = Brain::new(rng.0.below(6));
+        let (col, row) = match role {
+            Role::Owner { deposit } => {
+                let t = world.deposits[*deposit].tile;
+                (world.tiles[t].col, world.tiles[t].row)
+            }
+            _ => (
+                rng.0.below(world.cols as usize) as i32,
+                rng.0.below(world.rows as usize) as i32,
+            ),
+        };
+        pos.col = col;
+        pos.row = row;
+        home.col = col;
+        home.row = row;
+        let p = tile_to_pixel(col, row, view.hex_size, view.offset);
+        tf.translation = Vec3::new(p.x, p.y, 2.0);
+        if let Some(mut c) = contract {
+            *c = HaulContract::idle();
+        }
+    }
 }
 
 /// Touch: one finger drags the map, two fingers pinch to zoom (and pan). A
@@ -583,14 +713,7 @@ fn update_selection_ring(
 fn update_selection_panel(
     selection: Res<Selection>,
     sim: Res<Sim>,
-    noots: Query<(
-        &Role,
-        &Wallet,
-        &Hunger,
-        &Positional,
-        &Inventory,
-        Option<&HaulContract>,
-    )>,
+    noots: Query<(&Role, &Wallet, &Hunger, &Inventory, Option<&HaulContract>)>,
     mut panel: Query<&mut Text, With<SelectionText>>,
 ) {
     let Ok(mut text) = panel.single_mut() else {
@@ -601,7 +724,7 @@ fn update_selection_panel(
         text.0 = stale.into();
         return;
     };
-    let Ok((role, wallet, hunger, positional, inv, contract)) = noots.get(entity) else {
+    let Ok((role, wallet, hunger, inv, contract)) = noots.get(entity) else {
         text.0 = stale.into();
         return;
     };
@@ -626,7 +749,7 @@ fn update_selection_panel(
         }
     };
 
-    let utility = hunger.utility() + positional.utility();
+    let utility = hunger.utility() + economy::positional_utility(&world.goods, inv);
     let mut out = format!(
         "[selected] {}   ₦{:.0}   hunger {:.1}   utility {:.2}\n",
         role_label,
@@ -670,6 +793,7 @@ fn update_selection_panel(
 fn update_hud(
     sim: Res<Sim>,
     stats: Res<EconStats>,
+    paused: Res<Paused>,
     noots: Query<(&Role, &Wallet, &Hunger)>,
     haulers: Query<&HaulContract>,
     mut hud: Query<&mut Text, With<HudText>>,
@@ -717,8 +841,9 @@ fn update_hud(
     };
 
     if let Ok(mut text) = hud.single_mut() {
+        let pause_tag = if paused.0 { "[PAUSED]  " } else { "" };
         let mut out = format!(
-            "econ-sim  seed {:#x}  noots {}  trades {}  in circulation ₦{:.0}\n\
+            "{pause_tag}econ-sim  seed {:#x}  noots {}  trades {}  in circulation ₦{:.0}\n\
              {} owners · {} refiners · {} consumers · {} transporters   avg appetite {:.1}\n\
              starving {}/{} ({:.0}%)   production {:.1}/s   consumption {:.1}/s\n\
              haulers {}/{} active   hauled {:.1}/s   utility {:.1}/s\n\

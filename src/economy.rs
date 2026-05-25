@@ -21,7 +21,6 @@ pub const BUCKS_INCOME: f32 = 0.6;
 
 // Consumption.
 const EAT_VALUE: f32 = 4.0; // appetite removed per staple unit eaten
-const POSITIONAL_CONSUME_RATE: f32 = 1.5;
 
 // Asking prices (bucks) by item kind.
 const ASK_RAW_CONSUMABLE: f32 = 6.0;
@@ -31,7 +30,11 @@ const ASK_REFINED_CONSUMABLE: f32 = 12.0;
 // Valuations (bucks).
 const REFINER_WTP_INTERMEDIATE: f32 = 8.0;
 const STAPLE_VALUE: f32 = 20.0; // WTP when starving
-const POSITIONAL_VALUE: f32 = 40.0; // first-unit WTP, then /(1+stock)
+const POSITIONAL_VALUE: f32 = 40.0; // first-unit WTP, then /(1+held)
+/// How steeply hunger discounts a noot's reservation price for keeping a durable
+/// positional good: at full starvation it parts with one for `1−this` of its
+/// marginal worth, so the hungry liquidate wealth for food money.
+const POSITIONAL_SELL_URGENCY: f32 = 0.9;
 
 const TRADE_RADIUS_FACTOR: f32 = 1.7; // × hex_size
 
@@ -147,18 +150,20 @@ pub fn refine(time: Res<Time>, sim: Res<Sim>, mut q: Query<(&Role, &mut Inventor
 pub fn consume(
     sim: Res<Sim>,
     mut stats: ResMut<EconStats>,
-    mut q: Query<(&Role, &mut Inventory, &mut Hunger, &mut Positional, &mut Brain)>,
+    mut q: Query<(&Role, &mut Inventory, &mut Hunger, &mut Brain)>,
 ) {
     let dt_goods = &sim.0.goods;
     let mut eaten = 0.0f32;
     let mut utility_gained = 0.0f32;
-    for (role, mut inv, mut hunger, mut positional, mut brain) in &mut q {
+    for (role, mut inv, mut hunger, mut brain) in &mut q {
         // Transporters carry goods for others; they don't eat the cargo.
         if matches!(role, Role::Transporter) {
             continue;
         }
         let mut reward = 0.0f32;
         // Staples first (satisficing: eat only to satiation, surplus unused).
+        // Positional goods are *durable* — they're held as wealth (welfare from
+        // the holding, see `positional_utility`) and sold by choice, never eaten.
         for item in 0..N_ITEMS {
             if let ItemRole::Staple(sub) = dt_goods.role_of(item) {
                 if inv.items[item] > 0.0 && hunger.staple[sub] > 0.0 {
@@ -172,22 +177,6 @@ pub fn consume(
                 }
             }
         }
-        // Positional goods only once staples are satisfied.
-        if hunger.satisfied() {
-            for item in 0..N_ITEMS {
-                if let ItemRole::Positional(sub) = dt_goods.role_of(item) {
-                    if inv.items[item] > 0.0 {
-                        let c = inv.items[item].min(POSITIONAL_CONSUME_RATE);
-                        let before = (1.0 + positional.stock[sub]).ln();
-                        inv.items[item] -= c;
-                        positional.stock[sub] += c;
-                        eaten += c;
-                        // Diminishing (log) welfare from the new positional stock.
-                        reward += (1.0 + positional.stock[sub]).ln() - before;
-                    }
-                }
-            }
-        }
         brain.trip_reward += reward;
         utility_gained += reward;
     }
@@ -195,6 +184,15 @@ pub fn consume(
     stats.consumed_total += eaten as f64;
     stats.utility_window += utility_gained;
     stats.utility_total += utility_gained as f64;
+}
+
+/// Diminishing (logarithmic) welfare from the durable positional goods a noot
+/// currently holds in inventory: `Σ ln(1 + held)` over positional items.
+pub fn positional_utility(goods: &goods::WorldGoods, inv: &Inventory) -> f32 {
+    (0..N_ITEMS)
+        .filter(|&i| matches!(goods.role_of(i), ItemRole::Positional(_)))
+        .map(|i| (1.0 + inv.items[i]).ln())
+        .sum()
 }
 
 struct Snap {
@@ -205,9 +203,9 @@ struct Snap {
     bucks: f32,
     hunger: [f32; N_STAPLES],
     satisfied: bool,
-    positional: [f32; N_POSITIONAL],
 }
 
+/// What a noot is willing to *pay* to acquire one unit (buyer side).
 fn wtp(goods: &goods::WorldGoods, item: usize, s: &Snap) -> f32 {
     // Transporters are pure logistics agents: they haul and sell, never buy.
     if matches!(s.role, Role::Transporter) {
@@ -215,12 +213,46 @@ fn wtp(goods: &goods::WorldGoods, item: usize, s: &Snap) -> f32 {
     }
     match goods.role_of(item) {
         ItemRole::Staple(sub) => STAPLE_VALUE * (s.hunger[sub] / STAPLE_SATIATION),
-        ItemRole::Positional(sub) => {
+        // Durable luxuries are only bought once fed; marginal worth falls as the
+        // noot's *held* stock of that good grows.
+        ItemRole::Positional(_) => {
             if s.satisfied {
-                POSITIONAL_VALUE / (1.0 + s.positional[sub])
+                POSITIONAL_VALUE / (1.0 + s.inv[item])
             } else {
                 0.0
             }
+        }
+        ItemRole::Intermediate => {
+            if matches!(s.role, Role::Refiner) {
+                REFINER_WTP_INTERMEDIATE
+            } else {
+                0.0
+            }
+        }
+        ItemRole::Junk => 0.0,
+    }
+}
+
+/// The lowest price at which a noot will *part with* one unit it holds (seller
+/// side). For durable positional goods this is the marginal worth of keeping it
+/// (which shrinks as holdings grow), discounted by hunger — a starving, goods-rich
+/// noot sells cheaply to buy food, while a fed one sheds only its surplus.
+fn reservation(goods: &goods::WorldGoods, item: usize, s: &Snap) -> f32 {
+    // Transporters never want their cargo; they sell whatever they carry.
+    if matches!(s.role, Role::Transporter) {
+        return 0.0;
+    }
+    match goods.role_of(item) {
+        ItemRole::Staple(sub) => STAPLE_VALUE * (s.hunger[sub] / STAPLE_SATIATION),
+        ItemRole::Positional(_) => {
+            let marginal = POSITIONAL_VALUE / (1.0 + s.inv[item]);
+            let hunger_frac = s
+                .hunger
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max)
+                / STAPLE_SATIATION;
+            marginal * (1.0 - POSITIONAL_SELL_URGENCY * hunger_frac).max(0.0)
         }
         ItemRole::Intermediate => {
             if matches!(s.role, Role::Refiner) {
@@ -261,7 +293,6 @@ pub fn meet_and_trade(
         &mut Inventory,
         &mut Wallet,
         &Hunger,
-        &Positional,
     )>,
     // Separate query (HaulContract isn't in the tuple above, so no conflict):
     // record a hauling seller's revenue so it can settle the owner's share.
@@ -273,7 +304,7 @@ pub fn meet_and_trade(
     // Snapshot (immutable read) so we can reason about pairs without aliasing.
     let mut snaps: Vec<Snap> = q
         .iter()
-        .map(|(e, t, role, inv, wal, hunger, pos)| Snap {
+        .map(|(e, t, role, inv, wal, hunger)| Snap {
             e,
             pos: t.translation.truncate(),
             role: *role,
@@ -281,7 +312,6 @@ pub fn meet_and_trade(
             bucks: wal.bucks,
             hunger: hunger.staple,
             satisfied: hunger.satisfied(),
-            positional: pos.stock,
         })
         .collect();
 
@@ -301,8 +331,8 @@ pub fn meet_and_trade(
                     }
                     let price = ask(goods, item);
                     let buyer_wtp = wtp(goods, item, &snaps[bi]);
-                    let seller_wtp = wtp(goods, item, &snaps[si]);
-                    if buyer_wtp >= price && seller_wtp < price && snaps[bi].bucks >= price {
+                    let seller_res = reservation(goods, item, &snaps[si]);
+                    if buyer_wtp >= price && seller_res < price && snaps[bi].bucks >= price {
                         let surplus = buyer_wtp - price;
                         if best.map_or(true, |(_, _, _, _, s)| surplus > s) {
                             best = Some((bi, si, item, price, surplus));
@@ -331,11 +361,11 @@ pub fn meet_and_trade(
 
     // Apply to the ECS, one entity borrow at a time.
     for tx in txs {
-        if let Ok((_, _, _, mut inv, mut wal, _, _)) = q.get_mut(tx.buyer) {
+        if let Ok((_, _, _, mut inv, mut wal, _)) = q.get_mut(tx.buyer) {
             inv.items[tx.item] += 1.0;
             wal.bucks -= tx.price;
         }
-        if let Ok((_, _, _, mut inv, mut wal, _, _)) = q.get_mut(tx.seller) {
+        if let Ok((_, _, _, mut inv, mut wal, _)) = q.get_mut(tx.seller) {
             inv.items[tx.item] -= 1.0;
             wal.bucks += tx.price;
         }
