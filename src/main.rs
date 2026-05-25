@@ -43,6 +43,11 @@ const TAP_SLOP: f32 = 12.0;
 /// Min single-finger pan delta (screen px) that releases the follow lock.
 const DESELECT_PAN_SLOP: f32 = 1.5;
 
+// --- Pause button layout (shared by spawn_ui and the pick guard) ------------
+const PAUSE_BTN_W: f32 = 96.0;
+const PAUSE_BTN_H: f32 = 44.0;
+const PAUSE_BTN_MARGIN: f32 = 10.0;
+
 #[derive(Resource)]
 pub struct Sim(pub World);
 
@@ -431,10 +436,10 @@ fn spawn_ui(commands: &mut Commands) {
             Button,
             Node {
                 position_type: PositionType::Absolute,
-                right: Val::Px(10.0),
-                top: Val::Px(10.0),
-                width: Val::Px(96.0),
-                height: Val::Px(44.0),
+                right: Val::Px(PAUSE_BTN_MARGIN),
+                top: Val::Px(PAUSE_BTN_MARGIN),
+                width: Val::Px(PAUSE_BTN_W),
+                height: Val::Px(PAUSE_BTN_H),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 ..default()
@@ -638,20 +643,35 @@ fn pick_selection(
     let Ok((camera, cam_tf)) = cameras.single() else {
         return;
     };
+    let window = windows.single().ok();
+
+    // A click/tap on the pause button must not be read as an empty map hit (which
+    // would clear the selection when you unpause). Skip pick points over its rect.
+    let over_pause = |p: Vec2| {
+        window.is_some_and(|w| {
+            let left = w.width() - PAUSE_BTN_MARGIN - PAUSE_BTN_W;
+            p.x >= left
+                && p.x <= w.width() - PAUSE_BTN_MARGIN
+                && p.y >= PAUSE_BTN_MARGIN
+                && p.y <= PAUSE_BTN_MARGIN + PAUSE_BTN_H
+        })
+    };
 
     // Collect this frame's pick points in screen space.
     let mut points: Vec<Vec2> = Vec::new();
     // Desktop: no mouse-drag panning exists, so any left click is a pick.
     if mouse.just_pressed(MouseButton::Left) {
-        if let Ok(window) = windows.single() {
-            if let Some(cursor) = window.cursor_position() {
+        if let Some(cursor) = window.and_then(|w| w.cursor_position()) {
+            if !over_pause(cursor) {
                 points.push(cursor);
             }
         }
     }
     // Mobile: a tap is a touch that lifted with little movement (a drag pans).
     for touch in touches.iter_just_released() {
-        if (touch.position() - touch.start_position()).length() < TAP_SLOP {
+        if (touch.position() - touch.start_position()).length() < TAP_SLOP
+            && !over_pause(touch.position())
+        {
             points.push(touch.position());
         }
     }
