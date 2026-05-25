@@ -42,10 +42,20 @@ const TAP_SLOP: f32 = 12.0;
 /// Min single-finger pan delta (screen px) that releases the follow lock.
 const DESELECT_PAN_SLOP: f32 = 1.5;
 
-// --- Pause button layout (shared by spawn_ui and the pick guard) ------------
+// --- Top-right button column layout (shared by spawn_ui and the pick guard) -
+// Pause sits at the top; the two overlay toggles stack below it.
 const PAUSE_BTN_W: f32 = 96.0;
 const PAUSE_BTN_H: f32 = 44.0;
 const PAUSE_BTN_MARGIN: f32 = 10.0;
+const BTN_GAP: f32 = 8.0;
+const VALUE_BTN_TOP: f32 = PAUSE_BTN_MARGIN + PAUSE_BTN_H + BTN_GAP;
+const TERRAIN_BTN_TOP: f32 = VALUE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
+/// Bottom edge of the whole button column (taps above this are UI, not the map).
+const BTN_COLUMN_BOTTOM: f32 = TERRAIN_BTN_TOP + PAUSE_BTN_H;
+
+const BTN_OFF: Color = Color::srgba(0.12, 0.12, 0.12, 0.85);
+const VALUE_BTN_ON: Color = Color::srgba(0.62, 0.22, 0.16, 0.9);
+const TERRAIN_BTN_ON: Color = Color::srgba(0.20, 0.45, 0.30, 0.9);
 
 #[derive(Resource)]
 pub struct Sim(pub World);
@@ -85,6 +95,12 @@ fn sim_running(paused: Res<Paused>) -> bool {
 struct PauseButton;
 #[derive(Component)]
 struct PauseLabel;
+
+/// On-screen overlay toggles (touch equivalents of the V / T keys).
+#[derive(Component)]
+struct ValueButton;
+#[derive(Component)]
+struct TerrainButton;
 
 #[derive(Component)]
 struct HudText;
@@ -507,6 +523,40 @@ fn spawn_ui(commands: &mut Commands) {
                 PauseLabel,
             ));
         });
+
+    // Overlay toggles, stacked under the pause button (same touch-target size).
+    spawn_overlay_button(commands, "Value", VALUE_BTN_TOP, ValueButton);
+    spawn_overlay_button(commands, "Terrain", TERRAIN_BTN_TOP, TerrainButton);
+}
+
+/// Spawn one top-right overlay toggle button at vertical offset `top`.
+fn spawn_overlay_button(commands: &mut Commands, label: &str, top: f32, marker: impl Component) {
+    commands
+        .spawn((
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(PAUSE_BTN_MARGIN),
+                top: Val::Px(top),
+                width: Val::Px(PAUSE_BTN_W),
+                height: Val::Px(PAUSE_BTN_H),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(BTN_OFF),
+            marker,
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(label),
+                TextFont {
+                    font_size: 16.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+            ));
+        });
 }
 
 fn simulate(time: Res<Time>, mut sim: ResMut<Sim>) {
@@ -718,15 +768,15 @@ fn pick_selection(
     };
     let window = windows.single().ok();
 
-    // A click/tap on the pause button must not be read as an empty map hit (which
-    // would clear the selection when you unpause). Skip pick points over its rect.
-    let over_pause = |p: Vec2| {
+    // A click/tap on the top-right button column (pause + overlay toggles) must not
+    // be read as an empty map hit (which would clear the selection). Skip those.
+    let over_buttons = |p: Vec2| {
         window.is_some_and(|w| {
             let left = w.width() - PAUSE_BTN_MARGIN - PAUSE_BTN_W;
             p.x >= left
                 && p.x <= w.width() - PAUSE_BTN_MARGIN
                 && p.y >= PAUSE_BTN_MARGIN
-                && p.y <= PAUSE_BTN_MARGIN + PAUSE_BTN_H
+                && p.y <= BTN_COLUMN_BOTTOM
         })
     };
 
@@ -735,7 +785,7 @@ fn pick_selection(
     // Desktop: no mouse-drag panning exists, so any left click is a pick.
     if mouse.just_pressed(MouseButton::Left) {
         if let Some(cursor) = window.and_then(|w| w.cursor_position()) {
-            if !over_pause(cursor) {
+            if !over_buttons(cursor) {
                 points.push(cursor);
             }
         }
@@ -743,7 +793,7 @@ fn pick_selection(
     // Mobile: a tap is a touch that lifted with little movement (a drag pans).
     for touch in touches.iter_just_released() {
         if (touch.position() - touch.start_position()).length() < TAP_SLOP
-            && !over_pause(touch.position())
+            && !over_buttons(touch.position())
         {
             points.push(touch.position());
         }
@@ -785,21 +835,29 @@ fn pick_selection(
     }
 }
 
-/// V toggles the value-field heat overlay, T the terrain-difficulty overlay; both
-/// sets of hidden hex cells flip visibility together when a key is pressed.
-#[allow(clippy::type_complexity)]
+/// Toggle the value-field heat overlay (V key or Value button) and the terrain
+/// overlay (T key or Terrain button), flipping the hidden hex cells and keeping the
+/// buttons tinted to show which overlay is live.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn overlay_controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut overlays: ResMut<Overlays>,
+    value_btn: Query<&Interaction, (Changed<Interaction>, With<ValueButton>)>,
+    terrain_btn: Query<&Interaction, (Changed<Interaction>, With<TerrainButton>)>,
     mut value_cells: Query<&mut Visibility, (With<ValueOverlay>, Without<TerrainOverlay>)>,
     mut terrain_cells: Query<&mut Visibility, (With<TerrainOverlay>, Without<ValueOverlay>)>,
+    mut value_bg: Query<&mut BackgroundColor, (With<ValueButton>, Without<TerrainButton>)>,
+    mut terrain_bg: Query<&mut BackgroundColor, (With<TerrainButton>, Without<ValueButton>)>,
 ) {
+    let value_tap = value_btn.iter().any(|i| *i == Interaction::Pressed);
+    let terrain_tap = terrain_btn.iter().any(|i| *i == Interaction::Pressed);
+
     let mut changed = false;
-    if keys.just_pressed(KeyCode::KeyV) {
+    if keys.just_pressed(KeyCode::KeyV) || value_tap {
         overlays.value = !overlays.value;
         changed = true;
     }
-    if keys.just_pressed(KeyCode::KeyT) {
+    if keys.just_pressed(KeyCode::KeyT) || terrain_tap {
         overlays.terrain = !overlays.terrain;
         changed = true;
     }
@@ -818,6 +876,12 @@ fn overlay_controls(
     }
     for mut v in &mut terrain_cells {
         *v = to(overlays.terrain);
+    }
+    for mut bg in &mut value_bg {
+        bg.0 = if overlays.value { VALUE_BTN_ON } else { BTN_OFF };
+    }
+    for mut bg in &mut terrain_bg {
+        bg.0 = if overlays.terrain { TERRAIN_BTN_ON } else { BTN_OFF };
     }
 }
 
