@@ -10,8 +10,6 @@ pub const N_STAPLES: usize = 2;
 pub const STARTING_BUCKS: f32 = 100.0;
 /// Appetite at which a noot is "starving"; 0 means fully fed.
 pub const STAPLE_SATIATION: f32 = 10.0;
-/// Appetite gained per second per staple.
-pub const HUNGER_RATE: f32 = 0.5;
 /// Below this fraction of satiation a staple counts as satisfied.
 pub const SATISFIED_FRACTION: f32 = 0.3;
 /// At or above this fraction of satiation a staple counts as "starving".

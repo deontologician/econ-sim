@@ -107,6 +107,8 @@ design. Newest first within each section.
   `DEATH_GRACE_SECS` dies and is immediately reborn as a fresh agent of the same
   role — owners back on their deposit, everyone else at a random tile — with a
   full wallet, empty inventory and half hunger, so the population stays fixed.
+  The global hunger rate is no longer fixed: a **PID loop** (`HungerControl`, Plan
+  006) trims it so the realized death rate tracks 2%/min of the mortal population.
   *(partial)*
 - **INTENDED**: real demographics — births/deaths move the population, claims and
   wealth pass on or revert (inheritance, abandoned deposits), causes of death

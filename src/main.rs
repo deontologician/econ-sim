@@ -12,7 +12,7 @@ use bevy::input::touch::Touch;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
-use economy::EconStats;
+use economy::{EconStats, HungerControl};
 use goods::{GoodCategory, GoodForm};
 use movement::tile_to_pixel;
 use noot::{Hunger, Inventory, Merchant, Role, RouteMemory, TilePos, Wallet, STARTING_BUCKS};
@@ -111,7 +111,13 @@ fn main() {
                 // tuple-arity limit; grouping imposes no ordering. The simulation
                 // groups are gated by `sim_running` so the pause button freezes
                 // them while input/camera/HUD keep working.
-                (simulate, economy::income, economy::hunger_tick).run_if(sim_running),
+                (
+                    simulate,
+                    economy::income,
+                    economy::hunger_tick,
+                    economy::hunger_pid,
+                )
+                    .run_if(sim_running),
                 (
                     movement::movement,
                     economy::extract,
@@ -183,6 +189,12 @@ fn setup(
     let world = generate(random_seed(), COLS, ROWS, HEX_SIZE);
     let hex_size = world.hex_size;
     let n_tiles = (world.cols * world.rows) as usize;
+
+    // Mortal population (merchants don't starve): owners + refiners + consumers.
+    let n_eaters = (world.deposits.len() + N_REFINERS + N_CONSUMERS) as f32;
+    commands.insert_resource(HungerControl::new(
+        economy::TARGET_DEATH_FRAC_PER_MIN * n_eaters,
+    ));
 
     // Centre the map on the origin and pick an initial zoom that fits a typical
     // phone screen in portrait, so the whole world is visible on first load.
@@ -477,6 +489,7 @@ fn death_and_respawn(
     mut rng: ResMut<SimRng>,
     sim: Res<Sim>,
     view: Res<MapView>,
+    mut ctrl: ResMut<HungerControl>,
     mut q: Query<(
         &Role,
         &mut Hunger,
@@ -503,6 +516,9 @@ fn death_and_respawn(
         if hunger.starving_secs < DEATH_GRACE_SECS {
             continue;
         }
+
+        // A death: feed it back to the hunger-rate controller.
+        ctrl.deaths_since_update += 1;
 
         // Reincarnate: a fresh agent of the same role steps in.
         *inv = Inventory::new();
@@ -765,6 +781,7 @@ fn update_hud(
     sim: Res<Sim>,
     stats: Res<EconStats>,
     paused: Res<Paused>,
+    hunger_ctrl: Res<HungerControl>,
     noots: Query<(&Role, &Wallet, &Hunger)>,
     merchants: Query<&Merchant>,
     mut hud: Query<&mut Text, With<HudText>>,
@@ -824,11 +841,13 @@ fn update_hud(
              {} owners · {} refiners · {} consumers · {} merchants   avg appetite {:.1}\n\
              starving {}/{} ({:.0}%)   production {:.1}/s   consumption {:.1}/s\n\
              merchant discount {:.2}   margin ₦{:.1}/s   utility {:.1}/s\n\
+             deaths {:.2}/min → target {:.2}   hunger rate {:.2}\n\
              drag to pan · pinch to zoom · tap a noot to follow it\n\n",
             world.seed, count, stats.trades_total, total_bucks, owners, refiners, consumers,
             transporters, avg_appetite, starving, eaters, starving_pct, stats.production_rate,
             stats.consumption_rate, avg_discount, stats.merchant_profit_rate,
-            stats.utility_rate
+            stats.utility_rate, hunger_ctrl.measured_per_min, hunger_ctrl.target_per_min,
+            hunger_ctrl.rate
         );
         for slot in 0..4 {
             let ce = &world.chosen[slot];

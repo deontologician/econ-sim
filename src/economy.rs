@@ -108,8 +108,82 @@ pub fn income(time: Res<Time>, mut wallets: Query<&mut Wallet>) {
     }
 }
 
-pub fn hunger_tick(time: Res<Time>, mut q: Query<(&Role, &mut Hunger)>) {
-    let d = HUNGER_RATE * time.delta_secs();
+// --- Hunger-rate PID (targets a steady death rate) --------------------------
+/// Starting appetite gained per second per staple, before the controller adjusts it.
+pub const HUNGER_RATE_INIT: f32 = 0.5;
+/// Target deaths per minute, as a fraction of the mortal (non-merchant) population.
+pub const TARGET_DEATH_FRAC_PER_MIN: f32 = 0.02;
+/// PID gains: error is in deaths/min, output is the hunger rate (appetite/sec).
+const PID_KP: f32 = 0.05;
+const PID_KI: f32 = 0.02;
+const PID_KD: f32 = 0.01;
+/// Control update interval (s). Deaths are rare, so we measure over a window.
+const PID_PERIOD: f32 = 3.0;
+/// EMA smoothing on the measured death rate — discrete deaths are noisy.
+const PID_MEAS_ALPHA: f32 = 0.4;
+const HUNGER_RATE_MIN: f32 = 0.05;
+const HUNGER_RATE_MAX: f32 = 3.0;
+
+/// PID controller that trims the global hunger rate so the realized death rate
+/// tracks `target_per_min`. Deaths feed back via `deaths_since_update`, bumped by
+/// `death_and_respawn`.
+#[derive(Resource)]
+pub struct HungerControl {
+    /// Current hunger rate (appetite/sec/staple) — what `hunger_tick` applies.
+    pub rate: f32,
+    pub target_per_min: f32,
+    /// Smoothed measured death rate (deaths/min), for the readout and the error.
+    pub measured_per_min: f32,
+    /// Deaths counted since the last control update.
+    pub deaths_since_update: u32,
+    elapsed: f32,
+    integral: f32,
+    prev_error: f32,
+}
+
+impl HungerControl {
+    pub fn new(target_per_min: f32) -> Self {
+        Self {
+            rate: HUNGER_RATE_INIT,
+            target_per_min,
+            // Seed the measurement at target and the integral at the initial rate so
+            // the loop starts from today's behaviour and only trims from there.
+            measured_per_min: target_per_min,
+            deaths_since_update: 0,
+            elapsed: 0.0,
+            integral: HUNGER_RATE_INIT / PID_KI,
+            prev_error: 0.0,
+        }
+    }
+}
+
+/// Once per `PID_PERIOD`, fold the window's death count into the smoothed rate and
+/// step the PID, nudging the hunger rate up when too few are dying and down when
+/// too many are.
+pub fn hunger_pid(time: Res<Time>, mut ctrl: ResMut<HungerControl>) {
+    ctrl.elapsed += time.delta_secs();
+    if ctrl.elapsed < PID_PERIOD {
+        return;
+    }
+    let dt = ctrl.elapsed;
+    let raw = ctrl.deaths_since_update as f32 / dt * 60.0;
+    ctrl.measured_per_min += PID_MEAS_ALPHA * (raw - ctrl.measured_per_min);
+
+    let error = ctrl.target_per_min - ctrl.measured_per_min;
+    // Anti-windup: keep the integral term inside the rate range.
+    let (i_min, i_max) = (HUNGER_RATE_MIN / PID_KI, HUNGER_RATE_MAX / PID_KI);
+    ctrl.integral = (ctrl.integral + error * dt).clamp(i_min, i_max);
+    let derivative = (error - ctrl.prev_error) / dt;
+    let output = PID_KP * error + PID_KI * ctrl.integral + PID_KD * derivative;
+    ctrl.rate = output.clamp(HUNGER_RATE_MIN, HUNGER_RATE_MAX);
+
+    ctrl.prev_error = error;
+    ctrl.deaths_since_update = 0;
+    ctrl.elapsed = 0.0;
+}
+
+pub fn hunger_tick(time: Res<Time>, ctrl: Res<HungerControl>, mut q: Query<(&Role, &mut Hunger)>) {
+    let d = ctrl.rate * time.delta_secs();
     for (role, mut h) in &mut q {
         // Merchants don't eat, so they don't get hungry (and never starve).
         if matches!(role, Role::Transporter) {
