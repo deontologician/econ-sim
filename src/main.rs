@@ -480,6 +480,8 @@ fn pause_controls(
 /// A noot that has sat fully starving for `DEATH_GRACE_SECS` dies and is reborn
 /// as a fresh agent of the same role: owners back on their deposit, everyone else
 /// at a random tile, with a full wallet, empty inventory and half hunger.
+// The respawn touches most of a noot's state at once; a wide query is inherent.
+#[allow(clippy::type_complexity)]
 fn death_and_respawn(
     time: Res<Time>,
     mut rng: ResMut<SimRng>,
@@ -659,7 +661,7 @@ fn pick_selection(
         let mut best: Option<(Entity, f32)> = None;
         for (e, tf, _role) in &noots {
             let d2 = tf.translation.truncate().distance_squared(world_pos);
-            if d2 <= pick_r2 && best.map_or(true, |(_, bd)| d2 < bd) {
+            if d2 <= pick_r2 && best.is_none_or(|(_, bd)| d2 < bd) {
                 best = Some((e, d2));
             }
         }

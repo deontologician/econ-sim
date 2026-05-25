@@ -252,9 +252,10 @@ fn generate_terrain(rng: &mut Rng, cols: i32, rows: i32) -> Vec<Tile> {
             for c in 0..cols {
                 let mut difficult = 0;
                 for (nc, nr) in neighbors(c, r) {
-                    if nc < 0 || nr < 0 || nc >= cols || nr >= rows {
-                        difficult += 1;
-                    } else if terr[idx(nc, nr)] == Terrain::Difficult {
+                    // Out-of-bounds counts as difficult (rugged edges); the bounds
+                    // checks short-circuit before the in-bounds tile is indexed.
+                    let oob = nc < 0 || nr < 0 || nc >= cols || nr >= rows;
+                    if oob || terr[idx(nc, nr)] == Terrain::Difficult {
                         difficult += 1;
                     }
                 }

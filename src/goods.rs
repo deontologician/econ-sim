@@ -46,7 +46,7 @@ pub fn item_index(slot: usize, form: GoodForm) -> usize {
 }
 
 pub fn form_of(item: usize) -> GoodForm {
-    if item % 2 == 0 {
+    if item.is_multiple_of(2) {
         GoodForm::Raw
     } else {
         GoodForm::Refined

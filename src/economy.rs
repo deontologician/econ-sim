@@ -339,7 +339,7 @@ pub fn meet_and_trade(
                     let seller_res = reservation(goods, item, &snaps[si]);
                     if buyer_wtp >= price && seller_res < price && snaps[bi].bucks >= price {
                         let surplus = buyer_wtp - price;
-                        if best.map_or(true, |(_, _, _, _, s)| surplus > s) {
+                        if best.is_none_or(|(_, _, _, _, s)| surplus > s) {
                             best = Some((bi, si, item, price, surplus));
                         }
                     }
