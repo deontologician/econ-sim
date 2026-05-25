@@ -17,9 +17,9 @@ design. Newest first within each section.
 
 ### Consumer income / wages
 - **NOW**: every noot gets a flat universal bucks trickle (`BUCKS_INCOME`/sec) so
-  consumers don't go broke and demand keeps circulating. Transporters are the
-  first *earned* income (a share of haul revenue), but the universal trickle is
-  still on. *(stub)*
+  consumers don't go broke and demand keeps circulating. Death is a partial **money
+  sink** — a noot's bucks are cleared (not refilled) on rebirth, so its hoard leaves
+  circulation. Still net-inflationary while the trickle is on. *(stub)*
 - **INTENDED**: no free money. Noots earn bucks only by producing/selling, doing
   paid work (transport, refining, hauling), or a real labor market. Bucks should
   be conserved except where minted by a defined mechanism. Retiring the trickle
@@ -120,7 +120,9 @@ design. Newest first within each section.
 ### Movement learning (RL)
 - **NOW**: per-noot **per-hex value learning** (`RouteMemory`, Plan 004). Each noot
   trains a TD(λ) value estimate over the whole map (α=0.1, γ=0.9, λ=0.8) and moves
-  ε-greedily up the gradient toward where it has earned reward. Reward = staple
+  ε-greedily up the gradient toward where it has earned reward, where ε is an
+  **intrinsic per-noot explore/exploit ratio** drawn at birth (re-drawn on rebirth).
+  Reward = staple
   welfare from eating **+** scaled selling income, banked per-tile and folded in on
   each step; the eligibility trace credits whole routes, not just the reward tile.
   Every noot trains the same field (Plan 007): a claim-holder homes to its deposit

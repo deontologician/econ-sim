@@ -17,8 +17,6 @@ use crate::world::{terrain_factor, World};
 use crate::{MapView, Sim, SimRng};
 
 const BASE_STEP_TIME: f32 = 0.35;
-/// Chance of a random (exploratory) step instead of the greedy value step.
-const EPSILON: f32 = 0.12;
 /// A claim-holder mines until carrying this much of its raw good, then tours to sell.
 const LOAD_THRESHOLD: f32 = 6.0;
 /// A claim-holder heads back to its deposit to refill once raw stock falls to this.
@@ -89,11 +87,25 @@ pub fn movement(
                         Some(step_toward(world, pos.col, pos.row, dc, dr))
                     }
                 } else {
-                    Some(value_step(&mut rng.0, world, &mem.value, pos.col, pos.row))
+                    Some(value_step(
+                        &mut rng.0,
+                        world,
+                        &mem.value,
+                        mem.explore,
+                        pos.col,
+                        pos.row,
+                    ))
                 }
             }
             // No claim yet: free-roam (and `claim_deposits` grabs any it crosses).
-            None => Some(value_step(&mut rng.0, world, &mem.value, pos.col, pos.row)),
+            None => Some(value_step(
+                &mut rng.0,
+                world,
+                &mem.value,
+                mem.explore,
+                pos.col,
+                pos.row,
+            )),
         };
 
         if let Some((c, r)) = next {
@@ -113,11 +125,13 @@ pub fn movement(
 
 /// ε-greedy step up the learned value gradient: usually move to the highest-value
 /// in-bounds neighbour (ties broken at random, so an all-zero field gives an
-/// unbiased walk), occasionally a random neighbour to keep exploring.
+/// unbiased walk), but with probability `explore` (the noot's own intrinsic
+/// explore/exploit ratio) take a random neighbour instead.
 fn value_step(
     rng: &mut crate::rng::Rng,
     world: &World,
     value: &[f32],
+    explore: f32,
     col: i32,
     row: i32,
 ) -> (i32, i32) {
@@ -128,7 +142,7 @@ fn value_step(
     if inb.is_empty() {
         return (col, row);
     }
-    if rng.chance(EPSILON) {
+    if rng.chance(explore) {
         return inb[rng.below(inb.len())];
     }
     let mut best_val = f32::MIN;

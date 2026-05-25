@@ -163,6 +163,12 @@ impl Hunger {
 }
 
 // --- Route learning (per-hex TD(λ) value estimates) -------------------------
+/// Range of intrinsic explore/exploit ratios (ε) drawn per noot at birth: the
+/// chance, each step, of a random move instead of climbing the learned value
+/// gradient. Low = exploiter (beelines to known-good spots), high = wanderer.
+pub const EXPLORE_MIN: f32 = 0.03;
+pub const EXPLORE_MAX: f32 = 0.30;
+
 /// TD learning rate.
 const TD_ALPHA: f32 = 0.1;
 /// Discount applied to the next tile's value.
@@ -190,18 +196,21 @@ pub struct RouteMemory {
     pub pending_reward: f32,
     /// For a noot with a claim: heading back to its deposit to extract a load.
     pub homing: bool,
+    /// Intrinsic explore/exploit ratio (ε): per-step chance of a random move.
+    pub explore: f32,
     /// Seconds until the next tile step.
     pub move_cooldown: f32,
 }
 
 impl RouteMemory {
-    pub fn new(n_tiles: usize, homing: bool) -> Self {
+    pub fn new(n_tiles: usize, homing: bool, explore: f32) -> Self {
         Self {
             value: vec![0.0; n_tiles],
             elig: vec![0.0; n_tiles],
             active: Vec::new(),
             pending_reward: 0.0,
             homing,
+            explore,
             move_cooldown: 0.0,
         }
     }

@@ -17,7 +17,8 @@ use economy::{EconStats, HungerControl};
 use goods::{GoodCategory, GoodForm};
 use movement::tile_to_pixel;
 use noot::{
-    Claim, Hunger, Inventory, Noot, NootMeta, RouteMemory, TilePos, Trader, Wallet, STARTING_BUCKS,
+    Claim, Hunger, Inventory, Noot, NootMeta, RouteMemory, TilePos, Trader, Wallet, EXPLORE_MAX,
+    EXPLORE_MIN, STARTING_BUCKS,
 };
 use rng::Rng;
 use world::{generate, ResourceRole, World};
@@ -507,7 +508,7 @@ fn spawn_noot(
             bucks: STARTING_BUCKS,
         },
         Hunger::fresh(rng),
-        RouteMemory::new(n_tiles, homing),
+        RouteMemory::new(n_tiles, homing, rng.range(EXPLORE_MIN, EXPLORE_MAX)),
     ));
 }
 
@@ -768,11 +769,12 @@ fn death_and_respawn(
         // A death: feed it back to the hunger-rate controller.
         ctrl.deaths_since_update += 1;
 
-        // Reincarnate a fresh, unclaimed noot at a random tile.
+        // Reincarnate a fresh, unclaimed noot at a random tile: its hoard dies with
+        // it (cleared, not refilled — a money sink), and it draws a new temperament.
         *inv = Inventory::new();
-        wallet.bucks = STARTING_BUCKS;
+        wallet.bucks = 0.0;
         *hunger = Hunger::fresh(&mut rng.0);
-        *mem = RouteMemory::new(n_tiles, false);
+        *mem = RouteMemory::new(n_tiles, false, rng.0.range(EXPLORE_MIN, EXPLORE_MAX));
         *trader = Trader::new();
         *meta = NootMeta::new();
         claim.deposit = None;
@@ -1210,7 +1212,7 @@ fn update_selection_ring(
 fn update_selection_panel(
     selection: Res<Selection>,
     sim: Res<Sim>,
-    noots: Query<(&Claim, &Trader, &Wallet, &Hunger, &Inventory)>,
+    noots: Query<(&Claim, &Trader, &Wallet, &Hunger, &Inventory, &RouteMemory)>,
     mut panel: Query<&mut Text, With<SelectionText>>,
 ) {
     let Ok(mut text) = panel.single_mut() else {
@@ -1221,7 +1223,7 @@ fn update_selection_panel(
         text.0 = stale.into();
         return;
     };
-    let Ok((claim, trader, wallet, hunger, inv)) = noots.get(entity) else {
+    let Ok((claim, trader, wallet, hunger, inv, mem)) = noots.get(entity) else {
         text.0 = stale.into();
         return;
     };
@@ -1237,9 +1239,10 @@ fn update_selection_panel(
 
     let utility = hunger.utility() + economy::positional_utility(&world.goods, inv);
     let mut out = format!(
-        "[selected] noot — {}   discount {:.2}   ₦{:.0}   hunger {:.1}   utility {:.2}\n",
+        "[selected] noot — {}   discount {:.2}   explore {:.2}   ₦{:.0}   hunger {:.1}   utility {:.2}\n",
         claim_label,
         trader.discount,
+        mem.explore,
         wallet.bucks,
         hunger.staple.iter().sum::<f32>() / hunger.staple.len() as f32,
         utility,
