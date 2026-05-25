@@ -17,7 +17,7 @@ use goods::{GoodCategory, GoodForm};
 use movement::tile_to_pixel;
 use noot::{Claim, Hunger, Inventory, Noot, RouteMemory, TilePos, Trader, Wallet, STARTING_BUCKS};
 use rng::Rng;
-use world::{generate, ResourceRole, Terrain, World};
+use world::{generate, terrain_factor, ResourceRole, Terrain, World};
 
 // --- World generation knobs -------------------------------------------------
 const COLS: i32 = 30;
@@ -90,6 +90,34 @@ struct SelectionText;
 #[derive(Component)]
 struct SelectionRing;
 
+/// Which inspection overlays are currently shown (toggled with V / T).
+#[derive(Resource, Default)]
+struct Overlays {
+    value: bool,
+    terrain: bool,
+}
+
+/// Per-hex heat cell for the aggregated noot value-field overlay (`tile` indexes
+/// `RouteMemory::value`, i.e. `row * cols + col`).
+#[derive(Component)]
+struct ValueOverlay {
+    tile: usize,
+}
+
+/// Per-hex tint cell for the terrain-difficulty overlay (static colour).
+#[derive(Component)]
+struct TerrainOverlay;
+
+/// Ring drawn around a deposit while it is claimed.
+#[derive(Component)]
+struct DepositOutline {
+    deposit: usize,
+}
+
+/// Noot body colours: green while unclaimed, amber once it owns a deposit.
+const NOOT_UNCLAIMED: Color = Color::srgb(0.40, 0.85, 0.45);
+const NOOT_OWNER: Color = Color::srgb(0.95, 0.78, 0.25);
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -107,6 +135,7 @@ fn main() {
         .init_resource::<EconStats>()
         .init_resource::<Selection>()
         .init_resource::<Paused>()
+        .init_resource::<Overlays>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -137,11 +166,15 @@ fn main() {
                     keyboard_mouse_camera,
                     follow_selected,
                     pause_controls,
+                    overlay_controls,
                 ),
                 (
                     update_hud,
                     update_selection_ring,
                     update_selection_panel,
+                    update_noot_color,
+                    update_value_overlay,
+                    update_deposit_outlines,
                     hide_loading_screen,
                 ),
             ),
@@ -217,12 +250,15 @@ fn setup(
 
     commands.spawn((Camera2d, Transform::from_scale(Vec3::splat(init_zoom))));
 
-    // Shared tile mesh + per-terrain materials.
+    // Shared tile mesh + per-terrain materials. Each tile also gets two hidden,
+    // toggleable overlay cells stacked above it (z 0.4 terrain, z 1.6 value) — the
+    // value heat sits just under the noot layer (z 2.0) so noots ride on top.
     let hex_mesh = meshes.add(RegularPolygon::new(hex_size * 0.96, 6));
     let easy_mat = materials.add(Color::srgb(0.16, 0.28, 0.20));
     let difficult_mat = materials.add(Color::srgb(0.34, 0.24, 0.17));
     for tile in &world.tiles {
         let (x, y) = hex::hex_center(tile.col, tile.row, hex_size);
+        let (px, py) = (x + offset.x, y + offset.y);
         let material = match tile.terrain {
             Terrain::Easy => easy_mat.clone(),
             Terrain::Difficult => difficult_mat.clone(),
@@ -230,20 +266,52 @@ fn setup(
         commands.spawn((
             Mesh2d(hex_mesh.clone()),
             MeshMaterial2d(material),
-            Transform::from_xyz(x + offset.x, y + offset.y, 0.0),
+            Transform::from_xyz(px, py, 0.0),
+        ));
+
+        // Terrain-difficulty overlay: green (easy) → red (hard) by movement cost.
+        // A sub-1.0 alpha makes `ColorMaterial` blend, so the map shows through.
+        let d = (1.0 - terrain_factor(tile.terrain)).clamp(0.0, 1.0);
+        let terr_color = Color::srgba((0.2 + 1.6 * d).min(1.0), (0.7 - 1.2 * d).max(0.0), 0.1, 0.4);
+        commands.spawn((
+            Mesh2d(hex_mesh.clone()),
+            MeshMaterial2d(materials.add(terr_color)),
+            Transform::from_xyz(px, py, 0.4),
+            Visibility::Hidden,
+            TerrainOverlay,
+        ));
+
+        // Value-field heat overlay: recoloured each tick by `update_value_overlay`.
+        // Born translucent (alpha < 1) so the material is created in blend mode.
+        let idx = (tile.row * world.cols + tile.col) as usize;
+        commands.spawn((
+            Mesh2d(hex_mesh.clone()),
+            MeshMaterial2d(materials.add(Color::srgba(1.0, 0.12, 0.04, 0.0))),
+            Transform::from_xyz(px, py, 1.6),
+            Visibility::Hidden,
+            ValueOverlay { tile: idx },
         ));
     }
 
-    // Deposit markers, coloured by their element.
+    // Deposit markers (coloured by element) with a hidden claim outline above them.
     let deposit_mesh = meshes.add(RegularPolygon::new(hex_size * 0.5, 6));
-    for deposit in &world.deposits {
+    let outline_mesh = meshes.add(Annulus::new(hex_size * 0.54, hex_size * 0.62));
+    for (di, deposit) in world.deposits.iter().enumerate() {
         let tile = &world.tiles[deposit.tile];
         let (x, y) = hex::hex_center(tile.col, tile.row, hex_size);
+        let (px, py) = (x + offset.x, y + offset.y);
         let (r, g, b) = elements::element(world.chosen[deposit.element_slot].id).color;
         commands.spawn((
             Mesh2d(deposit_mesh.clone()),
             MeshMaterial2d(materials.add(Color::srgb(r, g, b))),
-            Transform::from_xyz(x + offset.x, y + offset.y, 1.0),
+            Transform::from_xyz(px, py, 1.0),
+        ));
+        commands.spawn((
+            Mesh2d(outline_mesh.clone()),
+            MeshMaterial2d(materials.add(Color::srgb(0.97, 0.97, 0.92))),
+            Transform::from_xyz(px, py, 1.1),
+            Visibility::Hidden,
+            DepositOutline { deposit: di },
         ));
     }
 
@@ -264,8 +332,8 @@ fn setup(
     // otherwise emergent: a roamer claims the first unclaimed deposit it crosses.
     let mut sim_rng = Rng::new(world.seed ^ 0xA5A5_5A5A);
     let noot_mesh = meshes.add(Circle::new(hex_size * 0.28));
-    let noot_mat = materials.add(Color::srgb(0.40, 0.85, 0.45));
 
+    // Each noot owns a unique material so `update_noot_color` can tint it alone.
     for di in 0..world.deposits.len() {
         let tile = world.deposits[di].tile;
         let (col, row) = (world.tiles[tile].col, world.tiles[tile].row);
@@ -273,7 +341,7 @@ fn setup(
             &mut commands,
             &mut sim_rng,
             noot_mesh.clone(),
-            noot_mat.clone(),
+            materials.add(NOOT_OWNER),
             Some(di),
             col,
             row,
@@ -287,7 +355,7 @@ fn setup(
             &mut commands,
             &mut sim_rng,
             noot_mesh.clone(),
-            noot_mat.clone(),
+            materials.add(NOOT_UNCLAIMED),
             None,
             col,
             row,
@@ -589,13 +657,16 @@ fn keyboard_mouse_camera(
 }
 
 /// A tap (touch) or left-click that didn't pan selects the nearest noot under
-/// the pointer; an empty hit clears the selection.
+/// the pointer (or a tapped deposit's owner); an empty hit clears the selection.
+// A Bevy system pulling several resources/queries inherently has many params.
+#[allow(clippy::too_many_arguments)]
 fn pick_selection(
     mouse: Res<ButtonInput<MouseButton>>,
     touches: Res<Touches>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
-    noots: Query<(Entity, &Transform), With<Noot>>,
+    noots: Query<(Entity, &Transform, &Claim), With<Noot>>,
+    sim: Res<Sim>,
     view: Res<MapView>,
     mut selection: ResMut<Selection>,
 ) {
@@ -639,18 +710,150 @@ fn pick_selection(
     }
 
     let pick_r2 = (view.hex_size * 0.6).powi(2);
+    let dep_r2 = (view.hex_size * 0.5).powi(2);
     for screen in points {
         let Ok(world_pos) = camera.viewport_to_world_2d(cam_tf, screen) else {
             continue;
         };
+        // Prefer the nearest noot under the pointer.
         let mut best: Option<(Entity, f32)> = None;
-        for (e, tf) in &noots {
+        for (e, tf, _) in &noots {
             let d2 = tf.translation.truncate().distance_squared(world_pos);
             if d2 <= pick_r2 && best.is_none_or(|(_, bd)| d2 < bd) {
                 best = Some((e, d2));
             }
         }
-        selection.0 = best.map(|(e, _)| e);
+        if let Some((e, _)) = best {
+            selection.0 = Some(e);
+            continue;
+        }
+        // No noot hit: if a deposit was tapped, select (and follow) its owner.
+        let owner = sim.0.deposits.iter().enumerate().find_map(|(di, dep)| {
+            let t = &sim.0.tiles[dep.tile];
+            let c = tile_to_pixel(t.col, t.row, view.hex_size, view.offset);
+            (c.distance_squared(world_pos) <= dep_r2).then_some(di)
+        });
+        selection.0 = owner.and_then(|di| {
+            noots
+                .iter()
+                .find(|(_, _, claim)| claim.deposit == Some(di))
+                .map(|(e, _, _)| e)
+        });
+    }
+}
+
+/// V toggles the value-field heat overlay, T the terrain-difficulty overlay; both
+/// sets of hidden hex cells flip visibility together when a key is pressed.
+#[allow(clippy::type_complexity)]
+fn overlay_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut overlays: ResMut<Overlays>,
+    mut value_cells: Query<&mut Visibility, (With<ValueOverlay>, Without<TerrainOverlay>)>,
+    mut terrain_cells: Query<&mut Visibility, (With<TerrainOverlay>, Without<ValueOverlay>)>,
+) {
+    let mut changed = false;
+    if keys.just_pressed(KeyCode::KeyV) {
+        overlays.value = !overlays.value;
+        changed = true;
+    }
+    if keys.just_pressed(KeyCode::KeyT) {
+        overlays.terrain = !overlays.terrain;
+        changed = true;
+    }
+    if !changed {
+        return;
+    }
+    let to = |on: bool| {
+        if on {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        }
+    };
+    for mut v in &mut value_cells {
+        *v = to(overlays.value);
+    }
+    for mut v in &mut terrain_cells {
+        *v = to(overlays.terrain);
+    }
+}
+
+/// Tint each noot by ownership: amber once it holds a deposit claim, green while
+/// claimless. Only fires when a `Claim` actually changes (spawn, grab, release).
+fn update_noot_color(
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    noots: Query<(&Claim, &MeshMaterial2d<ColorMaterial>), Changed<Claim>>,
+) {
+    for (claim, mat) in &noots {
+        if let Some(m) = materials.get_mut(&mat.0) {
+            m.color = if claim.deposit.is_some() {
+                NOOT_OWNER
+            } else {
+                NOOT_UNCLAIMED
+            };
+        }
+    }
+}
+
+/// Recolour the value-heat cells from the summed per-hex value across all noots,
+/// normalized to the busiest hex (red = most valued). Throttled — the field drifts
+/// slowly and recolouring every cell each frame would be wasteful.
+fn update_value_overlay(
+    time: Res<Time>,
+    overlays: Res<Overlays>,
+    sim: Res<Sim>,
+    mut timer: Local<f32>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    mems: Query<&RouteMemory, With<Noot>>,
+    cells: Query<(&ValueOverlay, &MeshMaterial2d<ColorMaterial>)>,
+) {
+    if !overlays.value {
+        return;
+    }
+    *timer += time.delta_secs();
+    if *timer < 0.2 {
+        return;
+    }
+    *timer = 0.0;
+
+    let n = (sim.0.cols * sim.0.rows) as usize;
+    let mut agg = vec![0.0f32; n];
+    for mem in &mems {
+        for (t, a) in agg.iter_mut().enumerate() {
+            *a += mem.value[t].max(0.0);
+        }
+    }
+    let max = agg.iter().copied().fold(0.0f32, f32::max);
+    for (cell, mat) in &cells {
+        if let Some(m) = materials.get_mut(&mat.0) {
+            let v = if max > 0.0 {
+                (agg[cell.tile] / max).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            m.color = Color::srgba(1.0, 0.12, 0.04, v * 0.85);
+        }
+    }
+}
+
+/// Show a deposit's outline ring iff some noot currently claims it.
+fn update_deposit_outlines(
+    sim: Res<Sim>,
+    claims: Query<&Claim, With<Noot>>,
+    mut outlines: Query<(&DepositOutline, &mut Visibility)>,
+) {
+    let mut owned = vec![false; sim.0.deposits.len()];
+    for c in &claims {
+        if let Some(d) = c.deposit {
+            owned[d] = true;
+        }
+    }
+    for (o, mut vis) in &mut outlines {
+        *vis = if owned[o.deposit] {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
     }
 }
 
@@ -794,7 +997,7 @@ fn update_hud(
              starving {}/{} ({:.0}%)   production {:.1}/s   consumption {:.1}/s\n\
              trade margin ₦{:.1}/s   utility {:.1}/s\n\
              deaths {:.2}/min → target {:.2}   hunger rate {:.2}\n\
-             drag to pan · pinch to zoom · tap a noot to follow it\n\n",
+             drag to pan · pinch to zoom · tap a noot (or deposit) to follow · V/T overlays\n\n",
             world.seed, count, stats.trades_total, total_bucks, claimed, n_deposits, avg_appetite,
             avg_discount, starving, count, starving_pct, stats.production_rate,
             stats.consumption_rate, stats.merchant_profit_rate, stats.utility_rate,
