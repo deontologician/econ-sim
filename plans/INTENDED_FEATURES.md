@@ -16,14 +16,15 @@ design. Newest first within each section.
 ## Persistence
 
 ### Save / load / migrations
-- **NOW**: the world **seed** is saved to `localStorage` behind a versioned,
-  migratable envelope (`save.rs`); reloads replay the same map (so you can tweak
-  rules and compare), and the "New" button / G clears it for a fresh world. Only the
-  seed is persisted — the simulation restarts on the fixed map. *(partial)*
-- **INTENDED**: snapshot live state too (noot positions/inventories/wallets/learned
-  value fields/claims, deposit stocks, controller state, stats) so a reload *resumes*
-  rather than restarts; explicit save slots; export/import. Each schema bump adds a
-  `migrate` arm so old saves upgrade in place.
+- **NOW**: the **full ECS state** is serialized to `localStorage` (serde → RON,
+  `save.rs`): the world (tiles/deposits/stocks/chosen/goods), the hunger & income
+  controllers, `EconStats`, and every noot (position, inventory, wallet, hunger,
+  claim, trader, meta, and its learned value field). **S**/Save snapshots; boot
+  resumes it; **G**/New clears it for a fresh world. Versioned: a parse failure or
+  version mismatch falls back to a fresh start; additive fields use `#[serde(default)]`,
+  breaking changes bump `SAVE_VERSION`. *(partial)*
+- **INTENDED**: autosave + multiple named slots; export/import; explicit per-version
+  `migrate` arms (vs. discard) so old saves upgrade in place rather than resetting.
 - **STATUS**: partial
 
 ## Economy

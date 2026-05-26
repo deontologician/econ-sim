@@ -1,20 +1,46 @@
-//! Tiny versioned save to the browser's `localStorage`, so a world persists across
-//! reloads — letting you tweak the rules and replay the same map. The blob is a flat
-//! `key=value;` string behind a version number, with a migration step so older saves
-//! still load after the schema changes.
+//! Full game-state persistence to the browser's `localStorage`, so you can save a
+//! run, tweak the rules, reload, and **resume** it (not just replay the seed).
 //!
-//! Today the save is just the world seed: the map (terrain, deposits, chosen
-//! elements) regenerates deterministically from it, and the simulation restarts on
-//! that fixed map. Richer snapshots (live noot/economy state) can be added later as
-//! new fields here plus a migration arm.
+//! State is serialized to RON via serde. Migrations: bump [`SAVE_VERSION`] and add a
+//! handler when the schema breaks; for *additive* changes mark new fields
+//! `#[serde(default)]` so older saves still load. A parse failure or version
+//! mismatch is treated as "no save" (fresh start), so a stale/corrupt blob never
+//! wedges boot.
 
-/// Bump when the saved schema changes; add a `migrate` arm for the old version.
-pub const SAVE_VERSION: u32 = 1;
+use serde::{Deserialize, Serialize};
 
-/// The persisted game state.
-#[derive(Clone, Copy)]
-pub struct Save {
-    pub seed: u64,
+use crate::economy::{EconStats, HungerControl, IncomeControl};
+use crate::noot::{Claim, Hunger, Inventory, NootMeta, TilePos, Trader, Wallet};
+use crate::world::World;
+
+/// Bump on any breaking schema change (then migrate or discard older versions).
+pub const SAVE_VERSION: u32 = 2;
+
+/// The persisted parts of one noot. `RouteMemory`'s eligibility trace is transient,
+/// so only its learned `value` field (plus `explore`/`homing`) is kept.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct NootSave {
+    pub pos: TilePos,
+    pub inv: Inventory,
+    pub wallet: Wallet,
+    pub hunger: Hunger,
+    pub claim: Claim,
+    pub trader: Trader,
+    pub meta: NootMeta,
+    pub explore: f32,
+    pub homing: bool,
+    pub value: Vec<f32>,
+}
+
+/// A complete simulation snapshot: the world, the controllers/stats, and every noot.
+#[derive(Serialize, Deserialize)]
+pub struct Snapshot {
+    pub version: u32,
+    pub world: World,
+    pub hunger: HungerControl,
+    pub income: IncomeControl,
+    pub stats: EconStats,
+    pub noots: Vec<NootSave>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -25,17 +51,18 @@ fn storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok().flatten()
 }
 
-/// Load and migrate the saved game, if any.
+/// Load and validate the saved snapshot, if any.
 #[cfg(target_arch = "wasm32")]
-pub fn load() -> Option<Save> {
+pub fn load() -> Option<Snapshot> {
     let raw = storage()?.get_item(SAVE_KEY).ok().flatten()?;
-    parse_and_migrate(&raw)
+    let snap: Snapshot = ron::from_str(&raw).ok()?;
+    (snap.version == SAVE_VERSION).then_some(snap)
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn store(save: &Save) {
-    if let Some(s) = storage() {
-        let _ = s.set_item(SAVE_KEY, &format!("v={};seed={}", SAVE_VERSION, save.seed));
+pub fn store(snap: &Snapshot) {
+    if let (Some(s), Ok(text)) = (storage(), ron::to_string(snap)) {
+        let _ = s.set_item(SAVE_KEY, &text);
     }
 }
 
@@ -54,44 +81,13 @@ pub fn reload_page() {
     }
 }
 
-/// Parse a `key=value;` blob, then migrate it up to `SAVE_VERSION`.
-#[cfg(target_arch = "wasm32")]
-fn parse_and_migrate(raw: &str) -> Option<Save> {
-    let mut version = 0u32;
-    let mut seed: Option<u64> = None;
-    for kv in raw.split(';') {
-        if kv.is_empty() {
-            continue;
-        }
-        let (k, v) = kv.split_once('=')?;
-        match k.trim() {
-            "v" => version = v.trim().parse().ok()?,
-            "seed" => seed = v.trim().parse().ok(),
-            _ => {} // ignore unknown keys so newer fields don't break older builds
-        }
-    }
-    migrate(version, seed)
-}
-
-/// Upgrade a parsed save to the current schema. Unknown/newer versions are
-/// discarded (treated as "no save") so a stale or corrupt blob never wedges boot.
-#[cfg(target_arch = "wasm32")]
-fn migrate(version: u32, seed: Option<u64>) -> Option<Save> {
-    match version {
-        // v1: { seed }. When the schema grows, add arms here that fill the new
-        // fields with sensible defaults when loading a save from an older version.
-        1 => Some(Save { seed: seed? }),
-        _ => None,
-    }
-}
-
 // --- Native stubs (the app ships as wasm; keep it compiling on native too) ---
 #[cfg(not(target_arch = "wasm32"))]
-pub fn load() -> Option<Save> {
+pub fn load() -> Option<Snapshot> {
     None
 }
 #[cfg(not(target_arch = "wasm32"))]
-pub fn store(_save: &Save) {}
+pub fn store(_snap: &Snapshot) {}
 #[cfg(not(target_arch = "wasm32"))]
 pub fn clear() {}
 #[cfg(not(target_arch = "wasm32"))]

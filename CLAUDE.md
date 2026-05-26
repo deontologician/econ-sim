@@ -38,9 +38,12 @@ cargo clippy --target wasm32-unknown-unknown
   extras, never the only way to reach a feature. The camera fits the map to the
   screen on launch; gameplay input stays limited to pan / pinch-zoom / pause / tap.
   Design and reason about touch ergonomics before desktop.
-- **No external crates beyond Bevy** (plus `web-sys`/`js-sys` on wasm). The PRNG is
-  hand-rolled (`rng.rs`, SplitMix64) to keep the bundle small and worldgen
-  reproducible from a single seed. Don't reach for `rand` etc.
+- **No external crates beyond Bevy** (plus `web-sys`/`js-sys` on wasm, and
+  `serde`+`ron` for the save system — both already in Bevy's tree, so no real bundle
+  cost). The PRNG is hand-rolled (`rng.rs`, SplitMix64) to keep the bundle small and
+  worldgen reproducible from a single seed. Don't reach for `rand` etc. The rule's
+  intent is bundle size / dependency hygiene: a crate already compiled by Bevy is
+  fair game; a genuinely new one needs a reason.
 - **Comments explain *why*, not *what*** — hidden constraints, invariants,
   short-circuit-order assumptions. Skip narration of obvious code. No emojis.
 - Currency is rendered with `₦`. The UI text uses an **embedded** font

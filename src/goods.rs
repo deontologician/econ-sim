@@ -13,23 +13,24 @@
 //! refiner must convert before anyone can consume it.
 
 use crate::rng::Rng;
+use serde::{Deserialize, Serialize};
 
 pub const N_ITEMS: usize = 8;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum GoodForm {
     Raw = 0,
     Refined = 1,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum GoodCategory {
     Staple,
     Positional,
 }
 
 /// What an item slot means to a noot.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum ItemRole {
     /// Directly edible staple; carries its hunger sub-index (0..2).
     Staple(usize),
@@ -53,7 +54,7 @@ pub fn form_of(item: usize) -> GoodForm {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct ConsumableGood {
     pub slot: usize,
     pub form: GoodForm,
@@ -62,6 +63,7 @@ pub struct ConsumableGood {
     pub sub: usize,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WorldGoods {
     pub goods: [ConsumableGood; 4],
     pub item_roles: [ItemRole; N_ITEMS],

@@ -5,6 +5,10 @@ edition = "2021"
 
 [dependencies]
 bevy = "0.18"
+# Save/load only. Both are already in Bevy's dependency tree (it uses them for
+# scenes/reflection), so this adds no real bundle or compile cost — see CLAUDE.md.
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
 
 # Web-only: hide the loading screen once Bevy boots, and draw an entropy seed.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

@@ -13,6 +13,7 @@ use bevy::prelude::*;
 use crate::goods::{self, form_of, GoodForm, ItemRole, N_ITEMS};
 use crate::noot::*;
 use crate::Sim;
+use serde::{Deserialize, Serialize};
 
 // Production rates.
 pub const WORK_RATE: f32 = 3.0;
@@ -87,7 +88,7 @@ const ARBITRAGE_RESERVE: f32 = 30.0;
 /// How long each production/consumption rate sample covers (seconds).
 const RATE_WINDOW: f32 = 0.5;
 
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Clone, Serialize, Deserialize)]
 pub struct EconStats {
     pub trades_total: u64,
     /// Exponentially weighted moving average of actual sale prices, per item.
@@ -153,7 +154,7 @@ const INCOME_RATE_MAX: f32 = 3.0;
 /// Trims the universal income so total trade value grows at roughly
 /// `TARGET_INFLATION_PER_MIN`. Inflation is measured as this minute's summed sale
 /// value vs. the previous minute's. `meet_and_trade` accumulates `this_window`.
-#[derive(Resource)]
+#[derive(Resource, Clone, Serialize, Deserialize)]
 pub struct IncomeControl {
     /// Current universal income (bucks/sec/noot) — what `income` pays out.
     pub rate: f32,
@@ -219,7 +220,7 @@ const HUNGER_RATE_MAX: f32 = 3.0;
 /// PID controller that trims the global hunger rate so the realized death rate
 /// tracks `target_per_min`. Deaths feed back via `deaths_since_update`, bumped by
 /// `death_and_respawn`.
-#[derive(Resource)]
+#[derive(Resource, Clone, Serialize, Deserialize)]
 pub struct HungerControl {
     /// Current hunger rate (appetite/sec/staple) — what `hunger_tick` applies.
     pub rate: f32,

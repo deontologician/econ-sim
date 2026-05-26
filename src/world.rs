@@ -14,8 +14,9 @@ use crate::elements::{element_count, ElementId};
 use crate::goods::{self, WorldGoods};
 use crate::hex::neighbors;
 use crate::rng::Rng;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum ResourceRole {
     Replenishable,
     Finite,
@@ -31,6 +32,7 @@ pub fn terrain_factor(difficulty: f32) -> f32 {
     1.0 - DIFFICULTY_SLOWDOWN * difficulty.clamp(0.0, 1.0)
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ChosenElement {
     pub id: ElementId,
     pub role: ResourceRole,
@@ -40,6 +42,7 @@ pub struct ChosenElement {
     pub extracted_total: f64,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Tile {
     pub col: i32,
     pub row: i32,
@@ -48,6 +51,7 @@ pub struct Tile {
     pub deposit: Option<usize>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub enum DepositKind {
     /// Standing `stock` regrows toward `capacity` at `rate` (× efficiency × terrain).
     Replenishable {
@@ -59,6 +63,7 @@ pub enum DepositKind {
     Finite { remaining: f64, initial: f64 },
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Deposit {
     /// Index into `World::chosen` (0..4).
     pub element_slot: usize,
@@ -77,6 +82,7 @@ impl Deposit {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct World {
     pub seed: u64,
     pub cols: i32,

@@ -2,6 +2,7 @@
 //! wants, and remembers. Behaviour lives in `movement.rs` and `economy.rs`.
 
 use bevy::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::goods::N_ITEMS;
 use crate::rng::Rng;
@@ -41,7 +42,7 @@ pub struct Noot;
 /// lived (reset on respawn); `transactions` counts trades made (buys + sells);
 /// `experience` is accumulated productive work (mining + refining), driving a
 /// slow learning-by-doing speed bonus. All reset on rebirth.
-#[derive(Component)]
+#[derive(Component, Clone, Serialize, Deserialize)]
 pub struct NootMeta {
     pub age: f32,
     pub transactions: u32,
@@ -60,7 +61,7 @@ impl NootMeta {
 
 /// Which deposit a noot has claimed and may mine, if any. Claims are sticky: a
 /// noot keeps its first claim and ignores other unowned deposits it passes.
-#[derive(Component)]
+#[derive(Component, Clone, Serialize, Deserialize)]
 pub struct Claim {
     pub deposit: Option<usize>,
 }
@@ -75,7 +76,7 @@ impl Claim {
 /// surplus on its own account at `discount × market ask`, carries it, and resells
 /// for the spread. `discount` is learned (see `DISCOUNT_LR`); `cost_basis` is the
 /// running average price paid per held item, so realized margin = price − basis.
-#[derive(Component)]
+#[derive(Component, Clone, Serialize, Deserialize)]
 pub struct Trader {
     pub discount: f32,
     pub cost_basis: [f32; N_ITEMS],
@@ -90,13 +91,13 @@ impl Trader {
     }
 }
 
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone, Copy, Serialize, Deserialize)]
 pub struct TilePos {
     pub col: i32,
     pub row: i32,
 }
 
-#[derive(Component)]
+#[derive(Component, Clone, Serialize, Deserialize)]
 pub struct Inventory {
     pub items: [f32; N_ITEMS],
 }
@@ -109,13 +110,13 @@ impl Inventory {
     }
 }
 
-#[derive(Component)]
+#[derive(Component, Clone, Serialize, Deserialize)]
 pub struct Wallet {
     pub bucks: f32,
 }
 
 /// Per-staple appetite: 0 = full, up to `STAPLE_SATIATION` = starving.
-#[derive(Component)]
+#[derive(Component, Clone, Serialize, Deserialize)]
 pub struct Hunger {
     pub staple: [f32; N_STAPLES],
     /// Seconds spent fully starving (all staples maxed); drives death.
@@ -211,6 +212,21 @@ impl RouteMemory {
         Self {
             value: vec![0.0; n_tiles],
             elig: vec![0.0; n_tiles],
+            active: Vec::new(),
+            pending_reward: 0.0,
+            homing,
+            explore,
+            move_cooldown: 0.0,
+        }
+    }
+
+    /// Rebuild from a saved value field (the eligibility trace is transient, so it
+    /// starts empty). `value.len()` is the tile count.
+    pub fn restored(value: Vec<f32>, homing: bool, explore: f32) -> Self {
+        let elig = vec![0.0; value.len()];
+        Self {
+            value,
+            elig,
             active: Vec::new(),
             pending_reward: 0.0,
             homing,

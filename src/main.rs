@@ -56,7 +56,8 @@ const BTN_GAP: f32 = 8.0;
 const VALUE_BTN_TOP: f32 = PAUSE_BTN_MARGIN + PAUSE_BTN_H + BTN_GAP;
 const TERRAIN_BTN_TOP: f32 = VALUE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const NOOT_BTN_TOP: f32 = TERRAIN_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
-const NEW_BTN_TOP: f32 = NOOT_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
+const SAVE_BTN_TOP: f32 = NOOT_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
+const NEW_BTN_TOP: f32 = SAVE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 /// Bottom edge of the whole button column (taps above this are UI, not the map).
 const BTN_COLUMN_BOTTOM: f32 = NEW_BTN_TOP + PAUSE_BTN_H;
 
@@ -114,6 +115,9 @@ struct NootColorButton;
 /// Clears the save and rerolls a fresh world (touch equivalent of the G key).
 #[derive(Component)]
 struct NewWorldButton;
+/// Snapshots the full game state to localStorage (touch equivalent of the S key).
+#[derive(Component)]
+struct SaveButton;
 /// Caption on the noot-colouring button, kept in sync with the active mode.
 #[derive(Component)]
 struct NootColorLabel;
@@ -253,6 +257,7 @@ fn main() {
                     follow_selected,
                     pause_controls,
                     overlay_controls,
+                    save_game,
                     new_world_controls,
                     fit_camera_to_screen,
                 ),
@@ -314,11 +319,25 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut fonts: ResMut<Assets<Font>>,
 ) {
-    // Reuse the saved world seed across reloads (so rule tweaks replay the same
-    // map); otherwise roll a fresh one and persist it. The "New" button clears it.
-    let seed = save::load().map_or_else(random_seed, |s| s.seed);
-    save::store(&save::Save { seed });
-    let world = generate(seed, COLS, ROWS, HEX_SIZE);
+    // Resume a saved run (full state) if one exists; otherwise roll a fresh world.
+    // The saved controllers/stats override the defaults here; on a fresh start the
+    // hunger PID gets a population-based target (and Income/EconStats keep defaults).
+    let (world, restore_noots) = match save::load() {
+        Some(snap) => {
+            commands.insert_resource(snap.hunger);
+            commands.insert_resource(snap.income);
+            commands.insert_resource(snap.stats);
+            (snap.world, Some(snap.noots))
+        }
+        None => {
+            let world = generate(random_seed(), COLS, ROWS, HEX_SIZE);
+            let n_noots = (world.deposits.len() + N_ROAMERS) as f32;
+            commands.insert_resource(HungerControl::new(
+                economy::TARGET_DEATH_FRAC_PER_MIN * n_noots,
+            ));
+            (world, None)
+        }
+    };
     let hex_size = world.hex_size;
     let n_tiles = (world.cols * world.rows) as usize;
 
@@ -332,12 +351,6 @@ fn setup(
     // One thematic icon texture per chosen element (used on the map and in the HUD).
     let icons: [Handle<Image>; 4] =
         std::array::from_fn(|slot| images.add(icon::render_icon(world.chosen[slot].id.0)));
-
-    // Every noot is mortal now; the PID targets a death rate over the whole roster.
-    let n_noots = (world.deposits.len() + N_ROAMERS) as f32;
-    commands.insert_resource(HungerControl::new(
-        economy::TARGET_DEATH_FRAC_PER_MIN * n_noots,
-    ));
 
     // Centre the map on the origin. `fit_camera_to_screen` does the real framing
     // once the window size is known; this is just a sane portrait fallback for the
@@ -442,47 +455,93 @@ fn setup(
         SelectionRing,
     ));
 
-    // Spawn the noots — one seeded onto each deposit (pre-claimed, so mining can
-    // start immediately), the rest free-roaming and unclaimed. Ownership is
-    // otherwise emergent: a roamer claims the first unclaimed deposit it crosses.
+    // Each noot owns a unique material so `update_noot_color` can tint it alone.
     let mut sim_rng = Rng::new(world.seed ^ 0xA5A5_5A5A);
     let noot_mesh = meshes.add(Circle::new(hex_size * 0.28));
-
-    // Each noot owns a unique material so `update_noot_color` can tint it alone.
-    for di in 0..world.deposits.len() {
-        let tile = world.deposits[di].tile;
-        let (col, row) = (world.tiles[tile].col, world.tiles[tile].row);
-        spawn_noot(
-            &mut commands,
-            &mut sim_rng,
-            noot_mesh.clone(),
-            materials.add(NOOT_OWNER),
-            Some(di),
-            col,
-            row,
-            n_tiles,
-            tile_to_pixel(col, row, hex_size, offset),
-        );
-    }
-    for _ in 0..N_ROAMERS {
-        let (col, row) = random_tile(&mut sim_rng, &world);
-        spawn_noot(
-            &mut commands,
-            &mut sim_rng,
-            noot_mesh.clone(),
-            materials.add(NOOT_UNCLAIMED),
-            None,
-            col,
-            row,
-            n_tiles,
-            tile_to_pixel(col, row, hex_size, offset),
-        );
+    match restore_noots {
+        // Resume: respawn every saved noot with its components and learned field.
+        Some(noots) => {
+            for ns in noots {
+                let (col, row) = (ns.pos.col, ns.pos.row);
+                let color = if ns.claim.deposit.is_some() {
+                    NOOT_OWNER
+                } else {
+                    NOOT_UNCLAIMED
+                };
+                spawn_restored_noot(
+                    &mut commands,
+                    noot_mesh.clone(),
+                    materials.add(color),
+                    ns,
+                    tile_to_pixel(col, row, hex_size, offset),
+                );
+            }
+        }
+        // Fresh: one noot seeded (pre-claimed) onto each deposit so mining starts,
+        // the rest free-roaming and unclaimed (ownership is otherwise emergent).
+        None => {
+            for di in 0..world.deposits.len() {
+                let tile = world.deposits[di].tile;
+                let (col, row) = (world.tiles[tile].col, world.tiles[tile].row);
+                spawn_noot(
+                    &mut commands,
+                    &mut sim_rng,
+                    noot_mesh.clone(),
+                    materials.add(NOOT_OWNER),
+                    Some(di),
+                    col,
+                    row,
+                    n_tiles,
+                    tile_to_pixel(col, row, hex_size, offset),
+                );
+            }
+            for _ in 0..N_ROAMERS {
+                let (col, row) = random_tile(&mut sim_rng, &world);
+                spawn_noot(
+                    &mut commands,
+                    &mut sim_rng,
+                    noot_mesh.clone(),
+                    materials.add(NOOT_UNCLAIMED),
+                    None,
+                    col,
+                    row,
+                    n_tiles,
+                    tile_to_pixel(col, row, hex_size, offset),
+                );
+            }
+        }
     }
 
     spawn_ui(&mut commands, &icons, &ui_font);
 
     commands.insert_resource(SimRng(sim_rng));
     commands.insert_resource(Sim(world));
+}
+
+/// Respawn a noot from a save: its saved components plus a `RouteMemory` rebuilt
+/// from the persisted value field.
+fn spawn_restored_noot(
+    commands: &mut Commands,
+    mesh: Handle<Mesh>,
+    material: Handle<ColorMaterial>,
+    ns: save::NootSave,
+    pixel: Vec2,
+) {
+    let mem = RouteMemory::restored(ns.value, ns.homing, ns.explore);
+    commands.spawn((
+        Mesh2d(mesh),
+        MeshMaterial2d(material),
+        Transform::from_xyz(pixel.x, pixel.y, 2.0),
+        Noot,
+        ns.claim,
+        ns.trader,
+        ns.meta,
+        ns.pos,
+        ns.inv,
+        ns.wallet,
+        ns.hunger,
+        mem,
+    ));
 }
 
 fn random_tile(rng: &mut Rng, world: &World) -> (i32, i32) {
@@ -647,6 +706,7 @@ fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4], font: &Handle<F
     // Overlay toggles, stacked under the pause button (same touch-target size).
     spawn_overlay_button(commands, font, "Value", VALUE_BTN_TOP, ValueButton);
     spawn_overlay_button(commands, font, "Terrain", TERRAIN_BTN_TOP, TerrainButton);
+    spawn_overlay_button(commands, font, "Save", SAVE_BTN_TOP, SaveButton);
     spawn_overlay_button(commands, font, "New", NEW_BTN_TOP, NewWorldButton);
 
     // Noot-colouring cycle button (caption shows the active mode).
@@ -997,8 +1057,57 @@ fn pick_selection(
     }
 }
 
-/// G key or the "New" button: clear the saved seed and reload, starting a fresh
-/// world. (Reloading re-runs setup, which rolls and persists a new seed.)
+/// S key or the "Save" button: snapshot the full game state (world, controllers,
+/// stats, and every noot) to localStorage so a later reload can resume it.
+#[allow(clippy::type_complexity)]
+fn save_game(
+    keys: Res<ButtonInput<KeyCode>>,
+    button: Query<&Interaction, (Changed<Interaction>, With<SaveButton>)>,
+    sim: Res<Sim>,
+    hunger: Res<HungerControl>,
+    income: Res<economy::IncomeControl>,
+    stats: Res<EconStats>,
+    noots: Query<(
+        &TilePos,
+        &Inventory,
+        &Wallet,
+        &Hunger,
+        &Claim,
+        &Trader,
+        &NootMeta,
+        &RouteMemory,
+    )>,
+) {
+    if !(keys.just_pressed(KeyCode::KeyS) || button.iter().any(|i| *i == Interaction::Pressed)) {
+        return;
+    }
+    let noot_saves = noots
+        .iter()
+        .map(|(pos, inv, wal, hun, claim, trader, meta, mem)| save::NootSave {
+            pos: *pos,
+            inv: inv.clone(),
+            wallet: wal.clone(),
+            hunger: hun.clone(),
+            claim: claim.clone(),
+            trader: trader.clone(),
+            meta: meta.clone(),
+            explore: mem.explore,
+            homing: mem.homing,
+            value: mem.value.clone(),
+        })
+        .collect();
+    save::store(&save::Snapshot {
+        version: save::SAVE_VERSION,
+        world: sim.0.clone(),
+        hunger: hunger.clone(),
+        income: income.clone(),
+        stats: stats.clone(),
+        noots: noot_saves,
+    });
+}
+
+/// G key or the "New" button: clear the saved snapshot and reload, starting a fresh
+/// world. (Reloading re-runs setup, which rolls a new random world.)
 fn new_world_controls(
     keys: Res<ButtonInput<KeyCode>>,
     button: Query<&Interaction, (Changed<Interaction>, With<NewWorldButton>)>,
@@ -1348,7 +1457,7 @@ fn update_hud(
              trade margin ₦{:.1}/s   utility {:.1}/s\n\
              deaths {:.2}/min → target {:.2}   hunger rate {:.2}\n\
              income ₦{:.2}/s   sales infl {:+.2}%/min → target {:.1}%\n\
-             drag to pan · pinch to zoom · tap a noot/deposit · V/T/N overlays · G new\n\n",
+             drag to pan · pinch to zoom · tap a noot/deposit · V/T/N overlays · S save · G new\n\n",
             world.seed, count, stats.trades_total, total_bucks, claimed, n_deposits, avg_appetite,
             avg_discount, starving, count, starving_pct, stats.production_rate,
             stats.consumption_rate, stats.merchant_profit_rate, stats.utility_rate,

@@ -2,7 +2,9 @@
 //! to be the building blocks of that world. Colours are sRGB and used as each
 //! element's theme colour for its procedural icon (`icon.rs`).
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct ElementId(pub usize);
 
 pub struct ElementDef {

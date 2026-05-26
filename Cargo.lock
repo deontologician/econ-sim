@@ -2255,6 +2255,8 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "js-sys",
+ "ron",
+ "serde",
  "web-sys",
 ]
 
