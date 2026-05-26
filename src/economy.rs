@@ -124,16 +124,24 @@ pub struct EconStats {
     pub merchant_profit_total: f64,
     /// Cumulative welfare (utility) realized through consumption.
     pub utility_total: f64,
+    /// Cumulative bucks of trade value cleared — the economy's nominal output (GDP).
+    #[serde(default)]
+    pub gdp_total: f64,
     /// Most recent windowed rates, **per tick**.
     pub production_rate: f32,
     pub consumption_rate: f32,
     pub merchant_profit_rate: f32,
     pub utility_rate: f32,
+    /// Trade value cleared per tick (nominal GDP rate).
+    #[serde(default)]
+    pub gdp_rate: f32,
     // Accumulators for the in-progress rate window.
     produced_window: f32,
     consumed_window: f32,
     merchant_profit_window: f32,
     utility_window: f32,
+    #[serde(default)]
+    gdp_window: f32,
     window_ticks: u32,
 }
 
@@ -147,10 +155,12 @@ pub fn update_rates(mut stats: ResMut<EconStats>) {
         stats.consumption_rate = stats.consumed_window * inv;
         stats.merchant_profit_rate = stats.merchant_profit_window * inv;
         stats.utility_rate = stats.utility_window * inv;
+        stats.gdp_rate = stats.gdp_window * inv;
         stats.produced_window = 0.0;
         stats.consumed_window = 0.0;
         stats.merchant_profit_window = 0.0;
         stats.utility_window = 0.0;
+        stats.gdp_window = 0.0;
         stats.window_ticks = 0;
     }
 }
@@ -954,6 +964,8 @@ pub fn meet_and_trade(
                 snaps[si].bucks += price;
                 snaps[si].inv[item] -= 1.0;
                 stats.trades_total += 1;
+                stats.gdp_window += price;
+                stats.gdp_total += price as f64;
                 income.this_window += price as f64;
                 // EWMA of realized sale prices (lazy-init to the first sample).
                 stats.ewma_price[item] = if stats.ewma_price[item] <= 0.0 {

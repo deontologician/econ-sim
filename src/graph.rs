@@ -14,7 +14,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 /// The time series tracked, in sample order. Index into a `[f32; N_SERIES]` sample and
 /// into `SERIES` (label, plot colour, unit). "Plus average age" lives at index 13.
-pub const N_SERIES: usize = 15;
+pub const N_SERIES: usize = 16;
 
 /// How a series' latest value is rendered as text.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,7 @@ pub const SERIES: [(&str, [u8; 3], Unit); N_SERIES] = [
     ("infl", [200, 200, 120], Unit::Percent),
     ("avg age", [130, 170, 240], Unit::Level),
     ("clump", [200, 150, 220], Unit::Level),
+    ("gdp", [240, 230, 150], Unit::Rate),
 ];
 
 /// A magnitude with adaptive precision (more decimals for small numbers).

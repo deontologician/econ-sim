@@ -1179,6 +1179,7 @@ fn sample_stats(
     s[12] = income.measured_inflation * 100.0;
     s[13] = age / nf;
     s[14] = nn;
+    s[15] = stats.gdp_rate;
 
     hist.samples.push_back(s);
     while hist.samples.len() > HISTORY_CAP {

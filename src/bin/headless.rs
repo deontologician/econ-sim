@@ -165,6 +165,8 @@ fn emit_record(w: &mut World) {
         "consumption_rate": stats.consumption_rate,
         "merchant_profit_rate": stats.merchant_profit_rate,
         "utility_rate": stats.utility_rate,
+        "gdp_rate": stats.gdp_rate,
+        "gdp_total": stats.gdp_total,
         "produced_total": stats.produced_total,
         "consumed_total": stats.consumed_total,
         "merchant_profit_total": stats.merchant_profit_total,
