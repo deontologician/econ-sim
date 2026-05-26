@@ -8,14 +8,14 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
 use econ_sim::economy::{self, EconStats, HungerControl};
-use econ_sim::goods::{self, GoodCategory, GoodForm};
+use econ_sim::goods::{self, GoodForm};
 use econ_sim::movement::{self, tile_to_pixel};
 use econ_sim::noot::{
     Action, Claim, Hunger, Inventory, Noot, NootMeta, TilePos, Trader, Wallet, EXPLORE_MAX,
     EXPLORE_MIN, STARTING_BUCKS,
 };
 use econ_sim::policy::{ActorCritic, PolicyMemory, Trainer};
-use econ_sim::world::{generate, ResourceRole, World};
+use econ_sim::world::{generate, World};
 use econ_sim::{elements, graph, hex, icon, rng::Rng, save, MapView, Sim, SimRng};
 
 // --- World generation knobs -------------------------------------------------
@@ -69,8 +69,8 @@ const BTN_COLUMN_BOTTOM: f32 = GRAPHS_BTN_TOP + PAUSE_BTN_H;
 /// Size of the big correlation (overlay) chart texture, and of each per-stat sparkline.
 const OVERLAY_W: u32 = 380;
 const OVERLAY_H: u32 = 170;
-const SPARK_W: u32 = 150;
-const SPARK_H: u32 = 42;
+const SPARK_W: u32 = 104;
+const SPARK_H: u32 = 34;
 /// Rolling history length (samples) and how often (real seconds) a sample is taken.
 const HISTORY_CAP: usize = 480;
 const GRAPH_SAMPLE_SECS: f32 = 0.25;
@@ -224,15 +224,6 @@ impl NootColorMode {
 #[derive(Resource, Default)]
 struct NootColoring(NootColorMode);
 
-#[derive(Component)]
-struct HudText;
-
-/// One per-resource HUD row's text (paired with its element icon); `slot` is 0..4.
-#[derive(Component)]
-struct ResourceLine {
-    slot: usize,
-}
-
 /// Text of the bottom panel describing the selected noot.
 #[derive(Component)]
 struct SelectionText;
@@ -241,12 +232,26 @@ struct SelectionText;
 #[derive(Component)]
 struct SelectionRing;
 
-/// Which inspection overlays are currently shown (toggled with V / T / C).
-#[derive(Resource, Default)]
+/// Which inspection overlays are currently shown. `value` (crowd) and `terrain` are map
+/// heatmaps; `strip` is the always-on top sparkline strip (shown by default, collapsible);
+/// `graphs` is the on-demand correlation chart behind the Graphs button.
+#[derive(Resource)]
 struct Overlays {
     value: bool,
     terrain: bool,
+    strip: bool,
     graphs: bool,
+}
+
+impl Default for Overlays {
+    fn default() -> Self {
+        Self {
+            value: false,
+            terrain: false,
+            strip: true,
+            graphs: false,
+        }
+    }
 }
 
 /// Rolling history of every graphed stat, oldest → newest, capped at `HISTORY_CAP`.
@@ -276,12 +281,20 @@ struct GraphAssets {
     sparks: Vec<Handle<Image>>,
 }
 
-/// Root of the graphs panel (shown/hidden by the Graphs toggle).
+/// Root of the correlation-chart panel (shown/hidden by the Graphs toggle).
 #[derive(Component)]
 struct GraphsPanel;
-/// The on-screen Graphs toggle button.
+/// The on-screen Graphs toggle button (opens the correlation chart).
 #[derive(Component)]
 struct GraphsButton;
+/// The collapsible body of the top sparkline strip (the row of stat cells).
+#[derive(Component)]
+struct StatStripBody;
+/// The strip's collapse/expand toggle button, and its caption.
+#[derive(Component)]
+struct StripToggle;
+#[derive(Component)]
+struct StripToggleLabel;
 /// A tappable per-stat cell; tapping toggles the stat onto the correlation chart.
 #[derive(Component)]
 struct GraphCell {
@@ -385,7 +398,6 @@ fn main() {
                     fit_camera_to_screen,
                 ),
                 (
-                    update_hud,
                     update_selection_ring,
                     update_selection_panel,
                     update_noot_color,
@@ -394,6 +406,7 @@ fn main() {
                     sample_stats,
                     render_graphs,
                     graph_select,
+                    strip_controls,
                     hide_loading_screen,
                 ),
             )
@@ -639,7 +652,7 @@ fn setup(
         }
     }
 
-    spawn_ui(&mut commands, &icons, &ui_font, &graph_assets);
+    spawn_ui(&mut commands, &ui_font, &graph_assets);
 
     commands.insert_resource(SimRng(sim_rng));
     commands.insert_resource(Sim(world));
@@ -708,76 +721,17 @@ fn spawn_noot(
     ));
 }
 
-fn spawn_ui(
-    commands: &mut Commands,
-    icons: &[Handle<Image>; 4],
-    font: &Handle<Font>,
-    graphs: &GraphAssets,
-) {
+fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) {
     commands
         .spawn(Node {
             width: Val::Percent(100.0),
             height: Val::Percent(100.0),
             flex_direction: FlexDirection::Column,
-            justify_content: JustifyContent::SpaceBetween,
+            justify_content: JustifyContent::FlexEnd,
             padding: UiRect::all(Val::Px(10.0)),
             ..default()
         })
         .with_children(|root| {
-            // Status panel (top): summary text, then one icon+text row per resource.
-            root.spawn((
-                Node {
-                    align_self: AlignSelf::FlexStart,
-                    max_width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(2.0),
-                    padding: UiRect::all(Val::Px(8.0)),
-                    ..default()
-                },
-                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
-            ))
-            .with_children(|panel| {
-                panel.spawn((
-                    Text::new("loading..."),
-                    TextFont {
-                        font: font.clone(),
-                        font_size: 14.0,
-                        ..default()
-                    },
-                    TextColor(Color::WHITE),
-                    HudText,
-                ));
-                for (slot, icon) in icons.iter().enumerate() {
-                    panel
-                        .spawn(Node {
-                            flex_direction: FlexDirection::Row,
-                            align_items: AlignItems::Center,
-                            column_gap: Val::Px(6.0),
-                            ..default()
-                        })
-                        .with_children(|row| {
-                            row.spawn((
-                                ImageNode::new(icon.clone()),
-                                Node {
-                                    width: Val::Px(18.0),
-                                    height: Val::Px(18.0),
-                                    ..default()
-                                },
-                            ));
-                            row.spawn((
-                                Text::new(""),
-                                TextFont {
-                                    font: font.clone(),
-                                    font_size: 13.0,
-                                    ..default()
-                                },
-                                TextColor(Color::WHITE),
-                                ResourceLine { slot },
-                            ));
-                        });
-                }
-            });
-
             // Selection panel (bottom): details of the followed noot.
             root.spawn((
                 Node {
@@ -981,6 +935,9 @@ fn speed_label(tps: f32) -> String {
 /// Build the (initially hidden) graphs panel: the big correlation chart on top, then a
 /// wrap-grid of tappable per-stat sparkline cells below.
 fn spawn_graphs_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) {
+    // --- Top sparkline strip (always docked at the top, collapsible) ---------
+    // Spans the width but leaves the right button column clear; the collapse toggle
+    // sits on its own row so the strip never fully disappears.
     commands
         .spawn((
             Node {
@@ -988,33 +945,93 @@ fn spawn_graphs_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &Gra
                 left: Val::Px(0.0),
                 top: Val::Px(0.0),
                 width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                // Start closed: `display: none` drops it out of layout *and* picking, so
-                // it can't intercept taps while hidden (a hidden-but-laid-out full-screen
-                // node would). `graphs_controls` flips this to `flex` to open it.
-                display: Display::None,
                 flex_direction: FlexDirection::Column,
-                align_items: AlignItems::Center,
-                row_gap: Val::Px(6.0),
-                padding: UiRect::all(Val::Px(8.0)),
-                overflow: Overflow::clip(),
+                align_items: AlignItems::FlexStart,
+                row_gap: Val::Px(3.0),
+                padding: UiRect {
+                    left: Val::Px(8.0),
+                    right: Val::Px(PAUSE_BTN_W + 2.0 * PAUSE_BTN_MARGIN),
+                    top: Val::Px(6.0),
+                    bottom: Val::Px(6.0),
+                },
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.86)),
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.62)),
+        ))
+        .with_children(|strip| {
+            // Collapse/expand toggle (always visible).
+            strip
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+                        ..default()
+                    },
+                    BackgroundColor(BTN_OFF),
+                    StripToggle,
+                ))
+                .with_children(|b| {
+                    b.spawn((
+                        Text::new("Hide stats"),
+                        TextFont {
+                            font: font.clone(),
+                            font_size: 13.0,
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                        StripToggleLabel,
+                    ));
+                });
+
+            // The wrapping row of tappable stat cells (hidden when collapsed).
+            strip
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        flex_wrap: FlexWrap::Wrap,
+                        align_items: AlignItems::FlexStart,
+                        column_gap: Val::Px(5.0),
+                        row_gap: Val::Px(5.0),
+                        ..default()
+                    },
+                    StatStripBody,
+                ))
+                .with_children(|grid| {
+                    for (series, (label, _c, _u)) in graph::SERIES.iter().enumerate() {
+                        spawn_stat_cell(grid, font, graphs, series, label);
+                    }
+                });
+        });
+
+    // --- Correlation chart panel (on-demand, behind the Graphs button) -------
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(8.0),
+                bottom: Val::Px(70.0),
+                // Closed by default; `display: none` keeps it out of layout + picking.
+                display: Display::None,
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::FlexStart,
+                row_gap: Val::Px(3.0),
+                padding: UiRect::all(Val::Px(6.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.85)),
             GraphsPanel,
         ))
         .with_children(|panel| {
             panel.spawn((
-                Text::new("Graphs — tap a stat to overlay it on the top chart  ·  C / Graphs to close"),
+                Text::new("Correlation — tap stats above to overlay them"),
                 TextFont {
                     font: font.clone(),
-                    font_size: 12.0,
+                    font_size: 11.0,
                     ..default()
                 },
                 TextColor(Color::srgb(0.8, 0.8, 0.85)),
             ));
-
-            // Correlation (overlay) chart.
             panel.spawn((
                 ImageNode::new(graphs.overlay.clone()),
                 Node {
@@ -1023,70 +1040,49 @@ fn spawn_graphs_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &Gra
                     ..default()
                 },
             ));
-
-            // Wrap-grid of per-stat cells.
-            panel
-                .spawn(Node {
-                    width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Row,
-                    flex_wrap: FlexWrap::Wrap,
-                    justify_content: JustifyContent::Center,
-                    align_items: AlignItems::FlexStart,
-                    column_gap: Val::Px(6.0),
-                    row_gap: Val::Px(6.0),
-                    ..default()
-                })
-                .with_children(|grid| {
-                    for (series, (label, _color)) in graph::SERIES.iter().enumerate() {
-                        grid.spawn((
-                            Button,
-                            Node {
-                                flex_direction: FlexDirection::Column,
-                                align_items: AlignItems::Center,
-                                padding: UiRect::all(Val::Px(3.0)),
-                                row_gap: Val::Px(2.0),
-                                ..default()
-                            },
-                            BackgroundColor(GRAPH_CELL_OFF),
-                            GraphCell { series },
-                        ))
-                        .with_children(|cell| {
-                            cell.spawn((
-                                Text::new(*label),
-                                TextFont {
-                                    font: font.clone(),
-                                    font_size: 11.0,
-                                    ..default()
-                                },
-                                TextColor(Color::WHITE),
-                                GraphLabel { series },
-                            ));
-                            cell.spawn((
-                                ImageNode::new(graphs.sparks[series].clone()),
-                                Node {
-                                    width: Val::Px(SPARK_W as f32),
-                                    height: Val::Px(SPARK_H as f32),
-                                    ..default()
-                                },
-                            ));
-                        });
-                    }
-                });
         });
 }
 
-/// Adaptive number formatting for the stat captions (rates are tiny, ages/bucks large).
-fn fmt_stat(v: f32) -> String {
-    let a = v.abs();
-    if a >= 1000.0 {
-        format!("{:.0}", v)
-    } else if a >= 10.0 {
-        format!("{:.1}", v)
-    } else if a >= 0.1 {
-        format!("{:.2}", v)
-    } else {
-        format!("{:.4}", v)
-    }
+/// One tappable stat cell (caption + sparkline) in the top strip.
+fn spawn_stat_cell(
+    grid: &mut bevy::ecs::hierarchy::ChildSpawnerCommands,
+    font: &Handle<Font>,
+    graphs: &GraphAssets,
+    series: usize,
+    label: &str,
+) {
+    grid.spawn((
+        Button,
+        Node {
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Center,
+            padding: UiRect::all(Val::Px(3.0)),
+            row_gap: Val::Px(1.0),
+            ..default()
+        },
+        BackgroundColor(GRAPH_CELL_OFF),
+        GraphCell { series },
+    ))
+    .with_children(|cell| {
+        cell.spawn((
+            Text::new(label),
+            TextFont {
+                font: font.clone(),
+                font_size: 10.0,
+                ..default()
+            },
+            TextColor(Color::WHITE),
+            GraphLabel { series },
+        ));
+        cell.spawn((
+            ImageNode::new(graphs.sparks[series].clone()),
+            Node {
+                width: Val::Px(SPARK_W as f32),
+                height: Val::Px(SPARK_H as f32),
+                ..default()
+            },
+        ));
+    });
 }
 
 /// Toggle the graphs panel from the Graphs button or the `C` key, keeping the button
@@ -1109,6 +1105,29 @@ fn graphs_controls(
         }
         if let Ok(mut bg) = bg.single_mut() {
             bg.0 = if overlays.graphs { VALUE_BTN_ON } else { BTN_OFF };
+        }
+    }
+}
+
+/// Collapse/expand the top sparkline strip from its "Hide/Show stats" toggle, syncing
+/// the strip body's display and the toggle caption.
+fn strip_controls(
+    button: Query<&Interaction, (Changed<Interaction>, With<StripToggle>)>,
+    mut overlays: ResMut<Overlays>,
+    mut body: Query<&mut Node, With<StatStripBody>>,
+    mut label: Query<&mut Text, With<StripToggleLabel>>,
+) {
+    if button.iter().any(|i| *i == Interaction::Pressed) {
+        overlays.strip = !overlays.strip;
+        if let Ok(mut node) = body.single_mut() {
+            node.display = if overlays.strip {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+        if let Ok(mut text) = label.single_mut() {
+            text.0 = if overlays.strip { "Hide stats" } else { "Show stats" }.into();
         }
     }
 }
@@ -1209,7 +1228,8 @@ fn render_graphs(
     mut cells: Query<(&GraphCell, &mut BackgroundColor)>,
     mut timer: Local<f32>,
 ) {
-    if !overlays.graphs {
+    // Nothing visible → skip the work entirely.
+    if !overlays.strip && !overlays.graphs {
         return;
     }
     *timer += time.delta_secs();
@@ -1223,28 +1243,36 @@ fn render_graphs(
         .map(|i| hist.samples.iter().map(|s| s[i]).collect())
         .collect();
 
-    if let Some(img) = images.get_mut(&assets.overlay) {
-        let sel: Vec<(&[f32], [u8; 3])> = (0..graph::N_SERIES)
-            .filter(|&i| selection.0[i])
-            .map(|i| (cols[i].as_slice(), graph::SERIES[i].1))
-            .collect();
-        graph::render_overlay(img, &sel);
-    }
-    for (i, col) in cols.iter().enumerate() {
-        if let Some(img) = images.get_mut(&assets.sparks[i]) {
-            graph::render_sparkline(img, col, graph::SERIES[i].1);
+    // Strip: redraw each sparkline, refresh its caption (SI-prefixed value) and tint.
+    if overlays.strip {
+        for (i, col) in cols.iter().enumerate() {
+            if let Some(img) = images.get_mut(&assets.sparks[i]) {
+                graph::render_sparkline(img, col, graph::SERIES[i].1);
+            }
+        }
+        for (lbl, mut text) in &mut labels {
+            let (name, _c, unit) = graph::SERIES[lbl.series];
+            let latest = cols[lbl.series].last().copied().unwrap_or(0.0);
+            text.0 = format!("{} {}", name, graph::fmt_value(latest, unit));
+        }
+        for (cell, mut bg) in &mut cells {
+            bg.0 = if selection.0[cell.series] {
+                GRAPH_CELL_ON
+            } else {
+                GRAPH_CELL_OFF
+            };
         }
     }
-    for (lbl, mut text) in &mut labels {
-        let latest = cols[lbl.series].last().copied().unwrap_or(0.0);
-        text.0 = format!("{}: {}", graph::SERIES[lbl.series].0, fmt_stat(latest));
-    }
-    for (cell, mut bg) in &mut cells {
-        bg.0 = if selection.0[cell.series] {
-            GRAPH_CELL_ON
-        } else {
-            GRAPH_CELL_OFF
-        };
+
+    // Correlation chart: overlay the selected series, each independently normalized.
+    if overlays.graphs {
+        if let Some(img) = images.get_mut(&assets.overlay) {
+            let sel: Vec<(&[f32], [u8; 3])> = (0..graph::N_SERIES)
+                .filter(|&i| selection.0[i])
+                .map(|i| (cols[i].as_slice(), graph::SERIES[i].1))
+                .collect();
+            graph::render_overlay(img, &sel);
+        }
     }
 }
 
@@ -1878,103 +1906,4 @@ fn update_selection_panel(
     }
     out.push_str(&format!("holding: {}\n", held));
     text.0 = out;
-}
-
-#[allow(clippy::too_many_arguments)]
-fn update_hud(
-    sim: Res<Sim>,
-    stats: Res<EconStats>,
-    paused: Res<Paused>,
-    hunger_ctrl: Res<HungerControl>,
-    income_ctrl: Res<economy::IncomeControl>,
-    noots: Query<(&Wallet, &Hunger, &Trader, &Claim)>,
-    mut hud: Query<&mut Text, (With<HudText>, Without<ResourceLine>)>,
-    mut lines: Query<(&ResourceLine, &mut Text), Without<HudText>>,
-) {
-    let world = &sim.0;
-
-    // Aggregate noot stats over the now-uniform population.
-    let mut total_bucks = 0.0f32;
-    let mut appetite_sum = 0.0f32;
-    let mut discount_sum = 0.0f32;
-    let mut starving = 0u32;
-    let mut claimed = 0u32;
-    let mut count = 0u32;
-    for (wallet, hunger, trader, claim) in &noots {
-        total_bucks += wallet.bucks;
-        appetite_sum += hunger.staple.iter().sum::<f32>() / hunger.staple.len() as f32;
-        discount_sum += trader.discount;
-        if hunger.is_starving() {
-            starving += 1;
-        }
-        if claim.deposit.is_some() {
-            claimed += 1;
-        }
-        count += 1;
-    }
-    let denom = count.max(1) as f32;
-    let avg_appetite = appetite_sum / denom;
-    let avg_discount = discount_sum / denom;
-    let starving_pct = starving as f32 / denom * 100.0;
-    let n_deposits = world.deposits.len();
-
-    if let Ok(mut text) = hud.single_mut() {
-        let pause_tag = if paused.0 { "[PAUSED]  " } else { "" };
-        let out = format!(
-            "{pause_tag}econ-sim  seed {:#x}  noots {}  tick {}  trades {}  in circulation ₦{:.0}\n\
-             {}/{} deposits claimed   avg appetite {:.1}   avg discount {:.2}\n\
-             starving {}/{} ({:.0}%)   production {:.2}/t   consumption {:.2}/t\n\
-             trade margin ₦{:.2}/t   utility {:.2}/t\n\
-             deaths {:.2e}/t → target {:.2e}   hunger rate {:.2}\n\
-             income ₦{:.2}/t   sales infl {:+.3}% → target {:.3}%\n\
-             drag to pan · pinch to zoom · tap a noot/deposit · V/T/N overlays · S save · G new\n\n",
-            world.seed, count, stats.ticks, stats.trades_total, total_bucks, claimed, n_deposits,
-            avg_appetite, avg_discount, starving, count, starving_pct, stats.production_rate,
-            stats.consumption_rate, stats.merchant_profit_rate, stats.utility_rate,
-            hunger_ctrl.measured_per_tick, hunger_ctrl.target_per_tick, hunger_ctrl.rate,
-            income_ctrl.rate, income_ctrl.measured_inflation * 100.0,
-            economy::TARGET_INFLATION * 100.0
-        );
-        text.0 = out;
-    }
-
-    // Per-resource rows, each beside its element icon.
-    for (line, mut text) in &mut lines {
-        let want = resource_line(world, &stats, line.slot);
-        if text.0 != want {
-            text.0 = want;
-        }
-    }
-}
-
-/// One resource's HUD line (the leading icon identifies which element it is).
-fn resource_line(world: &World, stats: &EconStats, slot: usize) -> String {
-    let ce = &world.chosen[slot];
-    let elem = elements::element(ce.id);
-    let good = &world.goods.goods[slot];
-    let category = match good.category {
-        GoodCategory::Staple => "staple",
-        GoodCategory::Positional => "posit ",
-    };
-    let (form, good_name) = match good.form {
-        GoodForm::Raw => ("raw    ", elem.name),
-        GoodForm::Refined => ("refined", elem.refined),
-    };
-    let resource = match ce.role {
-        ResourceRole::Replenishable => "REPL",
-        ResourceRole::Finite => "FIN ",
-    };
-    let avail: f64 = world
-        .deposits
-        .iter()
-        .filter(|d| d.element_slot == slot)
-        .map(|d| d.available())
-        .sum();
-    let item = goods::item_index(slot, good.form);
-    let price = stats.ewma_price[item];
-    let tail = match world.remaining_fraction(slot) {
-        Some(frac) => format!("left {:>3.0}%", frac * 100.0),
-        None => format!("stock {:>4.0}", avail),
-    };
-    format!("{good_name:<9} {category}/{form}  {resource}  ₦{price:>3.0}  {tail}")
 }

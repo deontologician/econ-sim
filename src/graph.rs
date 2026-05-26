@@ -13,28 +13,80 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 /// The time series tracked, in sample order. Index into a `[f32; N_SERIES]` sample and
-/// into `SERIES` (label + plot colour). "Plus average age" lives at index 13.
+/// into `SERIES` (label, plot colour, unit). "Plus average age" lives at index 13.
 pub const N_SERIES: usize = 15;
 
-/// `(label, rgb)` for each series. Colours are picked to stay distinct when several are
-/// overlaid on the correlation chart.
-pub const SERIES: [(&str, [u8; 3]); N_SERIES] = [
-    ("prod/t", [90, 200, 120]),
-    ("cons/t", [230, 140, 70]),
-    ("margin/t", [240, 210, 80]),
-    ("utility/t", [120, 200, 230]),
-    ("trades", [180, 140, 230]),
-    ("avg bucks", [120, 230, 180]),
-    ("appetite", [230, 110, 110]),
-    ("starving", [230, 70, 90]),
-    ("claimed", [150, 190, 90]),
-    ("hunger", [220, 120, 60]),
-    ("deaths/t", [200, 60, 70]),
-    ("income/t", [110, 180, 120]),
-    ("infl%", [200, 200, 120]),
-    ("avg age", [130, 170, 240]),
-    ("clump", [200, 150, 220]),
+/// How a series' latest value is rendered as text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Unit {
+    /// A per-tick rate: shown with an SI tick-prefix denominator (…/t, /Kt, /Mt, /Gt) so
+    /// tiny values like `8.5e-4/t` read as `850/Mt` instead of scientific notation.
+    Rate,
+    /// A plain count (integer-ish).
+    Count,
+    /// A percentage.
+    Percent,
+    /// A continuous level (averages, distances).
+    Level,
+}
+
+/// `(label, rgb, unit)` for each series. Colours are picked to stay distinct when
+/// several are overlaid on the correlation chart.
+pub const SERIES: [(&str, [u8; 3], Unit); N_SERIES] = [
+    ("prod", [90, 200, 120], Unit::Rate),
+    ("cons", [230, 140, 70], Unit::Rate),
+    ("margin", [240, 210, 80], Unit::Rate),
+    ("utility", [120, 200, 230], Unit::Rate),
+    ("trades", [180, 140, 230], Unit::Count),
+    ("avg ₦", [120, 230, 180], Unit::Level),
+    ("appetite", [230, 110, 110], Unit::Level),
+    ("starving", [230, 70, 90], Unit::Count),
+    ("claimed", [150, 190, 90], Unit::Count),
+    ("hunger", [220, 120, 60], Unit::Level),
+    ("deaths", [200, 60, 70], Unit::Rate),
+    ("income", [110, 180, 120], Unit::Rate),
+    ("infl", [200, 200, 120], Unit::Percent),
+    ("avg age", [130, 170, 240], Unit::Level),
+    ("clump", [200, 150, 220], Unit::Level),
 ];
+
+/// A magnitude with adaptive precision (more decimals for small numbers).
+fn magnitude(x: f32) -> String {
+    let a = x.abs();
+    if a >= 100.0 {
+        format!("{x:.0}")
+    } else if a >= 1.0 {
+        format!("{x:.1}")
+    } else {
+        format!("{x:.2}")
+    }
+}
+
+/// A per-tick rate with an SI tick-prefix denominator, chosen so the number sits in
+/// roughly `[1, 1000)`: `…/t`, `/Kt` (10³ ticks), `/Mt` (10⁶), `/Gt` (10⁹).
+fn rate(v: f32) -> String {
+    let a = v.abs();
+    let (scale, suffix) = if a == 0.0 || a >= 1.0 {
+        (1.0, "t")
+    } else if a >= 1e-3 {
+        (1e3, "Kt")
+    } else if a >= 1e-6 {
+        (1e6, "Mt")
+    } else {
+        (1e9, "Gt")
+    };
+    format!("{}/{}", magnitude(v * scale), suffix)
+}
+
+/// Render a series' latest value as a caption per its [`Unit`].
+pub fn fmt_value(v: f32, unit: Unit) -> String {
+    match unit {
+        Unit::Rate => rate(v),
+        Unit::Count => format!("{v:.0}"),
+        Unit::Percent => format!("{v:.2}%"),
+        Unit::Level => magnitude(v),
+    }
+}
 
 const BG: [u8; 4] = [18, 18, 24, 255];
 const OVERLAY_BG: [u8; 4] = [12, 12, 16, 255];
