@@ -8,12 +8,19 @@ starvation. No gameplay input beyond pan/zoom/pause and tapping a noot to follow
 ## Build & verify
 
 - **Gate:** `cargo check --target wasm32-unknown-unknown`. This is the build that
-  must pass — the project ships as wasm.
-- **Native (`cargo run`/`check`) does not work in the web/CI sandbox**: Bevy's
-  desktop backend needs Linux GUI/GPU system libraries that aren't installed here.
-  The app therefore can't be launched or visually verified from this environment;
-  say so plainly instead of claiming a feature was seen working. Behavioural
-  verification happens on-device after deploy.
+  must pass — the GUI app ships as wasm (the default `gui` feature pulls Bevy's full
+  default features).
+- **The GUI app can't be built/run natively in the sandbox**: Bevy's desktop backend
+  needs Linux GUI/GPU libs (wayland, etc.) that aren't installed here, so it can only
+  be visually verified on-device after deploy.
+- **Headless harness (runs here!):** the simulation core is a library; the `headless`
+  feature uses core Bevy only (no GPU/windowing) so the rollouts run without graphics:
+  `cargo run --release --no-default-features --features headless --bin headless [seed]`.
+  It steps a bare ECS World on a manual clock for 5 simulated minutes and prints
+  aggregate stats — use it to actually watch the policy learn (production/utility
+  rates, action mix, deaths vs target). Also run `cargo clippy` on it (it builds
+  natively). The crate is split: `src/lib.rs` (sim core, GUI-free), `src/main.rs` (GUI
+  bin, `required-features=["gui"]`), `src/bin/headless.rs` (`headless`).
 
 ## Linting — zero-warning policy
 

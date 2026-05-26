@@ -75,6 +75,12 @@ impl NootMeta {
     }
 }
 
+impl Default for NootMeta {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Which deposit a noot has claimed and may mine, if any. Claims are sticky: a
 /// noot keeps its first claim and ignores other unowned deposits it passes.
 #[derive(Component, Clone, Serialize, Deserialize)]
@@ -107,6 +113,12 @@ impl Trader {
     }
 }
 
+impl Default for Trader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Component, Clone, Copy, Serialize, Deserialize)]
 pub struct TilePos {
     pub col: i32,
@@ -123,6 +135,12 @@ impl Inventory {
         Self {
             items: [0.0; N_ITEMS],
         }
+    }
+}
+
+impl Default for Inventory {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -11,7 +11,7 @@
 use bevy::prelude::*;
 
 use crate::goods::{self, form_of, GoodForm, ItemRole, N_ITEMS};
-use crate::hex::neighbors;
+use crate::hex::{hex_center, neighbors};
 use crate::noot::*;
 use crate::world::terrain_factor;
 use crate::policy::{self, ActorCritic, PolicyMemory, Trainer, Transition, N_ACT, N_OTHER};
@@ -460,6 +460,65 @@ pub fn train_policy(mut ac: ResMut<ActorCritic>, mut trainer: ResMut<Trainer>, m
     }
 }
 
+/// Advance the resource simulation (deposit regrowth) by the frame's dt.
+pub fn simulate(time: Res<Time>, mut sim: ResMut<Sim>) {
+    sim.0.tick(time.delta_secs());
+}
+
+/// Seconds a noot can sit fully starving before it dies and is reborn fresh.
+pub const DEATH_GRACE_SECS: f32 = 20.0;
+
+/// A noot that has sat fully starving for `DEATH_GRACE_SECS` dies and is reborn fresh
+/// at a random tile (full wallet, empty inventory, half hunger, no claim, new
+/// exploration temperament). Position is set on the tile only — the GUI sprite glide
+/// (when present) follows it — so this system has no rendering dependency. The policy
+/// keeps its cached pre-death (state, action) plus a `died` flag so `policy_step`
+/// banks one terminal transition before the new episode.
+#[allow(clippy::type_complexity)]
+pub fn death_and_respawn(
+    time: Res<Time>,
+    mut rng: ResMut<SimRng>,
+    sim: Res<Sim>,
+    mut ctrl: ResMut<HungerControl>,
+    mut q: Query<(
+        &mut Hunger,
+        &mut Inventory,
+        &mut Wallet,
+        &mut PolicyMemory,
+        &mut Trader,
+        &mut NootMeta,
+        &mut Claim,
+        &mut TilePos,
+    )>,
+) {
+    let dt = time.delta_secs();
+    let world = &sim.0;
+    for (mut hunger, mut inv, mut wallet, mut mem, mut trader, mut meta, mut claim, mut pos) in
+        &mut q
+    {
+        if hunger.fully_starving() {
+            hunger.starving_secs += dt;
+        } else {
+            hunger.starving_secs = 0.0;
+        }
+        if hunger.starving_secs < DEATH_GRACE_SECS {
+            continue;
+        }
+        ctrl.deaths_since_update += 1;
+        *inv = Inventory::new();
+        wallet.bucks = STARTING_BUCKS;
+        *hunger = Hunger::fresh(&mut rng.0);
+        mem.died = true;
+        mem.explore = rng.0.range(EXPLORE_MIN, EXPLORE_MAX);
+        mem.cooldown = 0.0;
+        *trader = Trader::new();
+        *meta = NootMeta::new();
+        claim.deposit = None;
+        pos.col = rng.0.below(world.cols as usize) as i32;
+        pos.row = rng.0.below(world.rows as usize) as i32;
+    }
+}
+
 pub fn extract(
     time: Res<Time>,
     mut sim: ResMut<Sim>,
@@ -711,7 +770,7 @@ pub fn meet_and_trade(
     mut income: ResMut<IncomeControl>,
     mut q: Query<(
         Entity,
-        &Transform,
+        &TilePos,
         &mut Inventory,
         &mut Wallet,
         &Hunger,
@@ -720,20 +779,25 @@ pub fn meet_and_trade(
     )>,
 ) {
     let goods = &sim.0.goods;
-    let radius2 = (sim.0.hex_size * TRADE_RADIUS_FACTOR).powi(2);
+    let hex_size = sim.0.hex_size;
+    let radius2 = (hex_size * TRADE_RADIUS_FACTOR).powi(2);
 
     // Snapshot (immutable read) so we can reason about pairs without aliasing.
+    // Positions come from the tile (pixel centre), so trade has no rendering dep.
     let mut snaps: Vec<Snap> = q
         .iter()
-        .map(|(e, t, inv, wal, hunger, trader, _meta)| Snap {
-            e,
-            pos: t.translation.truncate(),
-            inv: inv.items,
-            bucks: wal.bucks,
-            hunger: hunger.staple,
-            satisfied: hunger.satisfied(),
-            discount: trader.discount,
-            cost_basis: trader.cost_basis,
+        .map(|(e, tp, inv, wal, hunger, trader, _meta)| {
+            let (px, py) = hex_center(tp.col, tp.row, hex_size);
+            Snap {
+                e,
+                pos: Vec2::new(px, py),
+                inv: inv.items,
+                bucks: wal.bucks,
+                hunger: hunger.staple,
+                satisfied: hunger.satisfied(),
+                discount: trader.discount,
+                cost_basis: trader.cost_basis,
+            }
         })
         .collect();
 

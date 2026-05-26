@@ -1,30 +1,21 @@
-mod economy;
-mod elements;
-mod goods;
-mod hex;
-mod icon;
-mod movement;
-mod noot;
-mod policy;
-mod rng;
-mod save;
-mod world;
+//! GUI binary: the rendered, interactive app. The simulation core lives in the
+//! `econ_sim` library; this file is the rendering/UI/input layer (gated by `gui`).
 
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::input::touch::Touch;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
-use economy::{EconStats, HungerControl};
-use goods::{GoodCategory, GoodForm};
-use movement::tile_to_pixel;
-use noot::{
+use econ_sim::economy::{self, EconStats, HungerControl};
+use econ_sim::goods::{self, GoodCategory, GoodForm};
+use econ_sim::movement::{self, tile_to_pixel};
+use econ_sim::noot::{
     Action, Claim, Hunger, Inventory, Noot, NootMeta, TilePos, Trader, Wallet, EXPLORE_MAX,
     EXPLORE_MIN, STARTING_BUCKS,
 };
-use policy::{ActorCritic, PolicyMemory, Trainer};
-use rng::Rng;
-use world::{generate, ResourceRole, World};
+use econ_sim::policy::{ActorCritic, PolicyMemory, Trainer};
+use econ_sim::world::{generate, ResourceRole, World};
+use econ_sim::{elements, hex, icon, rng::Rng, save, MapView, Sim, SimRng};
 
 // --- World generation knobs -------------------------------------------------
 const COLS: i32 = 30;
@@ -35,10 +26,6 @@ const HEX_SIZE: f32 = 26.0;
 /// Total noots at a fresh start. All spawn claimless and free-roaming — anyone can
 /// become a miner by claiming a deposit it wanders onto (no pre-seeded miners).
 const N_NOOTS: usize = 56;
-
-/// Seconds a noot can sit fully starving (all staples maxed) before it dies and
-/// is reborn fresh at a random tile (its deposit claim, if any, is released).
-const DEATH_GRACE_SECS: f32 = 20.0;
 
 // --- Camera limits ----------------------------------------------------------
 const MIN_ZOOM: f32 = 0.3;
@@ -67,22 +54,6 @@ const BTN_COLUMN_BOTTOM: f32 = NEW_BTN_TOP + PAUSE_BTN_H;
 const BTN_OFF: Color = Color::srgba(0.12, 0.12, 0.12, 0.85);
 const VALUE_BTN_ON: Color = Color::srgba(0.62, 0.22, 0.16, 0.9);
 const TERRAIN_BTN_ON: Color = Color::srgba(0.20, 0.45, 0.30, 0.9);
-
-#[derive(Resource)]
-pub struct Sim(pub World);
-
-#[derive(Resource)]
-pub struct SimRng(pub Rng);
-
-/// How tile coordinates map to world pixels (map centred on the origin).
-#[derive(Resource, Clone, Copy)]
-pub struct MapView {
-    pub offset: Vec2,
-    pub hex_size: f32,
-    /// Full map extent in world units, used to fit the camera on launch.
-    pub map_w: f32,
-    pub map_h: f32,
-}
 
 /// How long after launch the camera keeps re-fitting the map, so the wasm canvas
 /// (which resizes to its parent post-launch) settles before zoom is left to the user.
@@ -237,7 +208,7 @@ fn main() {
                 // groups are gated by `sim_running` so the pause button freezes
                 // them while input/camera/HUD keep working.
                 (
-                    simulate,
+                    economy::simulate,
                     economy::income,
                     economy::income_controller,
                     economy::hunger_tick,
@@ -256,7 +227,7 @@ fn main() {
                     .run_if(sim_running),
                 (
                     economy::consume,
-                    death_and_respawn,
+                    economy::death_and_respawn,
                     economy::update_rates,
                     economy::train_policy,
                 )
@@ -777,10 +748,6 @@ fn spawn_overlay_button(
         });
 }
 
-fn simulate(time: Res<Time>, mut sim: ResMut<Sim>) {
-    sim.0.tick(time.delta_secs());
-}
-
 /// Toggle pause from the spacebar or the on-screen button, and keep the button
 /// caption in sync. Runs every frame (never gated) so the sim can be unpaused.
 fn pause_controls(
@@ -798,68 +765,6 @@ fn pause_controls(
         if text.0 != want {
             text.0 = want.into();
         }
-    }
-}
-
-/// A noot that has sat fully starving for `DEATH_GRACE_SECS` dies and is reborn
-/// fresh at a random tile — full wallet, empty inventory, half hunger, no claim
-/// (its deposit, if any, is released for someone else to claim).
-// The respawn touches most of a noot's state at once; a wide query is inherent.
-#[allow(clippy::type_complexity)]
-fn death_and_respawn(
-    time: Res<Time>,
-    mut rng: ResMut<SimRng>,
-    sim: Res<Sim>,
-    view: Res<MapView>,
-    mut ctrl: ResMut<HungerControl>,
-    mut q: Query<(
-        &mut Hunger,
-        &mut Inventory,
-        &mut Wallet,
-        &mut PolicyMemory,
-        &mut Trader,
-        &mut NootMeta,
-        &mut Claim,
-        &mut TilePos,
-        &mut Transform,
-    )>,
-) {
-    let dt = time.delta_secs();
-    let world = &sim.0;
-    for (mut hunger, mut inv, mut wallet, mut mem, mut trader, mut meta, mut claim, mut pos, mut tf) in
-        &mut q
-    {
-        if hunger.fully_starving() {
-            hunger.starving_secs += dt;
-        } else {
-            hunger.starving_secs = 0.0;
-        }
-        if hunger.starving_secs < DEATH_GRACE_SECS {
-            continue;
-        }
-
-        // A death: feed it back to the hunger-rate controller.
-        ctrl.deaths_since_update += 1;
-
-        // Reincarnate a fresh, unclaimed noot at a random tile with the starting
-        // wallet, and draw a new temperament. The policy keeps its cached pre-death
-        // (state, action) and a `died` flag so `policy_step` banks one terminal
-        // transition (reward = −DEATH, done) before starting the new episode.
-        *inv = Inventory::new();
-        wallet.bucks = STARTING_BUCKS;
-        *hunger = Hunger::fresh(&mut rng.0);
-        mem.died = true;
-        mem.explore = rng.0.range(EXPLORE_MIN, EXPLORE_MAX);
-        mem.cooldown = 0.0;
-        *trader = Trader::new();
-        *meta = NootMeta::new();
-        claim.deposit = None;
-        let col = rng.0.below(world.cols as usize) as i32;
-        let row = rng.0.below(world.rows as usize) as i32;
-        pos.col = col;
-        pos.row = row;
-        let p = tile_to_pixel(col, row, view.hex_size, view.offset);
-        tf.translation = Vec3::new(p.x, p.y, 2.0);
     }
 }
 

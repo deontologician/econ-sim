@@ -3,13 +3,35 @@ name = "econ-sim"
 version = "0.1.0"
 edition = "2021"
 
+# The default `gui` feature pulls Bevy's full default features (rendering, winit,
+# etc.) for the wasm app. The `headless` build uses `default-features = false`, i.e.
+# core Bevy only (ECS/app/time/transform) — no GPU/windowing libs — so the simulation
+# can run without graphics (e.g. `cargo run --no-default-features --features headless
+# --bin headless`).
+[features]
+default = ["gui"]
+gui = ["bevy/default"]
+headless = []
+
 [dependencies]
-bevy = "0.18"
+bevy = { version = "0.18", default-features = false }
 # Save/load only. Both are already in Bevy's dependency tree, so this adds no real
 # bundle or compile cost — see CLAUDE.md. JSON (not RON) because serde_json::Value
 # round-trips enums faithfully, which the save migration replay relies on.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# GUI app (wasm): the default binary; needs the rendering features.
+[[bin]]
+name = "econ-sim"
+path = "src/main.rs"
+required-features = ["gui"]
+
+# Headless simulation harness: core Bevy only, runs the rollouts without graphics.
+[[bin]]
+name = "headless"
+path = "src/bin/headless.rs"
+required-features = ["headless"]
 
 # Web-only: hide the loading screen once Bevy boots, and draw an entropy seed.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
