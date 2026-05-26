@@ -39,19 +39,30 @@ const TAP_SLOP: f32 = 12.0;
 const DESELECT_PAN_SLOP: f32 = 1.5;
 
 // --- Top-right button column layout (shared by spawn_ui and the pick guard) -
-// Pause sits at the top; the two overlay toggles stack below it.
+// A horizontal transport bar — [<<] [Play/Pause] [>>] and a ticks/s readout — sits at
+// the top; the overlay toggles stack in a narrower column below it.
 const PAUSE_BTN_W: f32 = 120.0;
 const PAUSE_BTN_H: f32 = 44.0;
 const PAUSE_BTN_MARGIN: f32 = 10.0;
 const BTN_GAP: f32 = 8.0;
+
+// Transport bar: two side buttons (slower / faster), a wider middle play/pause button,
+// then the ticks/s readout, all in one right-anchored row of height `PAUSE_BTN_H`.
+const XPORT_SIDE_W: f32 = 46.0;
+const XPORT_MID_W: f32 = 60.0;
+const XPORT_READOUT_W: f32 = 104.0;
+const XPORT_GAP: f32 = 6.0;
+const XPORT_BAR_W: f32 = XPORT_SIDE_W * 2.0 + XPORT_MID_W + XPORT_READOUT_W + XPORT_GAP * 3.0;
+
+// The toggle column begins one transport-bar height below the top margin, so its first
+// button lines up just under the transport bar.
 const VALUE_BTN_TOP: f32 = PAUSE_BTN_MARGIN + PAUSE_BTN_H + BTN_GAP;
 const TERRAIN_BTN_TOP: f32 = VALUE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const NOOT_BTN_TOP: f32 = TERRAIN_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const SAVE_BTN_TOP: f32 = NOOT_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const NEW_BTN_TOP: f32 = SAVE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
-const SPEED_BTN_TOP: f32 = NEW_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
-/// Bottom edge of the whole button column (taps above this are UI, not the map).
-const BTN_COLUMN_BOTTOM: f32 = SPEED_BTN_TOP + PAUSE_BTN_H;
+/// Bottom edge of the toggle column (taps above this in the column are UI, not map).
+const BTN_COLUMN_BOTTOM: f32 = NEW_BTN_TOP + PAUSE_BTN_H;
 
 const BTN_OFF: Color = Color::srgba(0.12, 0.12, 0.12, 0.85);
 const VALUE_BTN_ON: Color = Color::srgba(0.62, 0.22, 0.16, 0.9);
@@ -80,10 +91,12 @@ struct SimSchedule;
 #[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
 struct SimDriver;
 
-/// Selectable game speeds in **ticks per second**, cycled by the Speed button.
-/// 60 t/s ≈ real-time; higher values run the sim faster than the wall clock while
-/// the render loop stays at the browser's frame rate.
-const SPEED_STEPS: [f32; 5] = [60.0, 120.0, 240.0, 480.0, 960.0];
+/// Selectable game speeds in **ticks per second**, stepped by the transport bar's
+/// `<<` / `>>` buttons (default 60 t/s ≈ real-time). Higher values run the sim faster
+/// than the wall clock while the render loop stays at the browser's frame rate.
+const SPEED_STEPS: [f32; 6] = [30.0, 60.0, 120.0, 240.0, 480.0, 960.0];
+/// Index into `SPEED_STEPS` the sim starts at (60 t/s).
+const SPEED_DEFAULT_IDX: usize = 1;
 
 /// Hard cap on sim ticks executed in a single rendered frame, so a slow frame (or a
 /// background tab catching up) can't spiral into an unbounded tick burst.
@@ -100,7 +113,7 @@ struct SimSpeed {
 impl Default for SimSpeed {
     fn default() -> Self {
         Self {
-            ticks_per_second: SPEED_STEPS[0],
+            ticks_per_second: SPEED_STEPS[SPEED_DEFAULT_IDX],
             accumulator: 0.0,
         }
     }
@@ -147,10 +160,12 @@ struct NewWorldButton;
 /// Snapshots the full game state to localStorage (touch equivalent of the S key).
 #[derive(Component)]
 struct SaveButton;
-/// Cycles the simulation speed (ticks per second).
+/// Transport buttons: step the simulation speed down / up through `SPEED_STEPS`.
 #[derive(Component)]
-struct SpeedButton;
-/// Caption on the speed button, kept in sync with the active speed.
+struct SpeedDownButton;
+#[derive(Component)]
+struct SpeedUpButton;
+/// The `x.x ticks/s` readout in the transport bar, kept in sync with the active speed.
 #[derive(Component)]
 struct SpeedLabel;
 /// Caption on the noot-colouring button, kept in sync with the active mode.
@@ -707,72 +722,70 @@ fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4], font: &Handle<F
             });
         });
 
-    // Pause toggle, pinned top-right (absolute so it floats over the panels).
-    // Large enough to be a comfortable touch target on mobile.
+    // Transport bar, pinned top-right (absolute so it floats over the panels): a row of
+    // [<<] [Play/Pause] [>>] with the ticks/s readout. Touch-target-sized buttons.
     commands
-        .spawn((
-            Button,
-            Node {
-                position_type: PositionType::Absolute,
-                right: Val::Px(PAUSE_BTN_MARGIN),
-                top: Val::Px(PAUSE_BTN_MARGIN),
-                width: Val::Px(PAUSE_BTN_W),
-                height: Val::Px(PAUSE_BTN_H),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.12, 0.12, 0.12, 0.85)),
-            PauseButton,
-        ))
-        .with_children(|b| {
-            b.spawn((
-                Text::new("Pause"),
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(PAUSE_BTN_MARGIN),
+            top: Val::Px(PAUSE_BTN_MARGIN),
+            height: Val::Px(PAUSE_BTN_H),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(XPORT_GAP),
+            ..default()
+        })
+        .with_children(|bar| {
+            spawn_transport_button(bar, font, "<<", XPORT_SIDE_W, SpeedDownButton);
+            // Middle play/pause button (caption flips in `pause_controls`).
+            bar.spawn((
+                Button,
+                Node {
+                    width: Val::Px(XPORT_MID_W),
+                    height: Val::Px(PAUSE_BTN_H),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BackgroundColor(BTN_OFF),
+                PauseButton,
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("Pause"),
+                    TextFont {
+                        font: font.clone(),
+                        font_size: 15.0,
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                    PauseLabel,
+                ));
+            });
+            spawn_transport_button(bar, font, ">>", XPORT_SIDE_W, SpeedUpButton);
+            // Ticks/s readout.
+            bar.spawn((
+                Text::new(speed_label(SPEED_STEPS[SPEED_DEFAULT_IDX])),
                 TextFont {
                     font: font.clone(),
-                    font_size: 18.0,
+                    font_size: 13.0,
                     ..default()
                 },
                 TextColor(Color::WHITE),
-                PauseLabel,
+                Node {
+                    width: Val::Px(XPORT_READOUT_W),
+                    margin: UiRect::left(Val::Px(2.0)),
+                    ..default()
+                },
+                SpeedLabel,
             ));
         });
 
-    // Overlay toggles, stacked under the pause button (same touch-target size).
+    // Overlay toggles, stacked under the transport bar (same touch-target size).
     spawn_overlay_button(commands, font, "Value", VALUE_BTN_TOP, ValueButton);
     spawn_overlay_button(commands, font, "Terrain", TERRAIN_BTN_TOP, TerrainButton);
     spawn_overlay_button(commands, font, "Save", SAVE_BTN_TOP, SaveButton);
     spawn_overlay_button(commands, font, "New", NEW_BTN_TOP, NewWorldButton);
-
-    // Speed cycle button (caption shows the active multiplier).
-    commands
-        .spawn((
-            Button,
-            Node {
-                position_type: PositionType::Absolute,
-                right: Val::Px(PAUSE_BTN_MARGIN),
-                top: Val::Px(SPEED_BTN_TOP),
-                width: Val::Px(PAUSE_BTN_W),
-                height: Val::Px(PAUSE_BTN_H),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            BackgroundColor(BTN_OFF),
-            SpeedButton,
-        ))
-        .with_children(|b| {
-            b.spawn((
-                Text::new(speed_label(SPEED_STEPS[0])),
-                TextFont {
-                    font: font.clone(),
-                    font_size: 15.0,
-                    ..default()
-                },
-                TextColor(Color::WHITE),
-                SpeedLabel,
-            ));
-        });
 
     // Noot-colouring cycle button (caption shows the active mode).
     commands
@@ -842,24 +855,66 @@ fn spawn_overlay_button(
         });
 }
 
-/// Caption for the speed button: the tick rate as a multiple of the 60 t/s base.
-fn speed_label(tps: f32) -> String {
-    format!("Speed {:.0}\u{00d7}", tps / SPEED_STEPS[0])
+/// Spawn one transport-bar button (a child of the bar row) carrying `label`.
+fn spawn_transport_button(
+    bar: &mut bevy::ecs::hierarchy::ChildSpawnerCommands,
+    font: &Handle<Font>,
+    label: &str,
+    width: f32,
+    marker: impl Component,
+) {
+    bar.spawn((
+        Button,
+        Node {
+            width: Val::Px(width),
+            height: Val::Px(PAUSE_BTN_H),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            ..default()
+        },
+        BackgroundColor(BTN_OFF),
+        marker,
+    ))
+    .with_children(|b| {
+        b.spawn((
+            Text::new(label),
+            TextFont {
+                font: font.clone(),
+                font_size: 18.0,
+                ..default()
+            },
+            TextColor(Color::WHITE),
+        ));
+    });
 }
 
-/// Cycle the sim speed from the on-screen button, advancing to the next entry in
-/// `SPEED_STEPS` (wrapping), and keep the caption in sync.
+/// The transport bar's speed readout, e.g. `60.0 ticks/s`.
+fn speed_label(tps: f32) -> String {
+    format!("{:.1} ticks/s", tps)
+}
+
+/// Step the sim speed through `SPEED_STEPS` (clamped) from the transport bar's `<<` /
+/// `>>` buttons (or the `,` / `.` keys), and keep the ticks/s readout in sync.
 fn speed_controls(
-    button: Query<&Interaction, (Changed<Interaction>, With<SpeedButton>)>,
+    keys: Res<ButtonInput<KeyCode>>,
+    down: Query<&Interaction, (Changed<Interaction>, With<SpeedDownButton>)>,
+    up: Query<&Interaction, (Changed<Interaction>, With<SpeedUpButton>)>,
     mut speed: ResMut<SimSpeed>,
     mut label: Query<&mut Text, With<SpeedLabel>>,
 ) {
-    if button.iter().any(|i| *i == Interaction::Pressed) {
+    let dec = keys.just_pressed(KeyCode::Comma) || down.iter().any(|i| *i == Interaction::Pressed);
+    let inc = keys.just_pressed(KeyCode::Period) || up.iter().any(|i| *i == Interaction::Pressed);
+    if dec || inc {
         let cur = SPEED_STEPS
             .iter()
             .position(|&s| s == speed.ticks_per_second)
-            .unwrap_or(0);
-        speed.ticks_per_second = SPEED_STEPS[(cur + 1) % SPEED_STEPS.len()];
+            .unwrap_or(SPEED_DEFAULT_IDX);
+        let next = if inc {
+            (cur + 1).min(SPEED_STEPS.len() - 1)
+        } else {
+            cur.saturating_sub(1)
+        };
+        speed.ticks_per_second = SPEED_STEPS[next];
     }
     if let Ok(mut text) = label.single_mut() {
         let want = speed_label(speed.ticks_per_second);
@@ -1019,15 +1074,21 @@ fn pick_selection(
     };
     let window = windows.single().ok();
 
-    // A click/tap on the top-right button column (pause + overlay toggles) must not
-    // be read as an empty map hit (which would clear the selection). Skip those.
+    // A click/tap on the top-right controls (the wide transport bar on the top row, or
+    // the narrower toggle column below it) must not be read as an empty map hit (which
+    // would clear the selection). Skip those two zones.
     let over_buttons = |p: Vec2| {
         window.is_some_and(|w| {
-            let left = w.width() - PAUSE_BTN_MARGIN - PAUSE_BTN_W;
-            p.x >= left
-                && p.x <= w.width() - PAUSE_BTN_MARGIN
+            let right = w.width() - PAUSE_BTN_MARGIN;
+            let bar = p.x >= right - XPORT_BAR_W
+                && p.x <= right
                 && p.y >= PAUSE_BTN_MARGIN
-                && p.y <= BTN_COLUMN_BOTTOM
+                && p.y <= PAUSE_BTN_MARGIN + PAUSE_BTN_H;
+            let column = p.x >= right - PAUSE_BTN_W
+                && p.x <= right
+                && p.y >= VALUE_BTN_TOP
+                && p.y <= BTN_COLUMN_BOTTOM;
+            bar || column
         })
     };
 

@@ -205,8 +205,9 @@ design. Newest first within each section.
 - **NOW**: the sim is **decoupled from real time**. Every system advances the world by
   exactly one `economy::TICK_DT` (fixed); a `SimSchedule` holds the whole sim and
   `run_sim_ticks` drives it many times per rendered frame, banking `ticks/sec · frame_dt`
-  ticks (capped to avoid a death-spiral). A `SimSpeed` resource + on-screen **Speed**
-  button cycle the tick rate, so the sim can run far faster than the wall clock while
+  ticks (capped to avoid a death-spiral). A `SimSpeed` resource + an on-screen
+  **transport bar** (`[<<] [Play/Pause] [>>]` with a `x.x ticks/s` readout; `,`/`.`
+  keys too) step the tick rate, so the sim can run far faster than the wall clock while
   the render loop stays at the browser's frame rate. All controllers/stats are
   denominated **per tick** (rates, and the PID/income windows counted in ticks) so the
   numbers are identical at any speed. The headless harness runs the same schedule
