@@ -38,12 +38,16 @@ cargo clippy --target wasm32-unknown-unknown
   extras, never the only way to reach a feature. The camera fits the map to the
   screen on launch; gameplay input stays limited to pan / pinch-zoom / pause / tap.
   Design and reason about touch ergonomics before desktop.
-- **No external crates beyond Bevy** (plus `web-sys`/`js-sys` on wasm, and
-  `serde`+`ron` for the save system — both already in Bevy's tree, so no real bundle
-  cost). The PRNG is hand-rolled (`rng.rs`, SplitMix64) to keep the bundle small and
-  worldgen reproducible from a single seed. Don't reach for `rand` etc. The rule's
-  intent is bundle size / dependency hygiene: a crate already compiled by Bevy is
-  fair game; a genuinely new one needs a reason.
+- **Dependencies: weigh effort vs. reward.** This ships as wasm to a phone, so the
+  bias is toward a small bundle and few deps — but a crate is fine when it clearly
+  earns its place. Guidelines:
+  - **Don't add a dep for something simple.** Hand-roll the small stuff: the PRNG is
+    SplitMix64 in `rng.rs` (also keeps worldgen reproducible from one seed) — don't
+    reach for `rand`; icons are drawn procedurally in `icon.rs`, not an image crate.
+  - **A crate already in Bevy's tree is nearly free** (no real bundle/compile cost) —
+    prefer those. `serde`+`ron` (save system) are already pulled in by Bevy.
+  - **A genuinely new dep needs a reason**: significant effort saved or correctness
+    gained, weighed against bundle size on mobile. When in doubt, ask.
 - **Comments explain *why*, not *what*** — hidden constraints, invariants,
   short-circuit-order assumptions. Skip narration of obvious code. No emojis.
 - Currency is rendered with `₦`. The UI text uses an **embedded** font
