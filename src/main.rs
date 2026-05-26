@@ -82,6 +82,9 @@ const GRAPH_CELL_ON: Color = Color::srgba(0.20, 0.28, 0.40, 0.95);
 const BTN_OFF: Color = Color::srgba(0.12, 0.12, 0.12, 0.85);
 const VALUE_BTN_ON: Color = Color::srgba(0.62, 0.22, 0.16, 0.9);
 const TERRAIN_BTN_ON: Color = Color::srgba(0.20, 0.45, 0.30, 0.9);
+/// Confirmation tint + how long (real seconds) the Save button flashes after a save.
+const SAVE_FLASH_COLOR: Color = Color::srgba(0.20, 0.55, 0.30, 0.95);
+const SAVE_FLASH_SECS: f32 = 1.0;
 
 /// How long after launch the camera keeps re-fitting the map, so the wasm canvas
 /// (which resizes to its parent post-launch) settles before zoom is left to the user.
@@ -175,6 +178,9 @@ struct NewWorldButton;
 /// Snapshots the full game state to localStorage (touch equivalent of the S key).
 #[derive(Component)]
 struct SaveButton;
+/// Caption on the Save button; briefly flips to "Saved!" after a save fires.
+#[derive(Component)]
+struct SaveLabel;
 /// Transport buttons: step the simulation speed down / up through `SPEED_STEPS`.
 #[derive(Component)]
 struct SpeedDownButton;
@@ -805,7 +811,36 @@ fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) 
     // Overlay toggles, stacked under the transport bar (same touch-target size).
     spawn_overlay_button(commands, font, "Crowd", VALUE_BTN_TOP, ValueButton);
     spawn_overlay_button(commands, font, "Terrain", TERRAIN_BTN_TOP, TerrainButton);
-    spawn_overlay_button(commands, font, "Save", SAVE_BTN_TOP, SaveButton);
+    // Save button spawned manually (not via the helper) so its caption carries a
+    // `SaveLabel` marker — `save_game` flips it to "Saved!" as save confirmation.
+    commands
+        .spawn((
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(PAUSE_BTN_MARGIN),
+                top: Val::Px(SAVE_BTN_TOP),
+                width: Val::Px(PAUSE_BTN_W),
+                height: Val::Px(PAUSE_BTN_H),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(BTN_OFF),
+            SaveButton,
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new("Save"),
+                TextFont {
+                    font: font.clone(),
+                    font_size: 16.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+                SaveLabel,
+            ));
+        });
     spawn_overlay_button(commands, font, "New", NEW_BTN_TOP, NewWorldButton);
     spawn_overlay_button(commands, font, "Graphs", GRAPHS_BTN_TOP, GraphsButton);
 
@@ -1524,6 +1559,7 @@ fn pick_selection(
 /// stats, policy, and every noot) to localStorage so a later reload can resume it.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn save_game(
+    time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     button: Query<&Interaction, (Changed<Interaction>, With<SaveButton>)>,
     sim: Res<Sim>,
@@ -1541,32 +1577,50 @@ fn save_game(
         &NootMeta,
         &PolicyMemory,
     )>,
+    mut flash: Local<f32>,
+    mut bg: Query<&mut BackgroundColor, With<SaveButton>>,
+    mut label: Query<&mut Text, With<SaveLabel>>,
 ) {
-    if !(keys.just_pressed(KeyCode::KeyS) || button.iter().any(|i| *i == Interaction::Pressed)) {
-        return;
+    if keys.just_pressed(KeyCode::KeyS) || button.iter().any(|i| *i == Interaction::Pressed) {
+        let noot_saves = noots
+            .iter()
+            .map(|(pos, inv, wal, hun, claim, trader, meta, mem)| save::NootSave {
+                pos: *pos,
+                inv: inv.clone(),
+                wallet: wal.clone(),
+                hunger: hun.clone(),
+                claim: claim.clone(),
+                trader: trader.clone(),
+                meta: meta.clone(),
+                explore: mem.explore,
+            })
+            .collect();
+        save::store(&save::Snapshot {
+            version: save::SAVE_VERSION,
+            world: sim.0.clone(),
+            hunger: hunger.clone(),
+            income: income.clone(),
+            stats: stats.clone(),
+            policy: policy.clone(),
+            noots: noot_saves,
+        });
+        *flash = SAVE_FLASH_SECS;
     }
-    let noot_saves = noots
-        .iter()
-        .map(|(pos, inv, wal, hun, claim, trader, meta, mem)| save::NootSave {
-            pos: *pos,
-            inv: inv.clone(),
-            wallet: wal.clone(),
-            hunger: hun.clone(),
-            claim: claim.clone(),
-            trader: trader.clone(),
-            meta: meta.clone(),
-            explore: mem.explore,
-        })
-        .collect();
-    save::store(&save::Snapshot {
-        version: save::SAVE_VERSION,
-        world: sim.0.clone(),
-        hunger: hunger.clone(),
-        income: income.clone(),
-        stats: stats.clone(),
-        policy: policy.clone(),
-        noots: noot_saves,
-    });
+
+    // Drive the "Saved!" confirmation: green tint + caption while the flash runs down.
+    if *flash > 0.0 {
+        *flash -= time.delta_secs();
+        let active = *flash > 0.0;
+        if let Ok(mut bg) = bg.single_mut() {
+            bg.0 = if active { SAVE_FLASH_COLOR } else { BTN_OFF };
+        }
+        if let Ok(mut text) = label.single_mut() {
+            let want = if active { "Saved!" } else { "Save" };
+            if text.0 != want {
+                text.0 = want.into();
+            }
+        }
+    }
 }
 
 /// G key or the "New" button: clear the saved snapshot and reload, starting a fresh
