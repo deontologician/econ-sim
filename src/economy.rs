@@ -11,9 +11,24 @@
 use bevy::prelude::*;
 
 use crate::goods::{self, form_of, GoodForm, ItemRole, N_ITEMS};
+use crate::hex::neighbors;
 use crate::noot::*;
-use crate::Sim;
+use crate::world::terrain_factor;
+use crate::policy::{self, ActorCritic, PolicyMemory, Trainer, Transition, N_ACT, N_OTHER};
+use crate::{Sim, SimRng};
 use serde::{Deserialize, Serialize};
+
+/// Decision/step cadence: a noot picks a new action (and, if Move, steps one hex)
+/// this often, scaled faster on easy terrain. This is the MDP timestep.
+pub const BASE_STEP_TIME: f32 = 0.35;
+/// Maslow utility weights (physiological ≫ safety ≫ esteem) and tier normalizers.
+const W_PHYS: f32 = 1.0;
+const W_SAFE: f32 = 0.6;
+const W_ESTEEM: f32 = 0.4;
+const SAFETY_BUCKS: f32 = 60.0;
+const ESTEEM_NORM: f32 = 4.0;
+/// Reward penalty applied to the transition that ends in starvation death.
+const DEATH_PENALTY: f32 = 2.0;
 
 // Production rates.
 pub const WORK_RATE: f32 = 3.0;
@@ -64,10 +79,6 @@ const POSITIONAL_VALUE: f32 = 40.0; // first-unit WTP, then /(1+held)
 const POSITIONAL_SELL_URGENCY: f32 = 0.9;
 
 const TRADE_RADIUS_FACTOR: f32 = 1.7; // × hex_size
-
-/// Selling income is scaled to roughly staple-welfare magnitude before it feeds
-/// the movement reward, so a sale and a meal pull the value field comparably.
-const SELL_REWARD_SCALE: f32 = 0.15;
 
 // --- Surplus discounting (the merchant arbitrage spread) --------------------
 // These three are the main levers on whether merchants can profit: the discount
@@ -292,33 +303,181 @@ pub fn hunger_tick(time: Res<Time>, ctrl: Res<HungerControl>, mut q: Query<&mut 
     }
 }
 
-/// Pick each noot's single action for this tick — the seam for a future learned
-/// rollout. Mining and refining compete for the tick (never both): a noot mines
-/// when it can (a claim underfoot with carry room), otherwise the *claimless*
-/// refine intermediates they hold. So producers don't refine their own output for
-/// free — refining is left to those who can't mine, who buy raw intermediates.
-pub fn choose_action(sim: Res<Sim>, mut q: Query<(&Claim, &TilePos, &Inventory, &mut Action)>) {
-    let world = &sim.0;
-    for (claim, pos, inv, mut action) in &mut q {
-        let can_mine = claim.deposit.is_some_and(|d| {
-            let dep = &world.deposits[d];
-            let t = &world.tiles[dep.tile];
-            t.col == pos.col
-                && t.row == pos.row
-                && inv.items[goods::item_index(dep.element_slot, GoodForm::Raw)] < CARRY_CAP
+/// Maslow-tiered utility over the game's concepts: physiological (fed) ≫ safety
+/// (food buffer + savings) ≫ esteem (positional wealth). Higher tiers only count
+/// once lower ones are satisfied, so the policy learns the hierarchy. Reward = ΔU.
+pub fn maslow_utility(hunger: &Hunger, inv: &Inventory, wallet: &Wallet, goods: &goods::WorldGoods) -> f32 {
+    let phys = hunger.utility() / N_STAPLES as f32; // ∈[0,1]
+    let min_food = (0..N_ITEMS)
+        .filter_map(|i| match goods.role_of(i) {
+            ItemRole::Staple(_) => Some(inv.items[i]),
+            _ => None,
+        })
+        .fold(f32::MAX, f32::min);
+    let min_food = if min_food.is_finite() { min_food } else { 0.0 };
+    let safety = 0.5 * (min_food / FOOD_RESERVE).clamp(0.0, 1.0)
+        + 0.5 * (wallet.bucks / SAFETY_BUCKS).clamp(0.0, 1.0);
+    let esteem = positional_utility(goods, inv); // Σ ln(1+held)
+    let gate = |x: f32| ((x - 0.5) / 0.4).clamp(0.0, 1.0);
+    W_PHYS * phys + W_SAFE * gate(phys) * safety + W_ESTEEM * gate(phys) * gate(safety) * esteem
+}
+
+/// Build the policy's non-positional feature vector and the tile index.
+fn features(world: &crate::world::World, pos_idx: usize, hunger: &Hunger, inv: &Inventory, wallet: &Wallet, owns: bool) -> (usize, [f32; N_OTHER]) {
+    let o = [
+        (wallet.bucks / 100.0).tanh(),
+        hunger.staple[0] / STAPLE_SATIATION,
+        hunger.staple[1] / STAPLE_SATIATION,
+        positional_utility(&world.goods, inv) / ESTEEM_NORM,
+        if owns { 1.0 } else { 0.0 },
+        1.0, // bias
+    ];
+    (pos_idx, o)
+}
+
+/// Which actions are valid in the current state. Move and Trade are always allowed
+/// (Trade simply won't clear with no counterparty); Mine/Refine match the gates in
+/// `extract`/`refine`.
+fn action_mask(world: &crate::world::World, claim: &Claim, pos: &TilePos, inv: &Inventory) -> [bool; N_ACT] {
+    let can_mine = claim.deposit.is_some_and(|d| {
+        let dep = &world.deposits[d];
+        let t = &world.tiles[dep.tile];
+        t.col == pos.col
+            && t.row == pos.row
+            && inv.items[goods::item_index(dep.element_slot, GoodForm::Raw)] < CARRY_CAP
+    });
+    let can_refine = claim.deposit.is_none()
+        && (0..N_ITEMS).any(|i| {
+            matches!(world.goods.role_of(i), ItemRole::Intermediate) && inv.items[i] > 0.0
         });
-        let refines = claim.deposit.is_none()
-            && (0..N_ITEMS).any(|i| {
-                matches!(world.goods.role_of(i), ItemRole::Intermediate) && inv.items[i] > 0.0
+    let mut mask = [false; N_ACT];
+    mask[policy::A_MOVE] = true;
+    mask[policy::A_MINE] = can_mine;
+    mask[policy::A_REFINE] = can_refine;
+    mask[policy::A_TRADE] = true;
+    mask
+}
+
+/// The learned decision step (replaces the heuristic). Once per noot per cadence:
+/// observe the reward since the last decision, record the transition, pick a new
+/// action from the shared policy, and — if Move — step toward the best-valued
+/// neighbour hex. Between decisions the chosen action persists and the extract/
+/// refine/trade systems apply it each frame.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub fn policy_step(
+    time: Res<Time>,
+    sim: Res<Sim>,
+    ac: Res<ActorCritic>,
+    mut trainer: ResMut<Trainer>,
+    mut rng: ResMut<SimRng>,
+    mut q: Query<(
+        &mut TilePos,
+        &Claim,
+        &Inventory,
+        &Hunger,
+        &Wallet,
+        &mut Action,
+        &mut PolicyMemory,
+    )>,
+) {
+    let world = &sim.0;
+    let dt = time.delta_secs();
+    for (mut pos, claim, inv, hunger, wallet, mut action, mut mem) in &mut q {
+        mem.cooldown -= dt;
+        if mem.cooldown > 0.0 && !mem.died {
+            continue;
+        }
+        let owns = claim.deposit.is_some();
+        let pos_idx = (pos.row * world.cols + pos.col) as usize;
+        let (s_pos, s_o) = features(world, pos_idx, hunger, inv, wallet, owns);
+        let mask = action_mask(world, claim, &pos, inv);
+        let u_now = maslow_utility(hunger, inv, wallet, &world.goods);
+
+        // Close out the previous transition (reward = ΔU, or a death penalty).
+        if mem.has_prev {
+            let (r, done) = if mem.died {
+                (-DEATH_PENALTY, true)
+            } else {
+                (u_now - mem.last_u, false)
+            };
+            trainer.record(Transition {
+                pos: mem.last_pos,
+                o: mem.last_o,
+                mask: mem.last_mask,
+                act: mem.last_act,
+                r,
+                pos2: s_pos,
+                o2: s_o,
+                done,
             });
-        *action = if can_mine {
-            Action::Mine
-        } else if refines {
-            Action::Refine
-        } else {
-            Action::Move
+        }
+        mem.died = false;
+
+        // Choose the next action from the shared policy (masked softmax).
+        let logits = ac.logits(s_pos, &s_o);
+        let probs = policy::masked_softmax(&logits, &mask);
+        let act = policy::sample(&probs, &mut rng.0);
+        *action = match act {
+            policy::A_MINE => Action::Mine,
+            policy::A_REFINE => Action::Refine,
+            policy::A_TRADE => Action::Trade,
+            _ => Action::Move,
         };
+
+        // Move resolves direction via the critic's value over neighbour positions.
+        if act == policy::A_MOVE {
+            let (nc, nr) = best_move(world, &ac, &s_o, pos.col, pos.row, mem.explore, &mut rng.0);
+            pos.col = nc;
+            pos.row = nr;
+        }
+
+        // Cache this state/action for the next transition.
+        mem.last_pos = s_pos;
+        mem.last_o = s_o;
+        mem.last_mask = mask;
+        mem.last_act = act;
+        mem.last_u = u_now;
+        mem.has_prev = true;
+        let tf = terrain_factor(world.tiles[pos_idx].difficulty);
+        mem.cooldown = BASE_STEP_TIME / tf;
     }
+}
+
+/// Pick the neighbour hex with the highest critic value (ε-greedy via `explore`).
+fn best_move(
+    world: &crate::world::World,
+    ac: &ActorCritic,
+    o: &[f32; N_OTHER],
+    col: i32,
+    row: i32,
+    explore: f32,
+    rng: &mut crate::rng::Rng,
+) -> (i32, i32) {
+    let inb: Vec<(i32, i32)> = neighbors(col, row)
+        .into_iter()
+        .filter(|&(c, r)| c >= 0 && r >= 0 && c < world.cols && r < world.rows)
+        .collect();
+    if inb.is_empty() {
+        return (col, row);
+    }
+    if rng.chance(explore) {
+        return inb[rng.below(inb.len())];
+    }
+    let mut best = inb[0];
+    let mut best_v = f32::MIN;
+    for (c, r) in inb {
+        let v = ac.value((r * world.cols + c) as usize, o);
+        if v > best_v {
+            best_v = v;
+            best = (c, r);
+        }
+    }
+    best
+}
+
+/// One A2C minibatch update on the shared policy each frame (warms up first).
+pub fn train_policy(mut ac: ResMut<ActorCritic>, mut trainer: ResMut<Trainer>, mut rng: ResMut<SimRng>) {
+    trainer.train(&mut ac, &mut rng.0);
 }
 
 pub fn extract(
@@ -409,13 +568,12 @@ pub fn refine(
 pub fn consume(
     sim: Res<Sim>,
     mut stats: ResMut<EconStats>,
-    mut q: Query<(&mut Inventory, &mut Hunger, &mut RouteMemory)>,
+    mut q: Query<(&mut Inventory, &mut Hunger)>,
 ) {
     let dt_goods = &sim.0.goods;
     let mut eaten = 0.0f32;
     let mut utility_gained = 0.0f32;
-    for (mut inv, mut hunger, mut mem) in &mut q {
-        let mut reward = 0.0f32;
+    for (mut inv, mut hunger) in &mut q {
         // Staples first (satisficing: eat only to satiation, surplus unused).
         // Positional goods are *durable* — they're held as wealth (welfare from
         // the holding, see `positional_utility`) and sold by choice, never eaten.
@@ -427,13 +585,11 @@ pub fn consume(
                     inv.items[item] -= eat;
                     hunger.staple[sub] = (hunger.staple[sub] - eat * EAT_VALUE).max(0.0);
                     eaten += eat;
-                    // Welfare from no longer being hungry.
-                    reward += (eat * EAT_VALUE) / STAPLE_SATIATION;
+                    // Welfare (also feeds the policy reward via the utility delta).
+                    utility_gained += (eat * EAT_VALUE) / STAPLE_SATIATION;
                 }
             }
         }
-        mem.pending_reward += reward;
-        utility_gained += reward;
     }
     stats.consumed_window += eaten;
     stats.consumed_total += eaten as f64;
@@ -457,6 +613,9 @@ struct Snap {
     bucks: f32,
     hunger: [f32; N_STAPLES],
     satisfied: bool,
+    /// Whether this noot chose the Trade action this step (a trade clears if at
+    /// least one party is trading).
+    trading: bool,
     /// Learned discount on anticipated resale value, and average price paid per
     /// held item (the floor a noot will resell at).
     discount: f32,
@@ -579,7 +738,7 @@ pub fn meet_and_trade(
         &mut Inventory,
         &mut Wallet,
         &Hunger,
-        &mut RouteMemory,
+        &Action,
         &mut Trader,
         &mut NootMeta,
     )>,
@@ -590,13 +749,14 @@ pub fn meet_and_trade(
     // Snapshot (immutable read) so we can reason about pairs without aliasing.
     let mut snaps: Vec<Snap> = q
         .iter()
-        .map(|(e, t, inv, wal, hunger, _route, trader, _meta)| Snap {
+        .map(|(e, t, inv, wal, hunger, action, trader, _meta)| Snap {
             e,
             pos: t.translation.truncate(),
             inv: inv.items,
             bucks: wal.bucks,
             hunger: hunger.staple,
             satisfied: hunger.satisfied(),
+            trading: *action == Action::Trade,
             discount: trader.discount,
             cost_basis: trader.cost_basis,
         })
@@ -606,6 +766,10 @@ pub fn meet_and_trade(
 
     for i in 0..snaps.len() {
         for j in (i + 1)..snaps.len() {
+            // A trade needs at least one willing trader and proximity.
+            if !(snaps[i].trading || snaps[j].trading) {
+                continue;
+            }
             if snaps[i].pos.distance_squared(snaps[j].pos) > radius2 {
                 continue;
             }
@@ -655,17 +819,11 @@ pub fn meet_and_trade(
 
     // Apply to the ECS, one entity borrow at a time.
     for tx in txs {
-        let base = base_ask(goods, tx.item);
-
-        // Buyer side: bank the "good deal" (a discounted view of resale headroom)
-        // where it was found, average in the cost, and grow more cautious.
-        if let Ok((_, _, mut inv, mut wal, _, mut route, mut trader, mut meta)) =
-            q.get_mut(tx.buyer)
-        {
+        // Buyer side: average in the cost basis and grow more cautious.
+        if let Ok((_, _, mut inv, mut wal, _, _, mut trader, mut meta)) = q.get_mut(tx.buyer) {
             let held_before = inv.items[tx.item];
             inv.items[tx.item] += 1.0;
             wal.bucks -= tx.price;
-            route.pending_reward += SELL_REWARD_SCALE * trader.discount * (base - tx.price).max(0.0);
             let total = trader.cost_basis[tx.item] * held_before + tx.price;
             trader.cost_basis[tx.item] = total / (held_before + 1.0);
             trader.discount = (trader.discount - DISCOUNT_LR * (trader.discount - DISCOUNT_MIN))
@@ -673,15 +831,11 @@ pub fn meet_and_trade(
             meta.transactions += 1;
         }
 
-        // Seller side: reward the realized margin (≈ income for a producer with
-        // near-zero cost, the spread for a flipper), and let success breed optimism.
-        if let Ok((_, _, mut inv, mut wal, _, mut route, mut trader, mut meta)) =
-            q.get_mut(tx.seller)
-        {
+        // Seller side: realized margin grows trade optimism; tally the profit stat.
+        if let Ok((_, _, mut inv, mut wal, _, _, mut trader, mut meta)) = q.get_mut(tx.seller) {
             inv.items[tx.item] -= 1.0;
             wal.bucks += tx.price;
             let margin = tx.price - trader.cost_basis[tx.item];
-            route.pending_reward += SELL_REWARD_SCALE * margin;
             if margin > 0.0 {
                 trader.discount = (trader.discount + DISCOUNT_LR * (DISCOUNT_MAX - trader.discount))
                     .min(DISCOUNT_MAX);

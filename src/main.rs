@@ -5,6 +5,7 @@ mod hex;
 mod icon;
 mod movement;
 mod noot;
+mod policy;
 mod rng;
 mod save;
 mod world;
@@ -18,9 +19,10 @@ use economy::{EconStats, HungerControl};
 use goods::{GoodCategory, GoodForm};
 use movement::tile_to_pixel;
 use noot::{
-    Action, Claim, Hunger, Inventory, Noot, NootMeta, RouteMemory, TilePos, Trader, Wallet,
-    EXPLORE_MAX, EXPLORE_MIN, STARTING_BUCKS,
+    Action, Claim, Hunger, Inventory, Noot, NootMeta, TilePos, Trader, Wallet, EXPLORE_MAX,
+    EXPLORE_MIN, STARTING_BUCKS,
 };
+use policy::{ActorCritic, PolicyMemory, Trainer};
 use rng::Rng;
 use world::{generate, ResourceRole, World};
 
@@ -225,6 +227,7 @@ fn main() {
         .init_resource::<Overlays>()
         .init_resource::<NootColoring>()
         .init_resource::<economy::IncomeControl>()
+        .init_resource::<Trainer>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -244,14 +247,20 @@ fn main() {
                     .run_if(sim_running),
                 (
                     movement::movement,
-                    economy::choose_action,
+                    economy::policy_step,
                     economy::claim_deposits,
                     economy::extract,
                     economy::refine,
                     economy::meet_and_trade,
                 )
                     .run_if(sim_running),
-                (economy::consume, death_and_respawn, economy::update_rates).run_if(sim_running),
+                (
+                    economy::consume,
+                    death_and_respawn,
+                    economy::update_rates,
+                    economy::train_policy,
+                )
+                    .run_if(sim_running),
                 (
                     pick_selection,
                     touch_camera,
@@ -324,19 +333,19 @@ fn setup(
     // Resume a saved run (full state) if one exists; otherwise roll a fresh world.
     // The saved controllers/stats override the defaults here; on a fresh start the
     // hunger PID gets a population-based target (and Income/EconStats keep defaults).
-    let (world, restore_noots) = match save::load() {
+    let (world, restore_noots, restore_policy) = match save::load() {
         Some(snap) => {
             commands.insert_resource(snap.hunger);
             commands.insert_resource(snap.income);
             commands.insert_resource(snap.stats);
-            (snap.world, Some(snap.noots))
+            (snap.world, Some(snap.noots), Some(snap.policy))
         }
         None => {
             let world = generate(random_seed(), COLS, ROWS, HEX_SIZE);
             commands.insert_resource(HungerControl::new(
                 economy::TARGET_DEATH_FRAC_PER_MIN * N_NOOTS as f32,
             ));
-            (world, None)
+            (world, None, None)
         }
     };
     let hex_size = world.hex_size;
@@ -459,6 +468,14 @@ fn setup(
     // Each noot owns a unique material so `update_noot_color` can tint it alone.
     let mut sim_rng = Rng::new(world.seed ^ 0xA5A5_5A5A);
     let noot_mesh = meshes.add(Circle::new(hex_size * 0.28));
+
+    // Shared actor-critic brain: reuse the saved one if it fits this map, else fresh.
+    let policy = match restore_policy {
+        Some(p) if p.n_tiles == n_tiles => p,
+        _ => ActorCritic::new(n_tiles, &mut sim_rng),
+    };
+    commands.insert_resource(policy);
+
     match restore_noots {
         // Resume: respawn every saved noot with its components and learned field.
         Some(noots) => {
@@ -491,7 +508,6 @@ fn setup(
                     None,
                     col,
                     row,
-                    n_tiles,
                     tile_to_pixel(col, row, hex_size, offset),
                 );
             }
@@ -504,8 +520,8 @@ fn setup(
     commands.insert_resource(Sim(world));
 }
 
-/// Respawn a noot from a save: its saved components plus a `RouteMemory` rebuilt
-/// from the persisted value field.
+/// Respawn a noot from a save: its saved components plus a fresh `PolicyMemory`
+/// (transient RL cache) carrying the saved exploration ε.
 fn spawn_restored_noot(
     commands: &mut Commands,
     mesh: Handle<Mesh>,
@@ -513,7 +529,6 @@ fn spawn_restored_noot(
     ns: save::NootSave,
     pixel: Vec2,
 ) {
-    let mem = RouteMemory::restored(ns.value, ns.homing, ns.explore);
     commands.spawn((
         Mesh2d(mesh),
         MeshMaterial2d(material),
@@ -527,7 +542,7 @@ fn spawn_restored_noot(
         ns.inv,
         ns.wallet,
         ns.hunger,
-        mem,
+        PolicyMemory::new(ns.explore),
     ));
 }
 
@@ -547,11 +562,8 @@ fn spawn_noot(
     claim: Option<usize>,
     col: i32,
     row: i32,
-    n_tiles: usize,
     pixel: Vec2,
 ) {
-    // A pre-claimed noot starts homed to its deposit so it mines a first load.
-    let homing = claim.is_some();
     commands.spawn((
         Mesh2d(mesh),
         MeshMaterial2d(material),
@@ -567,7 +579,7 @@ fn spawn_noot(
             bucks: STARTING_BUCKS,
         },
         Hunger::fresh(rng),
-        RouteMemory::new(n_tiles, homing, rng.range(EXPLORE_MIN, EXPLORE_MAX)),
+        PolicyMemory::new(rng.range(EXPLORE_MIN, EXPLORE_MAX)),
     ));
 }
 
@@ -804,7 +816,7 @@ fn death_and_respawn(
         &mut Hunger,
         &mut Inventory,
         &mut Wallet,
-        &mut RouteMemory,
+        &mut PolicyMemory,
         &mut Trader,
         &mut NootMeta,
         &mut Claim,
@@ -814,7 +826,6 @@ fn death_and_respawn(
 ) {
     let dt = time.delta_secs();
     let world = &sim.0;
-    let n_tiles = (world.cols * world.rows) as usize;
     for (mut hunger, mut inv, mut wallet, mut mem, mut trader, mut meta, mut claim, mut pos, mut tf) in
         &mut q
     {
@@ -831,11 +842,15 @@ fn death_and_respawn(
         ctrl.deaths_since_update += 1;
 
         // Reincarnate a fresh, unclaimed noot at a random tile with the starting
-        // wallet, and draw a new temperament.
+        // wallet, and draw a new temperament. The policy keeps its cached pre-death
+        // (state, action) and a `died` flag so `policy_step` banks one terminal
+        // transition (reward = −DEATH, done) before starting the new episode.
         *inv = Inventory::new();
         wallet.bucks = STARTING_BUCKS;
         *hunger = Hunger::fresh(&mut rng.0);
-        *mem = RouteMemory::new(n_tiles, false, rng.0.range(EXPLORE_MIN, EXPLORE_MAX));
+        mem.died = true;
+        mem.explore = rng.0.range(EXPLORE_MIN, EXPLORE_MAX);
+        mem.cooldown = 0.0;
         *trader = Trader::new();
         *meta = NootMeta::new();
         claim.deposit = None;
@@ -1046,8 +1061,8 @@ fn pick_selection(
 }
 
 /// S key or the "Save" button: snapshot the full game state (world, controllers,
-/// stats, and every noot) to localStorage so a later reload can resume it.
-#[allow(clippy::type_complexity)]
+/// stats, policy, and every noot) to localStorage so a later reload can resume it.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn save_game(
     keys: Res<ButtonInput<KeyCode>>,
     button: Query<&Interaction, (Changed<Interaction>, With<SaveButton>)>,
@@ -1055,6 +1070,7 @@ fn save_game(
     hunger: Res<HungerControl>,
     income: Res<economy::IncomeControl>,
     stats: Res<EconStats>,
+    policy: Res<ActorCritic>,
     noots: Query<(
         &TilePos,
         &Inventory,
@@ -1063,7 +1079,7 @@ fn save_game(
         &Claim,
         &Trader,
         &NootMeta,
-        &RouteMemory,
+        &PolicyMemory,
     )>,
 ) {
     if !(keys.just_pressed(KeyCode::KeyS) || button.iter().any(|i| *i == Interaction::Pressed)) {
@@ -1080,8 +1096,6 @@ fn save_game(
             trader: trader.clone(),
             meta: meta.clone(),
             explore: mem.explore,
-            homing: mem.homing,
-            value: mem.value.clone(),
         })
         .collect();
     save::store(&save::Snapshot {
@@ -1090,6 +1104,7 @@ fn save_game(
         hunger: hunger.clone(),
         income: income.clone(),
         stats: stats.clone(),
+        policy: policy.clone(),
         noots: noot_saves,
     });
 }
@@ -1229,19 +1244,20 @@ fn rank_color(t: f32) -> Color {
     Color::srgb(1.0 - 0.8 * t, 1.0 - 0.7 * t, 1.0 - 0.05 * t)
 }
 
-/// Recolour the value-heat cells from the summed per-hex value across all noots,
-/// normalized to the busiest hex (red = most valued). Throttled — the field drifts
-/// slowly and recolouring every cell each frame would be wasteful.
+/// Recolour the value-heat cells from the shared critic's value over each tile
+/// (red = most valued), normalized across the map. Uses a neutral, hungry-and-broke
+/// feature snapshot so the surface highlights where the policy expects to do well.
+/// Throttled — the net drifts slowly and recolouring every cell each frame is wasteful.
 fn update_value_overlay(
     time: Res<Time>,
     overlays: Res<Overlays>,
     sim: Res<Sim>,
+    policy: Res<ActorCritic>,
     mut timer: Local<f32>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    mems: Query<&RouteMemory, With<Noot>>,
     cells: Query<(&ValueOverlay, &MeshMaterial2d<ColorMaterial>)>,
 ) {
-    if !overlays.value {
+    if !overlays.value || policy.n_tiles == 0 {
         return;
     }
     *timer += time.delta_secs();
@@ -1251,20 +1267,19 @@ fn update_value_overlay(
     *timer = 0.0;
 
     let n = (sim.0.cols * sim.0.rows) as usize;
+    let probe = [0.0, 1.0, 1.0, 0.0, 0.0, 1.0]; // hungry, broke, no claim, bias
     let mut agg = vec![0.0f32; n];
-    for mem in &mems {
-        for (t, a) in agg.iter_mut().enumerate() {
-            *a += mem.value[t].max(0.0);
-        }
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for (t, a) in agg.iter_mut().enumerate() {
+        let v = policy.value(t, &probe);
+        *a = v;
+        lo = lo.min(v);
+        hi = hi.max(v);
     }
-    let max = agg.iter().copied().fold(0.0f32, f32::max);
+    let span = (hi - lo).max(1e-3);
     for (cell, mat) in &cells {
         if let Some(m) = materials.get_mut(&mat.0) {
-            let v = if max > 0.0 {
-                (agg[cell.tile] / max).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
+            let v = ((agg[cell.tile] - lo) / span).clamp(0.0, 1.0);
             m.color = Color::srgba(1.0, 0.12, 0.04, v * 0.85);
         }
     }
@@ -1331,6 +1346,7 @@ fn update_selection_ring(
 }
 
 /// Fill the bottom panel with the selected noot's details.
+#[allow(clippy::type_complexity)]
 fn update_selection_panel(
     selection: Res<Selection>,
     sim: Res<Sim>,
@@ -1340,8 +1356,9 @@ fn update_selection_panel(
         &Wallet,
         &Hunger,
         &Inventory,
-        &RouteMemory,
+        &PolicyMemory,
         &NootMeta,
+        &Action,
     )>,
     mut panel: Query<&mut Text, With<SelectionText>>,
 ) {
@@ -1353,7 +1370,7 @@ fn update_selection_panel(
         text.0 = stale.into();
         return;
     };
-    let Ok((claim, trader, wallet, hunger, inv, mem, meta)) = noots.get(entity) else {
+    let Ok((claim, trader, wallet, hunger, inv, mem, meta, action)) = noots.get(entity) else {
         text.0 = stale.into();
         return;
     };
@@ -1366,11 +1383,18 @@ fn update_selection_panel(
         }
         None => "unclaimed".to_string(),
     };
+    let act = match action {
+        Action::Move => "move",
+        Action::Mine => "mine",
+        Action::Refine => "refine",
+        Action::Trade => "trade",
+    };
 
-    let utility = hunger.utility() + economy::positional_utility(&world.goods, inv);
+    let utility = economy::maslow_utility(hunger, inv, wallet, &world.goods);
     let mut out = format!(
-        "[selected] noot — {}   skill {:.2}×   discount {:.2}   explore {:.2}   ₦{:.0}   hunger {:.1}   utility {:.2}\n",
+        "[selected] noot — {}   action {}   skill {:.2}×   discount {:.2}   explore {:.2}   ₦{:.0}   hunger {:.1}   utility {:.2}\n",
         claim_label,
+        act,
         economy::skill_factor(meta.experience),
         trader.discount,
         mem.explore,

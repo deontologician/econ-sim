@@ -105,18 +105,18 @@ design. Newest first within each section.
 
 ## Agents (noots)
 
-### Action selection (rollout seam)
-- **NOW**: each tick a noot has one `Action` (`Move`/`Mine`/`Refine`), set by a
-  heuristic `choose_action`: mine if a claimed deposit is underfoot with carry room,
-  else refine if it's claimless and holding intermediates, else move. Mining and
-  refining are mutually exclusive per tick, so producers don't refine their own
-  output for free — raw intermediates are sold and the claimless specialize as
-  refiners. *(stub)*
-- **INTENDED**: a learned **action rollout** — a policy scoring the full action set
-  (mine / refine / trade / move, and their parameters) from the noot's state, with
-  movement and trade also gated by the chosen action. `choose_action` is the seam
-  the policy slots into.
-- **STATUS**: stub
+### Action selection (learned actor-critic)
+- **NOW**: a **shared off-policy actor-critic** (`policy.rs`, `economy::policy_step`)
+  picks each noot's action (Move/Mine/Refine/Trade) from a masked softmax over its
+  state (absolute position embedding + bucks/hunger/positional/ownership). The critic
+  drives Move (step to the best-valued neighbour, replacing the old per-hex TD field).
+  Reward = Δ of a Maslow-tiered utility (physiological ≫ safety ≫ esteem). Trained
+  A2C-style from a shared replay buffer with a slow target critic; one brain persists
+  across deaths and saves. *(partial)*
+- **INTENDED**: tune/scale the net and reward; richer state (local observations,
+  others nearby), parameterized actions, and validation that learning beats the old
+  heuristic on-device. Possibly per-archetype policies or curricula.
+- **STATUS**: partial
 
 ### Welfare / utility
 - **NOW**: a noot's utility = "not starving" (per staple, `(satiation−appetite)/
@@ -157,19 +157,14 @@ design. Newest first within each section.
 - **STATUS**: partial
 
 ### Movement learning (RL)
-- **NOW**: per-noot **per-hex value learning** (`RouteMemory`, Plan 004). Each noot
-  trains a TD(λ) value estimate over the whole map (α=0.1, γ=0.9, λ=0.8) and moves
-  ε-greedily up the gradient toward where it has earned reward, where ε is an
-  **intrinsic per-noot explore/exploit ratio** drawn at birth (re-drawn on rebirth).
-  Reward = staple
-  welfare from eating **+** scaled selling income, banked per-tile and folded in on
-  each step; the eligibility trace credits whole routes, not just the reward tile.
-  Every noot trains the same field (Plan 007): a claim-holder homes to its deposit
-  to refill then value-walks to sell; a claimless noot value-walks to find food,
-  buyers, and surplus to flip. *(partial)*
+- **NOW**: folded into the shared actor-critic (see *Action selection*). The old
+  per-hex TD(λ) field (`RouteMemory`) is gone; movement is the **critic's value over
+  absolute position** — when the policy picks Move it steps to the best-valued
+  neighbour hex (ε-greedy via a per-noot exploration ratio). One shared net learns
+  both *what to do* and *where to go*. *(partial)*
 - **INTENDED**: richer *state* than position alone (local memory of observed
-  prices/inventories, who's nearby), function approximation instead of a full
-  per-hex table, and merchant transporters that learn arbitrage routes (pass 2).
+  prices/inventories, who's nearby); confirm the embedding learns sharp enough
+  spatial gradients to navigate as well as the old per-hex table did.
 - **STATUS**: partial
 
 ## World

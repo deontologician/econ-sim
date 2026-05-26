@@ -44,13 +44,15 @@ pub struct Noot;
 /// forgoing the other this tick.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Action {
-    /// Locomotion (home to a claim, roam the value gradient).
+    /// Step toward the highest-value neighbour hex (critic-greedy locomotion).
     #[default]
     Move,
     /// Extract from the claimed deposit underfoot.
     Mine,
     /// Convert a held intermediate into its refined good.
     Refine,
+    /// Buy/sell with a nearby noot.
+    Trade,
 }
 
 /// Per-noot life stats, surfaced by the noot-colouring overlays. `age` is seconds
@@ -182,92 +184,10 @@ impl Hunger {
     }
 }
 
-// --- Route learning (per-hex TD(λ) value estimates) -------------------------
+// --- Exploration ------------------------------------------------------------
 /// Range of intrinsic explore/exploit ratios (ε) drawn per noot at birth: the
-/// chance, each step, of a random move instead of climbing the learned value
-/// gradient. Low = exploiter (beelines to known-good spots), high = wanderer.
+/// chance, each decision, of a random move instead of the critic-greedy one. Low =
+/// exploiter (beelines to known-good spots), high = wanderer. Held in `PolicyMemory`.
 pub const EXPLORE_MIN: f32 = 0.03;
 pub const EXPLORE_MAX: f32 = 0.30;
 
-/// TD learning rate.
-const TD_ALPHA: f32 = 0.1;
-/// Discount applied to the next tile's value.
-const TD_GAMMA: f32 = 0.9;
-/// Eligibility-trace decay (the λ in TD(λ)) — spreads credit back along the
-/// path so reward at a destination raises the value of the hexes that led there.
-const TD_LAMBDA: f32 = 0.8;
-/// Drop a tile from the live trace once its eligibility falls below this.
-const TRACE_CUTOFF: f32 = 0.02;
-
-/// A noot's learned sense of *where good things happen*: a per-hex value estimate
-/// over the whole map, trained online with TD(λ). Reward earned on a tile
-/// (welfare from eating, income from selling) is banked in `pending_reward` and
-/// folded into the estimate on the next step, so high-value regions pull future
-/// movement up the gradient.
-#[derive(Component)]
-pub struct RouteMemory {
-    /// Value estimate per tile, indexed `row * cols + col`.
-    pub value: Vec<f32>,
-    /// Eligibility trace per tile; only entries listed in `active` are non-zero.
-    elig: Vec<f32>,
-    /// Tiles whose eligibility trace is currently live.
-    active: Vec<usize>,
-    /// Reward accrued on the current tile, credited on the next step.
-    pub pending_reward: f32,
-    /// For a noot with a claim: heading back to its deposit to extract a load.
-    pub homing: bool,
-    /// Intrinsic explore/exploit ratio (ε): per-step chance of a random move.
-    pub explore: f32,
-    /// Seconds until the next tile step.
-    pub move_cooldown: f32,
-}
-
-impl RouteMemory {
-    pub fn new(n_tiles: usize, homing: bool, explore: f32) -> Self {
-        Self {
-            value: vec![0.0; n_tiles],
-            elig: vec![0.0; n_tiles],
-            active: Vec::new(),
-            pending_reward: 0.0,
-            homing,
-            explore,
-            move_cooldown: 0.0,
-        }
-    }
-
-    /// Rebuild from a saved value field (the eligibility trace is transient, so it
-    /// starts empty). `value.len()` is the tile count.
-    pub fn restored(value: Vec<f32>, homing: bool, explore: f32) -> Self {
-        let elig = vec![0.0; value.len()];
-        Self {
-            value,
-            elig,
-            active: Vec::new(),
-            pending_reward: 0.0,
-            homing,
-            explore,
-            move_cooldown: 0.0,
-        }
-    }
-
-    /// TD(λ) update for a step from tile `from` to tile `to`, crediting the
-    /// `reward` accrued while sitting on `from`.
-    pub fn learn(&mut self, from: usize, to: usize, reward: f32) {
-        let delta = reward + TD_GAMMA * self.value[to] - self.value[from];
-        if self.elig[from] == 0.0 {
-            self.active.push(from);
-        }
-        self.elig[from] = 1.0; // replacing trace
-        let mut active = std::mem::take(&mut self.active);
-        active.retain(|&t| {
-            self.value[t] += TD_ALPHA * delta * self.elig[t];
-            self.elig[t] *= TD_GAMMA * TD_LAMBDA;
-            let live = self.elig[t] >= TRACE_CUTOFF;
-            if !live {
-                self.elig[t] = 0.0;
-            }
-            live
-        });
-        self.active = active;
-    }
-}

@@ -16,14 +16,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::economy::{EconStats, HungerControl, IncomeControl};
 use crate::noot::{Claim, Hunger, Inventory, NootMeta, TilePos, Trader, Wallet};
+use crate::policy::ActorCritic;
 use crate::world::World;
 
 /// Current save schema version. Bump on any change, and add a [`migrate_step`] arm
-/// upgrading the previous version to this one.
-pub const SAVE_VERSION: u32 = 1;
+/// upgrading the previous version to this one. v2 added the learned `policy`.
+pub const SAVE_VERSION: u32 = 2;
 
-/// The persisted parts of one noot. `RouteMemory`'s eligibility trace is transient,
-/// so only its learned `value` field (plus `explore`/`homing`) is kept.
+/// The persisted parts of one noot. Per-noot RL state (`PolicyMemory`) is transient;
+/// only its intrinsic exploration ε is kept (the shared brain is saved separately).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct NootSave {
     pub pos: TilePos,
@@ -34,11 +35,10 @@ pub struct NootSave {
     pub trader: Trader,
     pub meta: NootMeta,
     pub explore: f32,
-    pub homing: bool,
-    pub value: Vec<f32>,
 }
 
-/// A complete simulation snapshot: the world, the controllers/stats, and every noot.
+/// A complete simulation snapshot: the world, the controllers/stats, the shared
+/// learned policy, and every noot.
 #[derive(Serialize, Deserialize)]
 pub struct Snapshot {
     pub version: u32,
@@ -46,6 +46,10 @@ pub struct Snapshot {
     pub hunger: HungerControl,
     pub income: IncomeControl,
     pub stats: EconStats,
+    /// Shared actor-critic brain. `#[serde(default)]` so a pre-policy (v1) save loads
+    /// with an empty net, which `setup` then re-initializes to the world's tile count.
+    #[serde(default)]
+    pub policy: ActorCritic,
     pub noots: Vec<NootSave>,
 }
 
@@ -93,9 +97,9 @@ pub fn store(snap: &Snapshot) {
 /// ```
 #[cfg(target_arch = "wasm32")]
 fn migrate_step(from_version: u32, save: &mut serde_json::Value) {
-    // No migrations yet — v1 is the first schema. When you bump SAVE_VERSION, branch
-    // on `from_version` and mutate `save` to the next shape, e.g.:
-    //   if from_version == 1 { save["new_field"] = serde_json::json!(0.0); }
+    // v1 → v2: the shared `policy` field was added. It's `#[serde(default)]`, so a v1
+    // save (which lacks it) deserializes with an empty net and `setup` re-initializes
+    // it to the world's tile count — no JSON surgery needed here.
     let _ = (from_version, save);
 }
 
