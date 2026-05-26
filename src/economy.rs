@@ -11,7 +11,7 @@
 use bevy::prelude::*;
 
 use crate::goods::{self, form_of, GoodForm, ItemRole, N_ITEMS};
-use crate::hex::{hex_center, neighbors};
+use crate::hex::{hex_center, neighbors, torus_distance};
 use crate::noot::*;
 use crate::world::terrain_factor;
 use crate::policy::{self, ActorCritic, PolicyMemory, Trainer, Transition, N_ACT, N_OTHER};
@@ -227,15 +227,17 @@ pub fn income_controller(mut ctrl: ResMut<IncomeControl>) {
 // --- Hunger-rate controller (targets a steady death rate) -------------------
 /// Starting appetite gained per second per staple, before the controller adjusts it.
 pub const HUNGER_RATE_INIT: f32 = 0.5;
-/// Target deaths **per tick**, as a fraction of the population (≈ 2%/min at 60 t/s).
-pub const TARGET_DEATH_FRAC_PER_TICK: f32 = 0.02 / 3600.0;
-/// Integral gain: `rate += GAIN·(target − measured)` each control window (deaths are
-/// tiny per tick, hence the large gain).
-const HUNGER_PID_GAIN: f32 = 400.0;
-/// Control update interval, in ticks (deaths are rare, so we measure over a window).
-const PID_PERIOD_TICKS: u32 = 180;
+/// Target deaths **per tick**, as a fraction of the population (≈ 4%/min at 60 t/s).
+pub const TARGET_DEATH_FRAC_PER_TICK: f32 = 0.04 / 3600.0;
+/// Integral gain: `rate += GAIN·(target − measured)` each control window. Kept gentle:
+/// a high gain winds the integrator up during death-free spells, then dumps it as a
+/// hunger spike that starves the whole population at once (synchronized death waves).
+const HUNGER_PID_GAIN: f32 = 30.0;
+/// Control update interval, in ticks (deaths are rare, so we measure over a long
+/// window to keep the quantized death count from jittering the controller).
+const PID_PERIOD_TICKS: u32 = 600;
 /// EMA smoothing on the measured death rate — discrete deaths are noisy.
-const PID_MEAS_ALPHA: f32 = 0.4;
+const PID_MEAS_ALPHA: f32 = 0.25;
 const HUNGER_RATE_MIN: f32 = 0.05;
 const HUNGER_RATE_MAX: f32 = 3.0;
 
@@ -312,20 +314,61 @@ pub fn maslow_utility(hunger: &Hunger, inv: &Inventory, wallet: &Wallet, goods: 
     let safety = 0.5 * (min_food / FOOD_RESERVE).clamp(0.0, 1.0)
         + 0.5 * (wallet.bucks / SAFETY_BUCKS).clamp(0.0, 1.0);
     let esteem = positional_utility(goods, inv); // Σ ln(1+held)
-    let gate = |x: f32| ((x - 0.5) / 0.4).clamp(0.0, 1.0);
+    // Tier gate: higher needs start to matter once a lower need is partly met (≈30%)
+    // and count fully past ≈70%. A softer gate than a hard 0.5 step so a chronically
+    // half-hungry noot still gets a learning gradient for stocking food and earning.
+    let gate = |x: f32| ((x - 0.3) / 0.4).clamp(0.0, 1.0);
     W_PHYS * phys + W_SAFE * gate(phys) * safety + W_ESTEEM * gate(phys) * gate(safety) * esteem
 }
 
-/// Build the policy's non-positional feature vector and the tile index.
-fn features(world: &crate::world::World, pos_idx: usize, hunger: &Hunger, inv: &Inventory, wallet: &Wallet, owns: bool) -> (usize, [f32; N_OTHER]) {
-    let o = [
-        (wallet.bucks / 100.0).tanh(),
-        hunger.staple[0] / STAPLE_SATIATION,
-        hunger.staple[1] / STAPLE_SATIATION,
-        positional_utility(&world.goods, inv) / ESTEEM_NORM,
-        if owns { 1.0 } else { 0.0 },
-        1.0, // bias
-    ];
+/// The tile a noot should head to mine: its claimed deposit if it owns one, else the
+/// nearest deposit (which it can claim on arrival). `None` only if the map has none.
+fn target_deposit_tile(world: &crate::world::World, claim: &Claim, pos: &TilePos) -> Option<(i32, i32)> {
+    if let Some(d) = claim.deposit {
+        let t = &world.tiles[world.deposits[d].tile];
+        return Some((t.col, t.row));
+    }
+    world
+        .deposits
+        .iter()
+        .map(|dep| {
+            let t = &world.tiles[dep.tile];
+            (t.col, t.row)
+        })
+        .min_by_key(|&(c, r)| torus_distance(pos.col, pos.row, c, r, world.cols, world.rows))
+}
+
+/// Build the policy's non-positional feature vector and the tile index. The six
+/// directional features score each move by how much it shortens the toroidal hex path
+/// to the target deposit (+1 closer, −1 farther), so the actor can learn to walk to a
+/// deposit and then mine; `on_minable` flags that Mine is legal right now.
+fn features(
+    world: &crate::world::World,
+    pos: &TilePos,
+    claim: &Claim,
+    hunger: &Hunger,
+    inv: &Inventory,
+    wallet: &Wallet,
+    mask: &[bool; N_ACT],
+) -> (usize, [f32; N_OTHER]) {
+    let pos_idx = (pos.row * world.cols + pos.col) as usize;
+    let mut o = [0.0f32; N_OTHER];
+    o[0] = (wallet.bucks / 100.0).tanh();
+    o[1] = hunger.staple[0] / STAPLE_SATIATION;
+    o[2] = hunger.staple[1] / STAPLE_SATIATION;
+    o[3] = positional_utility(&world.goods, inv) / ESTEEM_NORM;
+    o[4] = if claim.deposit.is_some() { 1.0 } else { 0.0 };
+    o[5] = 1.0; // bias
+
+    if let Some((tc, tr)) = target_deposit_tile(world, claim, pos) {
+        let here = torus_distance(pos.col, pos.row, tc, tr, world.cols, world.rows);
+        let nbrs = neighbors(pos.col, pos.row, world.cols, world.rows);
+        for (d, &(nc, nr)) in nbrs.iter().enumerate() {
+            let there = torus_distance(nc, nr, tc, tr, world.cols, world.rows);
+            o[policy::O_DEPOSIT_DIR + d] = (here - there) as f32;
+        }
+    }
+    o[policy::O_ON_MINABLE] = if mask[policy::A_MINE] { 1.0 } else { 0.0 };
     (pos_idx, o)
 }
 
@@ -379,10 +422,8 @@ pub fn policy_step(
         if mem.cooldown > 0.0 && !mem.died {
             continue;
         }
-        let owns = claim.deposit.is_some();
-        let pos_idx = (pos.row * world.cols + pos.col) as usize;
-        let (s_pos, s_o) = features(world, pos_idx, hunger, inv, wallet, owns);
         let mask = action_mask(world, claim, &pos, inv);
+        let (s_pos, s_o) = features(world, &pos, claim, hunger, inv, wallet, &mask);
         let u_now = maslow_utility(hunger, inv, wallet, &world.goods);
 
         // Close out the previous transition (reward = ΔU, or a death penalty).
@@ -436,7 +477,7 @@ pub fn policy_step(
         mem.last_act = act;
         mem.last_u = u_now;
         mem.has_prev = true;
-        let tf = terrain_factor(world.tiles[pos_idx].difficulty);
+        let tf = terrain_factor(world.tiles[s_pos].difficulty);
         mem.cooldown = BASE_STEP_TIME / tf;
     }
 }
@@ -799,7 +840,10 @@ pub fn meet_and_trade(
             let mut best: Option<(usize, usize, usize, f32, f32)> = None; // buyer_i, seller_i, item, price, surplus
             for &(bi, si) in &[(i, j), (j, i)] {
                 for item in 0..N_ITEMS {
-                    if snaps[si].inv[item] <= 0.0 {
+                    // One whole unit changes hands, so the seller must hold a full unit
+                    // — selling out of a fractional holding would drive inventory
+                    // negative and corrupt the running cost basis.
+                    if snaps[si].inv[item] < 1.0 {
                         continue;
                     }
                     let price =

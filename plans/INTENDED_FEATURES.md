@@ -43,9 +43,10 @@ design. Newest first within each section.
 ### Consumer income / wages
 - **NOW**: every noot gets a universal bucks trickle so consumers don't go broke and
   demand keeps circulating. The rate is **controlled** (`IncomeControl`): an integral
-  loop trims it so total sale value grows at a target ~0.1%/min ("inflation" = this
-  minute's summed sales vs. last minute's). A reborn noot restarts with the starting
-  wallet (a separate, uncontrolled money injection). *(stub)*
+  loop trims it so total sale value grows at a small per-window target ("inflation" =
+  this window's summed sales vs. the previous window's, windows counted in **ticks**).
+  A reborn noot restarts with the starting wallet (a separate, uncontrolled money
+  injection). *(stub)*
 - **INTENDED**: no free money. Noots earn bucks only by producing/selling, doing
   paid work (transport, refining, hauling), or a real labor market. Bucks should
   be conserved except where minted by a defined mechanism. Retiring the trickle
@@ -107,19 +108,22 @@ design. Newest first within each section.
 
 ### Action selection (learned actor-critic)
 - **NOW**: a **shared off-policy actor-critic** (`policy.rs`, `economy::policy_step`)
-  picks each noot's action from a masked softmax over its state (absolute position
-  embedding + bucks/hunger/positional/ownership). Actions are **relative**: 6 hex move
-  directions (the actor learns a directional policy directly, rather than navigating
-  by the critic's absolute value surface) plus Mine and Refine. **Trading is
-  automatic** — any nearby pair clears a mutually-beneficial trade, gated by each
-  noot's learned `discount`/reservation thresholds (no explicit Trade action). Reward
-  = Δ of a Maslow-tiered utility (physiological ≫ safety ≫ esteem). Trained A2C-style
-  (several minibatches/frame) from a shared replay buffer with a slow target critic;
-  one brain persists across deaths and saves. *(partial)*
-- **INTENDED**: faster learning — likely **relative/local state** too (position-
-  invariant cues like direction-to-nearest-deposit) so one rule generalizes across
-  the map instead of a per-tile flow field; reward/entropy/lr tuning; validation that
-  it beats the old heuristic on-device.
+  picks each noot's action from a masked softmax over its state. The state mixes an
+  absolute position embedding with **position-invariant cues**: bucks/hunger/positional/
+  ownership, a six-way *deposit-direction gradient* (does each move shorten the toroidal
+  hex path to my claimed — or nearest — deposit, ∈{−1,0,1}), and an *on-minable* flag.
+  Those last cues make the mining/navigation subtask Markov: without them the shared
+  brain couldn't tell where its deposit was or that it was standing on it, and mining
+  essentially never happened. Actions are **relative**: 6 hex move directions (the actor
+  learns a directional policy directly) plus Mine and Refine. **Trading is automatic** —
+  any nearby pair clears a mutually-beneficial trade, gated by each noot's learned
+  `discount`/reservation thresholds (no explicit Trade action). Reward = Δ of a
+  Maslow-tiered utility (physiological ≫ safety ≫ esteem, with a softened tier gate so a
+  half-hungry noot still gets gradient for stocking food and earning). Trained A2C-style
+  (several minibatches/frame) from a shared replay buffer with a slow target critic; one
+  brain persists across deaths and saves. *(partial)*
+- **INTENDED**: richer relative/local state (observed prices/inventories, who's nearby);
+  more reward/entropy/lr tuning; validation that it beats the old heuristic on-device.
 - **STATUS**: partial
 
 ### Welfare / utility
@@ -148,11 +152,14 @@ design. Newest first within each section.
 
 ### Mortality (starvation death)
 - **NOW**: a noot that sits fully starving (all staples maxed) for
-  `DEATH_GRACE_SECS` dies and is immediately reborn as a fresh agent of the same
-  role — owners back on their deposit, everyone else at a random tile — with a
-  full wallet, empty inventory and half hunger, so the population stays fixed.
-  The global hunger rate is no longer fixed: a **PID loop** (`HungerControl`, Plan
-  006) trims it so the realized death rate tracks 2%/min of the mortal population.
+  `DEATH_GRACE_SECS` (simulated seconds) dies and is immediately reborn fresh at a
+  **random tile** (claimless, full wallet, empty inventory, half hunger, new explore
+  temperament), so the population stays fixed. The global hunger rate is no longer
+  fixed: an **integral controller** (`HungerControl`, Plan 006) trims it so the
+  realized death rate tracks a target (~4%/min of the population). The loop is now
+  denominated **per tick** and kept gentle — a high gain wound the integrator up during
+  death-free spells and dumped it as a hunger spike that starved the whole population at
+  once (synchronized death waves); a long measurement window + low gain removed them.
   *(partial)*
 - **INTENDED**: real demographics — births/deaths move the population, claims and
   wealth pass on or revert (inheritance, abandoned deposits), causes of death
@@ -162,13 +169,12 @@ design. Newest first within each section.
 
 ### Movement learning (RL)
 - **NOW**: folded into the shared actor-critic (see *Action selection*). The old
-  per-hex TD(λ) field (`RouteMemory`) is gone; movement is the **critic's value over
-  absolute position** — when the policy picks Move it steps to the best-valued
-  neighbour hex (ε-greedy via a per-noot exploration ratio). One shared net learns
-  both *what to do* and *where to go*. *(partial)*
-- **INTENDED**: richer *state* than position alone (local memory of observed
-  prices/inventories, who's nearby); confirm the embedding learns sharp enough
-  spatial gradients to navigate as well as the old per-hex table did.
+  per-hex TD(λ) field (`RouteMemory`) is gone; the actor **directly emits one of the six
+  relative hex directions** as its move action (ε-greedy via a per-noot exploration
+  ratio), informed by the position embedding plus the deposit-direction gradient cue.
+  One shared net learns both *what to do* and *where to go*. *(partial)*
+- **INTENDED**: richer *state* (local memory of observed prices/inventories, who's
+  nearby); confirm navigation matches or beats the old per-hex table on-device.
 - **STATUS**: partial
 
 ## World
@@ -191,6 +197,23 @@ design. Newest first within each section.
   depletion driving migration and price shocks, regrowth affected by use and
   environment, and finite stocks creating long-run scarcity the economy must
   adapt to.
+- **STATUS**: partial
+
+## Simulation engine
+
+### Fixed-tick clock & game speed
+- **NOW**: the sim is **decoupled from real time**. Every system advances the world by
+  exactly one `economy::TICK_DT` (fixed); a `SimSchedule` holds the whole sim and
+  `run_sim_ticks` drives it many times per rendered frame, banking `ticks/sec · frame_dt`
+  ticks (capped to avoid a death-spiral). A `SimSpeed` resource + on-screen **Speed**
+  button cycle the tick rate, so the sim can run far faster than the wall clock while
+  the render loop stays at the browser's frame rate. All controllers/stats are
+  denominated **per tick** (rates, and the PID/income windows counted in ticks) so the
+  numbers are identical at any speed. The headless harness runs the same schedule
+  back-to-back and streams full econ stats as **JSONL** to stdout for offline tuning.
+  *(partial)*
+- **INTENDED**: a true fixed-timestep with render interpolation; a numeric speed/seed
+  entry field; pause/step controls; maybe deterministic replay from the JSONL stream.
 - **STATUS**: partial
 
 ## Rendering / UI

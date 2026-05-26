@@ -1293,7 +1293,12 @@ fn update_value_overlay(
     *timer = 0.0;
 
     let n = (sim.0.cols * sim.0.rows) as usize;
-    let probe = [0.0, 1.0, 1.0, 0.0, 0.0, 1.0]; // hungry, broke, no claim, bias
+    // Neutral probe: hungry, broke, no claim, bias; deposit-direction and on-minable
+    // features left at zero (the overlay shows the position value surface alone).
+    let mut probe = [0.0f32; econ_sim::policy::N_OTHER];
+    probe[1] = 1.0;
+    probe[2] = 1.0;
+    probe[5] = 1.0;
     let mut agg = vec![0.0f32; n];
     let (mut lo, mut hi) = (f32::MAX, f32::MIN);
     for (t, a) in agg.iter_mut().enumerate() {

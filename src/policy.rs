@@ -27,8 +27,17 @@ pub const A_MINE: usize = N_DIRS;
 pub const A_REFINE: usize = N_DIRS + 1;
 pub const N_ACT: usize = N_DIRS + 2;
 
-/// Non-positional state features (position is a separate embedding lookup).
-pub const N_OTHER: usize = 6;
+/// Non-positional state features (position is a separate embedding lookup). Layout:
+/// 0 `tanh(bucks/100)`, 1–2 hunger per staple, 3 positional utility, 4 owns-a-deposit,
+/// 5 bias, 6–11 per-direction "does this step shorten the path to my target deposit"
+/// (∈ {−1,0,1}), 12 "Mine is available right now". The last seven make the
+/// mining/navigation subtask Markov — without them the shared brain can't tell where
+/// its deposit is or that it's standing on it.
+pub const N_OTHER: usize = 13;
+/// Index of the first of the six directional deposit-gradient features.
+pub const O_DEPOSIT_DIR: usize = 6;
+/// Index of the "Mine available" feature.
+pub const O_ON_MINABLE: usize = 12;
 /// Hidden width of the shared trunk.
 pub const H: usize = 32;
 
@@ -411,7 +420,12 @@ mod tests {
 
     #[test]
     fn masked_softmax_sums_to_one_and_masks() {
-        let p = masked_softmax(&[1.0, 2.0, 3.0, 0.5], &[true, false, true, true]);
+        let mut logits = [0.0f32; N_ACT];
+        logits[0] = 1.0;
+        logits[2] = 3.0;
+        let mut mask = [true; N_ACT];
+        mask[1] = false;
+        let p = masked_softmax(&logits, &mask);
         assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-5);
         assert_eq!(p[1], 0.0);
         assert!(p[2] > p[0]); // higher logit → higher probability
@@ -420,7 +434,9 @@ mod tests {
     #[test]
     fn sample_returns_the_only_valid_action() {
         let mut rng = Rng::new(42);
-        assert_eq!(sample(&[0.0, 1.0, 0.0, 0.0], &mut rng), A_MINE);
+        let mut probs = [0.0f32; N_ACT];
+        probs[A_MINE] = 1.0;
+        assert_eq!(sample(&probs, &mut rng), A_MINE);
     }
 
     #[test]
@@ -428,7 +444,8 @@ mod tests {
         let mut rng = Rng::new(7);
         let ac = ActorCritic::new(50, &mut rng);
         assert_eq!(ac.n_tiles, 50);
-        let o = [0.1, 0.2, 0.3, 0.0, 1.0, 1.0];
+        let mut o = [0.0; N_OTHER];
+        o[..6].copy_from_slice(&[0.1, 0.2, 0.3, 0.0, 1.0, 1.0]);
         assert!(ac.value(10, &o).is_finite());
         assert!(ac.logits(10, &o).iter().all(|x| x.is_finite()));
     }

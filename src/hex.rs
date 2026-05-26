@@ -30,3 +30,58 @@ pub fn neighbors(col: i32, row: i32, cols: i32, rows: i32) -> [(i32, i32); 6] {
     }
     out
 }
+
+/// odd-r offset coordinate → cube coordinate.
+fn to_cube(col: i32, row: i32) -> (i32, i32, i32) {
+    let x = col - (row - (row & 1)) / 2;
+    let z = row;
+    (x, -x - z, z)
+}
+
+/// Hex distance (number of steps) between two odd-r offset coords, ignoring wrap.
+fn cube_distance(ac: i32, ar: i32, bc: i32, br: i32) -> i32 {
+    let (ax, ay, az) = to_cube(ac, ar);
+    let (bx, by, bz) = to_cube(bc, br);
+    ((ax - bx).abs() + (ay - by).abs() + (az - bz).abs()) / 2
+}
+
+/// Shortest hex distance on the **torus**: the minimum over the nine wrapped images of
+/// `b`. `cols`/`rows` must be even (so the wrapped images keep odd-r parity), which the
+/// map already guarantees.
+pub fn torus_distance(ac: i32, ar: i32, bc: i32, br: i32, cols: i32, rows: i32) -> i32 {
+    let mut best = i32::MAX;
+    for i in -1..=1 {
+        for j in -1..=1 {
+            best = best.min(cube_distance(ac, ar, bc + i * cols, br + j * rows));
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn torus_distance_is_symmetric_and_zero_on_self() {
+        assert_eq!(torus_distance(3, 4, 3, 4, 30, 22), 0);
+        assert_eq!(
+            torus_distance(2, 1, 9, 7, 30, 22),
+            torus_distance(9, 7, 2, 1, 30, 22)
+        );
+    }
+
+    #[test]
+    fn torus_distance_wraps_around_the_seam() {
+        // Columns 0 and 29 are neighbours across the wrap on a 30-wide torus, so the
+        // distance is far less than the 29 it would be without wrapping.
+        assert!(torus_distance(0, 0, 29, 0, 30, 22) < 5);
+    }
+
+    #[test]
+    fn each_neighbour_is_one_step_away() {
+        for (nc, nr) in neighbors(5, 5, 30, 22) {
+            assert_eq!(torus_distance(5, 5, nc, nr, 30, 22), 1);
+        }
+    }
+}

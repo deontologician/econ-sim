@@ -43,8 +43,19 @@ fn arg<T: std::str::FromStr>(n: usize, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Parse the seed argument, accepting either decimal or a `0x`-prefixed hex literal.
+fn arg_seed(default: u64) -> u64 {
+    std::env::args()
+        .nth(1)
+        .and_then(|s| match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            Some(hex) => u64::from_str_radix(hex, 16).ok(),
+            None => s.parse().ok(),
+        })
+        .unwrap_or(default)
+}
+
 fn main() {
-    let seed: u64 = arg(1, 0x0EC0_5EED);
+    let seed: u64 = arg_seed(0x0EC0_5EED);
     let ticks: u64 = arg(2, DEFAULT_TICKS);
     let sample_every: u64 = arg(3, DEFAULT_SAMPLE_EVERY).max(1);
 
