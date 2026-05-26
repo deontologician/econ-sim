@@ -16,6 +16,8 @@ pub mod save;
 pub mod world;
 
 #[cfg(feature = "gui")]
+pub mod graph;
+#[cfg(feature = "gui")]
 pub mod icon;
 #[cfg(feature = "gui")]
 pub mod movement;

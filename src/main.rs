@@ -16,7 +16,7 @@ use econ_sim::noot::{
 };
 use econ_sim::policy::{ActorCritic, PolicyMemory, Trainer};
 use econ_sim::world::{generate, ResourceRole, World};
-use econ_sim::{elements, hex, icon, rng::Rng, save, MapView, Sim, SimRng};
+use econ_sim::{elements, graph, hex, icon, rng::Rng, save, MapView, Sim, SimRng};
 
 // --- World generation knobs -------------------------------------------------
 const COLS: i32 = 30;
@@ -61,8 +61,23 @@ const TERRAIN_BTN_TOP: f32 = VALUE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const NOOT_BTN_TOP: f32 = TERRAIN_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const SAVE_BTN_TOP: f32 = NOOT_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const NEW_BTN_TOP: f32 = SAVE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
+const GRAPHS_BTN_TOP: f32 = NEW_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 /// Bottom edge of the toggle column (taps above this in the column are UI, not map).
-const BTN_COLUMN_BOTTOM: f32 = NEW_BTN_TOP + PAUSE_BTN_H;
+const BTN_COLUMN_BOTTOM: f32 = GRAPHS_BTN_TOP + PAUSE_BTN_H;
+
+// --- Graphs overlay ---------------------------------------------------------
+/// Size of the big correlation (overlay) chart texture, and of each per-stat sparkline.
+const OVERLAY_W: u32 = 380;
+const OVERLAY_H: u32 = 170;
+const SPARK_W: u32 = 150;
+const SPARK_H: u32 = 42;
+/// Rolling history length (samples) and how often (real seconds) a sample is taken.
+const HISTORY_CAP: usize = 480;
+const GRAPH_SAMPLE_SECS: f32 = 0.25;
+/// Cell background in the graphs grid: dim when a stat is off the overlay, bright when
+/// it's been tapped into the correlation chart.
+const GRAPH_CELL_OFF: Color = Color::srgba(0.10, 0.10, 0.13, 0.9);
+const GRAPH_CELL_ON: Color = Color::srgba(0.20, 0.28, 0.40, 0.95);
 
 const BTN_OFF: Color = Color::srgba(0.12, 0.12, 0.12, 0.85);
 const VALUE_BTN_ON: Color = Color::srgba(0.62, 0.22, 0.16, 0.9);
@@ -226,11 +241,56 @@ struct SelectionText;
 #[derive(Component)]
 struct SelectionRing;
 
-/// Which inspection overlays are currently shown (toggled with V / T).
+/// Which inspection overlays are currently shown (toggled with V / T / C).
 #[derive(Resource, Default)]
 struct Overlays {
     value: bool,
     terrain: bool,
+    graphs: bool,
+}
+
+/// Rolling history of every graphed stat, oldest → newest, capped at `HISTORY_CAP`.
+#[derive(Resource, Default)]
+struct StatHistory {
+    samples: std::collections::VecDeque<[f32; graph::N_SERIES]>,
+}
+
+/// Which stats are currently drawn together on the correlation (overlay) chart.
+#[derive(Resource)]
+struct GraphSelection([bool; graph::N_SERIES]);
+
+impl Default for GraphSelection {
+    fn default() -> Self {
+        // Start by overlaying production and consumption — the canonical paired series.
+        let mut sel = [false; graph::N_SERIES];
+        sel[0] = true;
+        sel[1] = true;
+        Self(sel)
+    }
+}
+
+/// Handles to the chart textures: one big overlay chart plus one sparkline per stat.
+#[derive(Resource, Clone)]
+struct GraphAssets {
+    overlay: Handle<Image>,
+    sparks: Vec<Handle<Image>>,
+}
+
+/// Root of the graphs panel (shown/hidden by the Graphs toggle).
+#[derive(Component)]
+struct GraphsPanel;
+/// The on-screen Graphs toggle button.
+#[derive(Component)]
+struct GraphsButton;
+/// A tappable per-stat cell; tapping toggles the stat onto the correlation chart.
+#[derive(Component)]
+struct GraphCell {
+    series: usize,
+}
+/// The value caption inside a stat cell (`"<label>: <latest>"`).
+#[derive(Component)]
+struct GraphLabel {
+    series: usize,
 }
 
 /// Per-hex heat cell for the aggregated noot value-field overlay (`tile` indexes
@@ -274,6 +334,8 @@ fn main() {
         .init_resource::<SimSpeed>()
         .init_resource::<Overlays>()
         .init_resource::<NootColoring>()
+        .init_resource::<StatHistory>()
+        .init_resource::<GraphSelection>()
         .init_resource::<economy::IncomeControl>()
         .init_resource::<Trainer>()
         .add_systems(Startup, setup)
@@ -319,6 +381,7 @@ fn main() {
                     save_game,
                     new_world_controls,
                     speed_controls,
+                    graphs_controls,
                     fit_camera_to_screen,
                 ),
                 (
@@ -328,6 +391,9 @@ fn main() {
                     update_noot_color,
                     update_crowd_overlay,
                     update_deposit_outlines,
+                    sample_stats,
+                    render_graphs,
+                    graph_select,
                     hide_loading_screen,
                 ),
             )
@@ -411,6 +477,15 @@ fn setup(
     // One thematic icon texture per chosen element (used on the map and in the HUD).
     let icons: [Handle<Image>; 4] =
         std::array::from_fn(|slot| images.add(icon::render_icon(world.chosen[slot].id.0)));
+
+    // Blank chart textures for the graphs overlay (re-rasterized live by `render_graphs`).
+    let graph_assets = GraphAssets {
+        overlay: images.add(graph::blank_image(OVERLAY_W, OVERLAY_H)),
+        sparks: (0..graph::N_SERIES)
+            .map(|_| images.add(graph::blank_image(SPARK_W, SPARK_H)))
+            .collect(),
+    };
+    commands.insert_resource(graph_assets.clone());
 
     // Centre the map on the origin. `fit_camera_to_screen` does the real framing
     // once the window size is known; this is just a sane portrait fallback for the
@@ -564,7 +639,7 @@ fn setup(
         }
     }
 
-    spawn_ui(&mut commands, &icons, &ui_font);
+    spawn_ui(&mut commands, &icons, &ui_font, &graph_assets);
 
     commands.insert_resource(SimRng(sim_rng));
     commands.insert_resource(Sim(world));
@@ -633,7 +708,12 @@ fn spawn_noot(
     ));
 }
 
-fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4], font: &Handle<Font>) {
+fn spawn_ui(
+    commands: &mut Commands,
+    icons: &[Handle<Image>; 4],
+    font: &Handle<Font>,
+    graphs: &GraphAssets,
+) {
     commands
         .spawn(Node {
             width: Val::Percent(100.0),
@@ -722,6 +802,10 @@ fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4], font: &Handle<F
             });
         });
 
+    // Graphs panel (hidden until toggled). Spawned before the buttons so the toggle
+    // column renders on top of it and stays tappable while the panel is open.
+    spawn_graphs_panel(commands, font, graphs);
+
     // Transport bar, pinned top-right (absolute so it floats over the panels): a row of
     // [<<] [Play/Pause] [>>] with the ticks/s readout. Touch-target-sized buttons.
     commands
@@ -786,6 +870,7 @@ fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4], font: &Handle<F
     spawn_overlay_button(commands, font, "Terrain", TERRAIN_BTN_TOP, TerrainButton);
     spawn_overlay_button(commands, font, "Save", SAVE_BTN_TOP, SaveButton);
     spawn_overlay_button(commands, font, "New", NEW_BTN_TOP, NewWorldButton);
+    spawn_overlay_button(commands, font, "Graphs", GRAPHS_BTN_TOP, GraphsButton);
 
     // Noot-colouring cycle button (caption shows the active mode).
     commands
@@ -891,6 +976,288 @@ fn spawn_transport_button(
 /// The transport bar's speed readout, e.g. `60.0 ticks/s`.
 fn speed_label(tps: f32) -> String {
     format!("{:.1} ticks/s", tps)
+}
+
+/// Build the (initially hidden) graphs panel: the big correlation chart on top, then a
+/// wrap-grid of tappable per-stat sparkline cells below.
+fn spawn_graphs_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                // Start closed: `display: none` drops it out of layout *and* picking, so
+                // it can't intercept taps while hidden (a hidden-but-laid-out full-screen
+                // node would). `graphs_controls` flips this to `flex` to open it.
+                display: Display::None,
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(6.0),
+                padding: UiRect::all(Val::Px(8.0)),
+                overflow: Overflow::clip(),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.86)),
+            GraphsPanel,
+        ))
+        .with_children(|panel| {
+            panel.spawn((
+                Text::new("Graphs — tap a stat to overlay it on the top chart  ·  C / Graphs to close"),
+                TextFont {
+                    font: font.clone(),
+                    font_size: 12.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.8, 0.8, 0.85)),
+            ));
+
+            // Correlation (overlay) chart.
+            panel.spawn((
+                ImageNode::new(graphs.overlay.clone()),
+                Node {
+                    width: Val::Px(OVERLAY_W as f32),
+                    height: Val::Px(OVERLAY_H as f32),
+                    ..default()
+                },
+            ));
+
+            // Wrap-grid of per-stat cells.
+            panel
+                .spawn(Node {
+                    width: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::FlexStart,
+                    column_gap: Val::Px(6.0),
+                    row_gap: Val::Px(6.0),
+                    ..default()
+                })
+                .with_children(|grid| {
+                    for (series, (label, _color)) in graph::SERIES.iter().enumerate() {
+                        grid.spawn((
+                            Button,
+                            Node {
+                                flex_direction: FlexDirection::Column,
+                                align_items: AlignItems::Center,
+                                padding: UiRect::all(Val::Px(3.0)),
+                                row_gap: Val::Px(2.0),
+                                ..default()
+                            },
+                            BackgroundColor(GRAPH_CELL_OFF),
+                            GraphCell { series },
+                        ))
+                        .with_children(|cell| {
+                            cell.spawn((
+                                Text::new(*label),
+                                TextFont {
+                                    font: font.clone(),
+                                    font_size: 11.0,
+                                    ..default()
+                                },
+                                TextColor(Color::WHITE),
+                                GraphLabel { series },
+                            ));
+                            cell.spawn((
+                                ImageNode::new(graphs.sparks[series].clone()),
+                                Node {
+                                    width: Val::Px(SPARK_W as f32),
+                                    height: Val::Px(SPARK_H as f32),
+                                    ..default()
+                                },
+                            ));
+                        });
+                    }
+                });
+        });
+}
+
+/// Adaptive number formatting for the stat captions (rates are tiny, ages/bucks large).
+fn fmt_stat(v: f32) -> String {
+    let a = v.abs();
+    if a >= 1000.0 {
+        format!("{:.0}", v)
+    } else if a >= 10.0 {
+        format!("{:.1}", v)
+    } else if a >= 0.1 {
+        format!("{:.2}", v)
+    } else {
+        format!("{:.4}", v)
+    }
+}
+
+/// Toggle the graphs panel from the Graphs button or the `C` key, keeping the button
+/// tint and the panel visibility in sync.
+fn graphs_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    button: Query<&Interaction, (Changed<Interaction>, With<GraphsButton>)>,
+    mut overlays: ResMut<Overlays>,
+    mut panel: Query<&mut Node, With<GraphsPanel>>,
+    mut bg: Query<&mut BackgroundColor, With<GraphsButton>>,
+) {
+    if keys.just_pressed(KeyCode::KeyC) || button.iter().any(|i| *i == Interaction::Pressed) {
+        overlays.graphs = !overlays.graphs;
+        if let Ok(mut node) = panel.single_mut() {
+            node.display = if overlays.graphs {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+        if let Ok(mut bg) = bg.single_mut() {
+            bg.0 = if overlays.graphs { VALUE_BTN_ON } else { BTN_OFF };
+        }
+    }
+}
+
+/// Sample every graphed stat into the rolling history (throttled, paused-aware).
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn sample_stats(
+    time: Res<Time>,
+    paused: Res<Paused>,
+    sim: Res<Sim>,
+    stats: Res<EconStats>,
+    hunger: Res<HungerControl>,
+    income: Res<economy::IncomeControl>,
+    noots: Query<(&Wallet, &Hunger, &Claim, &NootMeta, &TilePos)>,
+    mut hist: ResMut<StatHistory>,
+    mut timer: Local<f32>,
+    mut prev_trades: Local<u64>,
+) {
+    if paused.0 {
+        return;
+    }
+    *timer += time.delta_secs();
+    if *timer < GRAPH_SAMPLE_SECS {
+        return;
+    }
+    *timer = 0.0;
+
+    let (cols, rows) = (sim.0.cols, sim.0.rows);
+    let mut n = 0u32;
+    let (mut bucks, mut appetite, mut age) = (0.0f32, 0.0f32, 0.0f32);
+    let (mut starving, mut claimed) = (0u32, 0u32);
+    let mut tiles: Vec<(i32, i32)> = Vec::new();
+    for (w, h, c, m, tp) in &noots {
+        bucks += w.bucks;
+        appetite += h.staple.iter().sum::<f32>() / h.staple.len() as f32;
+        age += m.age;
+        if h.is_starving() {
+            starving += 1;
+        }
+        if c.deposit.is_some() {
+            claimed += 1;
+        }
+        tiles.push((tp.col, tp.row));
+        n += 1;
+    }
+    let nf = n.max(1) as f32;
+    let mut nn = 0.0f32;
+    for (i, &(c, r)) in tiles.iter().enumerate() {
+        let mut best = i32::MAX;
+        for (j, &(oc, or)) in tiles.iter().enumerate() {
+            if i != j {
+                best = best.min(hex::torus_distance(c, r, oc, or, cols, rows));
+            }
+        }
+        if best != i32::MAX {
+            nn += best as f32;
+        }
+    }
+
+    let trades = stats.trades_total;
+    let dtrades = trades.saturating_sub(*prev_trades) as f32;
+    *prev_trades = trades;
+
+    let mut s = [0.0f32; graph::N_SERIES];
+    s[0] = stats.production_rate;
+    s[1] = stats.consumption_rate;
+    s[2] = stats.merchant_profit_rate;
+    s[3] = stats.utility_rate;
+    s[4] = dtrades;
+    s[5] = bucks / nf;
+    s[6] = appetite / nf;
+    s[7] = starving as f32;
+    s[8] = claimed as f32;
+    s[9] = hunger.rate;
+    s[10] = hunger.measured_per_tick;
+    s[11] = income.rate;
+    s[12] = income.measured_inflation * 100.0;
+    s[13] = age / nf;
+    s[14] = nn / nf;
+
+    hist.samples.push_back(s);
+    while hist.samples.len() > HISTORY_CAP {
+        hist.samples.pop_front();
+    }
+}
+
+/// Re-rasterize the chart textures and refresh the per-stat captions / selection tints
+/// while the panel is open (throttled).
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn render_graphs(
+    time: Res<Time>,
+    overlays: Res<Overlays>,
+    hist: Res<StatHistory>,
+    selection: Res<GraphSelection>,
+    assets: Res<GraphAssets>,
+    mut images: ResMut<Assets<Image>>,
+    mut labels: Query<(&GraphLabel, &mut Text)>,
+    mut cells: Query<(&GraphCell, &mut BackgroundColor)>,
+    mut timer: Local<f32>,
+) {
+    if !overlays.graphs {
+        return;
+    }
+    *timer += time.delta_secs();
+    if *timer < 0.2 {
+        return;
+    }
+    *timer = 0.0;
+
+    // Pull each series into a chronological f32 vector once.
+    let cols: Vec<Vec<f32>> = (0..graph::N_SERIES)
+        .map(|i| hist.samples.iter().map(|s| s[i]).collect())
+        .collect();
+
+    if let Some(img) = images.get_mut(&assets.overlay) {
+        let sel: Vec<(&[f32], [u8; 3])> = (0..graph::N_SERIES)
+            .filter(|&i| selection.0[i])
+            .map(|i| (cols[i].as_slice(), graph::SERIES[i].1))
+            .collect();
+        graph::render_overlay(img, &sel);
+    }
+    for (i, col) in cols.iter().enumerate() {
+        if let Some(img) = images.get_mut(&assets.sparks[i]) {
+            graph::render_sparkline(img, col, graph::SERIES[i].1);
+        }
+    }
+    for (lbl, mut text) in &mut labels {
+        let latest = cols[lbl.series].last().copied().unwrap_or(0.0);
+        text.0 = format!("{}: {}", graph::SERIES[lbl.series].0, fmt_stat(latest));
+    }
+    for (cell, mut bg) in &mut cells {
+        bg.0 = if selection.0[cell.series] {
+            GRAPH_CELL_ON
+        } else {
+            GRAPH_CELL_OFF
+        };
+    }
+}
+
+/// Tapping a stat cell toggles whether it's drawn on the correlation chart.
+fn graph_select(
+    cells: Query<(&GraphCell, &Interaction), Changed<Interaction>>,
+    mut selection: ResMut<GraphSelection>,
+) {
+    for (cell, interaction) in &cells {
+        if *interaction == Interaction::Pressed {
+            selection.0[cell.series] = !selection.0[cell.series];
+        }
+    }
 }
 
 /// Step the sim speed through `SPEED_STEPS` (clamped) from the transport bar's `<<` /
@@ -1062,6 +1429,7 @@ fn fit_camera_to_screen(
 fn pick_selection(
     mouse: Res<ButtonInput<MouseButton>>,
     touches: Res<Touches>,
+    overlays: Res<Overlays>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
     noots: Query<(Entity, &Transform, &Claim), With<Noot>>,
@@ -1069,6 +1437,10 @@ fn pick_selection(
     view: Res<MapView>,
     mut selection: ResMut<Selection>,
 ) {
+    // The graphs panel covers the map; taps there drive the panel, not noot selection.
+    if overlays.graphs {
+        return;
+    }
     let Ok((camera, cam_tf)) = cameras.single() else {
         return;
     };
