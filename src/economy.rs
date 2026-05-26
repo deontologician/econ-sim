@@ -18,8 +18,16 @@ use crate::policy::{self, ActorCritic, PolicyMemory, Trainer, Transition, N_ACT,
 use crate::{Sim, SimRng};
 use serde::{Deserialize, Serialize};
 
-/// Decision/step cadence: a noot picks a new action (and, if Move, steps one hex)
-/// this often, scaled faster on easy terrain. This is the MDP timestep.
+/// The simulation advances in fixed **ticks** of `TICK_DT` simulated seconds each,
+/// decoupled from real time. Game speed = how many ticks the GUI runs per rendered
+/// frame; the headless harness just runs ticks back-to-back. All continuous accrual
+/// (hunger, income, regrowth, extraction, age, cooldowns) multiplies a per-second
+/// rate by `TICK_DT`; all windows/periods are counted in ticks; all reported rates
+/// are **per tick**, so numbers are identical at any speed.
+pub const TICK_DT: f32 = 1.0 / 60.0;
+
+/// Decision/step cadence (simulated seconds): a noot picks a new action (and, if
+/// Move, steps one hex) this often, scaled faster on easy terrain.
 pub const BASE_STEP_TIME: f32 = 0.35;
 /// Maslow utility weights (physiological ≫ safety ≫ esteem) and tier normalizers.
 const W_PHYS: f32 = 1.0;
@@ -98,23 +106,25 @@ const SURPLUS_FLOOR: f32 = 0.35;
 /// so speculation never starves it of food money.
 const ARBITRAGE_RESERVE: f32 = 30.0;
 
-/// How long each production/consumption rate sample covers (seconds).
-const RATE_WINDOW: f32 = 0.5;
+/// Ticks each production/consumption rate sample covers.
+const RATE_WINDOW_TICKS: u32 = 30;
 
 #[derive(Resource, Default, Clone, Serialize, Deserialize)]
 pub struct EconStats {
     pub trades_total: u64,
+    /// Total ticks elapsed (the sim clock).
+    pub ticks: u64,
     /// Exponentially weighted moving average of actual sale prices, per item.
     pub ewma_price: [f32; N_ITEMS],
     /// Cumulative raw units extracted from deposits (the economy's supply).
     pub produced_total: f64,
     /// Cumulative units consumed (staples eaten + positional goods used up).
     pub consumed_total: f64,
-    /// Cumulative bucks of margin realized by merchants reselling surplus.
+    /// Cumulative bucks of margin realized reselling surplus.
     pub merchant_profit_total: f64,
     /// Cumulative welfare (utility) realized through consumption.
     pub utility_total: f64,
-    /// Most recent windowed rates, in units (or utility/bucks) per second.
+    /// Most recent windowed rates, **per tick**.
     pub production_rate: f32,
     pub consumption_rate: f32,
     pub merchant_profit_rate: f32,
@@ -124,15 +134,15 @@ pub struct EconStats {
     consumed_window: f32,
     merchant_profit_window: f32,
     utility_window: f32,
-    window_elapsed: f32,
+    window_ticks: u32,
 }
 
-/// Convert the running production/consumption/profit tallies into per-second
-/// rates, once per `RATE_WINDOW` so the HUD numbers don't jitter every frame.
-pub fn update_rates(time: Res<Time>, mut stats: ResMut<EconStats>) {
-    stats.window_elapsed += time.delta_secs();
-    if stats.window_elapsed >= RATE_WINDOW {
-        let inv = 1.0 / stats.window_elapsed;
+/// Fold the running tallies into per-tick rates once per `RATE_WINDOW_TICKS`.
+pub fn update_rates(mut stats: ResMut<EconStats>) {
+    stats.ticks += 1;
+    stats.window_ticks += 1;
+    if stats.window_ticks >= RATE_WINDOW_TICKS {
+        let inv = 1.0 / stats.window_ticks as f32;
         stats.production_rate = stats.produced_window * inv;
         stats.consumption_rate = stats.consumed_window * inv;
         stats.merchant_profit_rate = stats.merchant_profit_window * inv;
@@ -141,22 +151,22 @@ pub fn update_rates(time: Res<Time>, mut stats: ResMut<EconStats>) {
         stats.consumed_window = 0.0;
         stats.merchant_profit_window = 0.0;
         stats.utility_window = 0.0;
-        stats.window_elapsed = 0.0;
+        stats.window_ticks = 0;
     }
 }
 
-pub fn income(time: Res<Time>, ctrl: Res<IncomeControl>, mut wallets: Query<&mut Wallet>) {
-    let d = ctrl.rate * time.delta_secs();
+pub fn income(ctrl: Res<IncomeControl>, mut wallets: Query<&mut Wallet>) {
+    let d = ctrl.rate * TICK_DT;
     for mut w in &mut wallets {
         w.bucks += d;
     }
 }
 
 // --- Universal-income controller (targets a tiny sales "inflation") ---------
-/// Target growth in total sale value, minute over minute (0.1% / min).
-pub const TARGET_INFLATION_PER_MIN: f32 = 0.001;
-/// Measurement/control window — one minute, per the inflation definition.
-const INCOME_WINDOW: f32 = 60.0;
+/// Target growth in total sale value, window over window.
+pub const TARGET_INFLATION: f32 = 0.001;
+/// Measurement/control window, in ticks.
+const INCOME_WINDOW_TICKS: u32 = 1800;
 /// Integral gain: `rate += INCOME_K * (target − measured)` each window.
 const INCOME_K: f32 = 0.4;
 /// EMA smoothing on the measured inflation (window-to-window sales are noisy).
@@ -165,139 +175,121 @@ const INCOME_RATE_MIN: f32 = 0.0;
 const INCOME_RATE_MAX: f32 = 3.0;
 
 /// Trims the universal income so total trade value grows at roughly
-/// `TARGET_INFLATION_PER_MIN`. Inflation is measured as this minute's summed sale
-/// value vs. the previous minute's. `meet_and_trade` accumulates `this_window`.
+/// `TARGET_INFLATION` per window. Inflation = this window's summed sale value vs.
+/// the previous window's. `meet_and_trade` accumulates `this_window`.
 #[derive(Resource, Clone, Serialize, Deserialize)]
 pub struct IncomeControl {
-    /// Current universal income (bucks/sec/noot) — what `income` pays out.
+    /// Current universal income (bucks/sec/noot) — `income` pays out `rate·TICK_DT`.
     pub rate: f32,
-    /// Smoothed measured inflation (fractional sales growth per minute).
+    /// Smoothed measured inflation (fractional sales growth per window).
     pub measured_inflation: f32,
     /// Sale value (bucks) summed over the current window.
     pub this_window: f64,
     last_window: f64,
     have_prev: bool,
-    elapsed: f32,
+    elapsed_ticks: u32,
 }
 
 impl Default for IncomeControl {
     fn default() -> Self {
         Self {
             rate: BUCKS_INCOME,
-            measured_inflation: TARGET_INFLATION_PER_MIN,
+            measured_inflation: TARGET_INFLATION,
             this_window: 0.0,
             last_window: 0.0,
             have_prev: false,
-            elapsed: 0.0,
+            elapsed_ticks: 0,
         }
     }
 }
 
-pub fn income_controller(time: Res<Time>, mut ctrl: ResMut<IncomeControl>) {
-    ctrl.elapsed += time.delta_secs();
-    if ctrl.elapsed < INCOME_WINDOW {
+pub fn income_controller(mut ctrl: ResMut<IncomeControl>) {
+    ctrl.elapsed_ticks += 1;
+    if ctrl.elapsed_ticks < INCOME_WINDOW_TICKS {
         return;
     }
     let this = ctrl.this_window;
-    // Need a previous (non-empty) minute to define growth; otherwise just rotate.
+    // Need a previous (non-empty) window to define growth; otherwise just rotate.
     if ctrl.have_prev && ctrl.last_window > 0.0 {
         let inflation = ((this - ctrl.last_window) / ctrl.last_window) as f32;
         ctrl.measured_inflation += INCOME_MEAS_ALPHA * (inflation - ctrl.measured_inflation);
         // Integral control: more income → more spending → faster sales growth, so
         // raise income when inflation is below target and cut it when above.
-        let error = TARGET_INFLATION_PER_MIN - ctrl.measured_inflation;
+        let error = TARGET_INFLATION - ctrl.measured_inflation;
         ctrl.rate = (ctrl.rate + INCOME_K * error).clamp(INCOME_RATE_MIN, INCOME_RATE_MAX);
     }
     ctrl.last_window = this;
     ctrl.have_prev = true;
     ctrl.this_window = 0.0;
-    ctrl.elapsed = 0.0;
+    ctrl.elapsed_ticks = 0;
 }
 
-// --- Hunger-rate PID (targets a steady death rate) --------------------------
+// --- Hunger-rate controller (targets a steady death rate) -------------------
 /// Starting appetite gained per second per staple, before the controller adjusts it.
 pub const HUNGER_RATE_INIT: f32 = 0.5;
-/// Target deaths per minute, as a fraction of the mortal (non-merchant) population.
-pub const TARGET_DEATH_FRAC_PER_MIN: f32 = 0.02;
-/// PID gains: error is in deaths/min, output is the hunger rate (appetite/sec).
-const PID_KP: f32 = 0.05;
-const PID_KI: f32 = 0.02;
-const PID_KD: f32 = 0.01;
-/// Control update interval (s). Deaths are rare, so we measure over a window.
-const PID_PERIOD: f32 = 3.0;
+/// Target deaths **per tick**, as a fraction of the population (≈ 2%/min at 60 t/s).
+pub const TARGET_DEATH_FRAC_PER_TICK: f32 = 0.02 / 3600.0;
+/// Integral gain: `rate += GAIN·(target − measured)` each control window (deaths are
+/// tiny per tick, hence the large gain).
+const HUNGER_PID_GAIN: f32 = 400.0;
+/// Control update interval, in ticks (deaths are rare, so we measure over a window).
+const PID_PERIOD_TICKS: u32 = 180;
 /// EMA smoothing on the measured death rate — discrete deaths are noisy.
 const PID_MEAS_ALPHA: f32 = 0.4;
 const HUNGER_RATE_MIN: f32 = 0.05;
 const HUNGER_RATE_MAX: f32 = 3.0;
 
-/// PID controller that trims the global hunger rate so the realized death rate
-/// tracks `target_per_min`. Deaths feed back via `deaths_since_update`, bumped by
-/// `death_and_respawn`.
+/// Integral controller that trims the global hunger rate so the realized
+/// deaths-per-tick track `target_per_tick`. Deaths feed back via
+/// `deaths_since_update`, bumped by `death_and_respawn`.
 #[derive(Resource, Clone, Serialize, Deserialize)]
 pub struct HungerControl {
-    /// Current hunger rate (appetite/sec/staple) — what `hunger_tick` applies.
+    /// Current hunger rate (appetite/sec/staple) — `hunger_tick` applies `rate·TICK_DT`.
     pub rate: f32,
-    pub target_per_min: f32,
-    /// Smoothed measured death rate (deaths/min), for the readout and the error.
-    pub measured_per_min: f32,
+    pub target_per_tick: f32,
+    /// Smoothed measured deaths per tick (readout + control error).
+    pub measured_per_tick: f32,
     /// Deaths counted since the last control update.
     pub deaths_since_update: u32,
-    elapsed: f32,
-    integral: f32,
-    prev_error: f32,
+    elapsed_ticks: u32,
 }
 
 impl HungerControl {
-    pub fn new(target_per_min: f32) -> Self {
+    pub fn new(target_per_tick: f32) -> Self {
         Self {
             rate: HUNGER_RATE_INIT,
-            target_per_min,
-            // Seed the measurement at target and the integral at the initial rate so
-            // the loop starts from today's behaviour and only trims from there.
-            measured_per_min: target_per_min,
+            target_per_tick,
+            measured_per_tick: target_per_tick,
             deaths_since_update: 0,
-            elapsed: 0.0,
-            integral: HUNGER_RATE_INIT / PID_KI,
-            prev_error: 0.0,
+            elapsed_ticks: 0,
         }
     }
 }
 
-/// Once per `PID_PERIOD`, fold the window's death count into the smoothed rate and
-/// step the PID, nudging the hunger rate up when too few are dying and down when
-/// too many are.
-pub fn hunger_pid(time: Res<Time>, mut ctrl: ResMut<HungerControl>) {
-    ctrl.elapsed += time.delta_secs();
-    if ctrl.elapsed < PID_PERIOD {
+/// Once per `PID_PERIOD_TICKS`, fold the window's death count into the smoothed rate
+/// and nudge the hunger rate up when too few are dying, down when too many are.
+pub fn hunger_pid(mut ctrl: ResMut<HungerControl>) {
+    ctrl.elapsed_ticks += 1;
+    if ctrl.elapsed_ticks < PID_PERIOD_TICKS {
         return;
     }
-    let dt = ctrl.elapsed;
-    let raw = ctrl.deaths_since_update as f32 / dt * 60.0;
-    ctrl.measured_per_min += PID_MEAS_ALPHA * (raw - ctrl.measured_per_min);
-
-    let error = ctrl.target_per_min - ctrl.measured_per_min;
-    // Anti-windup: keep the integral term inside the rate range.
-    let (i_min, i_max) = (HUNGER_RATE_MIN / PID_KI, HUNGER_RATE_MAX / PID_KI);
-    ctrl.integral = (ctrl.integral + error * dt).clamp(i_min, i_max);
-    let derivative = (error - ctrl.prev_error) / dt;
-    let output = PID_KP * error + PID_KI * ctrl.integral + PID_KD * derivative;
-    ctrl.rate = output.clamp(HUNGER_RATE_MIN, HUNGER_RATE_MAX);
-
-    ctrl.prev_error = error;
+    let raw = ctrl.deaths_since_update as f32 / PID_PERIOD_TICKS as f32;
+    ctrl.measured_per_tick += PID_MEAS_ALPHA * (raw - ctrl.measured_per_tick);
+    let error = ctrl.target_per_tick - ctrl.measured_per_tick;
+    ctrl.rate = (ctrl.rate + HUNGER_PID_GAIN * error).clamp(HUNGER_RATE_MIN, HUNGER_RATE_MAX);
     ctrl.deaths_since_update = 0;
-    ctrl.elapsed = 0.0;
+    ctrl.elapsed_ticks = 0;
 }
 
-/// Age every noot by the simulated time elapsed (frozen while paused).
-pub fn age_noots(time: Res<Time>, mut q: Query<&mut NootMeta>) {
-    let dt = time.delta_secs();
+/// Age every noot by one tick.
+pub fn age_noots(mut q: Query<&mut NootMeta>) {
     for mut m in &mut q {
-        m.age += dt;
+        m.age += TICK_DT;
     }
 }
 
-pub fn hunger_tick(time: Res<Time>, ctrl: Res<HungerControl>, mut q: Query<&mut Hunger>) {
-    let d = ctrl.rate * time.delta_secs();
+pub fn hunger_tick(ctrl: Res<HungerControl>, mut q: Query<&mut Hunger>) {
+    let d = ctrl.rate * TICK_DT;
     for mut h in &mut q {
         for a in &mut h.staple {
             *a = (*a + d).min(STAPLE_SATIATION);
@@ -367,7 +359,6 @@ fn action_mask(world: &crate::world::World, claim: &Claim, pos: &TilePos, inv: &
 /// refine/trade systems apply it each frame.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn policy_step(
-    time: Res<Time>,
     sim: Res<Sim>,
     ac: Res<ActorCritic>,
     mut trainer: ResMut<Trainer>,
@@ -383,9 +374,8 @@ pub fn policy_step(
     )>,
 ) {
     let world = &sim.0;
-    let dt = time.delta_secs();
     for (mut pos, claim, inv, hunger, wallet, mut action, mut mem) in &mut q {
-        mem.cooldown -= dt;
+        mem.cooldown -= TICK_DT;
         if mem.cooldown > 0.0 && !mem.died {
             continue;
         }
@@ -460,9 +450,9 @@ pub fn train_policy(mut ac: ResMut<ActorCritic>, mut trainer: ResMut<Trainer>, m
     }
 }
 
-/// Advance the resource simulation (deposit regrowth) by the frame's dt.
-pub fn simulate(time: Res<Time>, mut sim: ResMut<Sim>) {
-    sim.0.tick(time.delta_secs());
+/// Advance the resource simulation (deposit regrowth) by one tick.
+pub fn simulate(mut sim: ResMut<Sim>) {
+    sim.0.tick(TICK_DT);
 }
 
 /// Seconds a noot can sit fully starving before it dies and is reborn fresh.
@@ -476,7 +466,6 @@ pub const DEATH_GRACE_SECS: f32 = 20.0;
 /// banks one terminal transition before the new episode.
 #[allow(clippy::type_complexity)]
 pub fn death_and_respawn(
-    time: Res<Time>,
     mut rng: ResMut<SimRng>,
     sim: Res<Sim>,
     mut ctrl: ResMut<HungerControl>,
@@ -491,13 +480,12 @@ pub fn death_and_respawn(
         &mut TilePos,
     )>,
 ) {
-    let dt = time.delta_secs();
     let world = &sim.0;
     for (mut hunger, mut inv, mut wallet, mut mem, mut trader, mut meta, mut claim, mut pos) in
         &mut q
     {
         if hunger.fully_starving() {
-            hunger.starving_secs += dt;
+            hunger.starving_secs += TICK_DT;
         } else {
             hunger.starving_secs = 0.0;
         }
@@ -520,12 +508,10 @@ pub fn death_and_respawn(
 }
 
 pub fn extract(
-    time: Res<Time>,
     mut sim: ResMut<Sim>,
     mut stats: ResMut<EconStats>,
     mut q: Query<(&Action, &Claim, &TilePos, &mut Inventory, &mut NootMeta)>,
 ) {
-    let dt = time.delta_secs();
     for (action, claim, pos, mut inv, mut meta) in &mut q {
         if *action != Action::Mine {
             continue;
@@ -545,7 +531,7 @@ pub fn extract(
         }
         // Learning by doing: a seasoned miner pulls more per second.
         let rate = WORK_RATE * skill_factor(meta.experience);
-        let got = sim.0.extract_from(deposit, rate, dt) as f32;
+        let got = sim.0.extract_from(deposit, rate, TICK_DT) as f32;
         inv.items[raw] += got;
         meta.experience += got;
         stats.produced_window += got;
@@ -580,11 +566,9 @@ pub fn claim_deposits(sim: Res<Sim>, mut q: Query<(&TilePos, &mut Claim)>) {
 /// Refine held intermediates — but only for noots whose chosen action this tick is
 /// `Refine` (set by `choose_action`), faster the more refining experience accrued.
 pub fn refine(
-    time: Res<Time>,
     sim: Res<Sim>,
     mut q: Query<(&Action, &mut Inventory, &mut NootMeta)>,
 ) {
-    let dt = time.delta_secs();
     for (action, mut inv, mut meta) in &mut q {
         if *action != Action::Refine {
             continue;
@@ -596,7 +580,7 @@ pub fn refine(
                 continue;
             }
             let refined = goods::item_index(slot, GoodForm::Refined);
-            let amount = (rate * dt).min(inv.items[raw]);
+            let amount = (rate * TICK_DT).min(inv.items[raw]);
             inv.items[raw] -= amount;
             inv.items[refined] += amount;
             meta.experience += amount;

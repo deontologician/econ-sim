@@ -1,6 +1,7 @@
 //! GUI binary: the rendered, interactive app. The simulation core lives in the
 //! `econ_sim` library; this file is the rendering/UI/input layer (gated by `gui`).
 
+use bevy::ecs::schedule::ScheduleLabel;
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::input::touch::Touch;
 use bevy::prelude::*;
@@ -48,8 +49,9 @@ const TERRAIN_BTN_TOP: f32 = VALUE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const NOOT_BTN_TOP: f32 = TERRAIN_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const SAVE_BTN_TOP: f32 = NOOT_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const NEW_BTN_TOP: f32 = SAVE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
+const SPEED_BTN_TOP: f32 = NEW_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 /// Bottom edge of the whole button column (taps above this are UI, not the map).
-const BTN_COLUMN_BOTTOM: f32 = NEW_BTN_TOP + PAUSE_BTN_H;
+const BTN_COLUMN_BOTTOM: f32 = SPEED_BTN_TOP + PAUSE_BTN_H;
 
 const BTN_OFF: Color = Color::srgba(0.12, 0.12, 0.12, 0.85);
 const VALUE_BTN_ON: Color = Color::srgba(0.62, 0.22, 0.16, 0.9);
@@ -67,9 +69,62 @@ struct Selection(Option<Entity>);
 #[derive(Resource, Default)]
 struct Paused(bool);
 
-/// Whether the simulation should advance this frame (a Bevy run condition).
-fn sim_running(paused: Res<Paused>) -> bool {
-    !paused.0
+/// The fixed-tick simulation schedule. Its systems advance the world by exactly one
+/// `economy::TICK_DT` per run; `run_sim_ticks` runs it many times per rendered frame
+/// (per `SimSpeed`), decoupling sim rate from render rate.
+#[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
+struct SimSchedule;
+
+/// System set holding the sim driver, so the per-frame visual/HUD systems can order
+/// themselves after it (they read the freshest sim state each frame).
+#[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
+struct SimDriver;
+
+/// Selectable game speeds in **ticks per second**, cycled by the Speed button.
+/// 60 t/s ≈ real-time; higher values run the sim faster than the wall clock while
+/// the render loop stays at the browser's frame rate.
+const SPEED_STEPS: [f32; 5] = [60.0, 120.0, 240.0, 480.0, 960.0];
+
+/// Hard cap on sim ticks executed in a single rendered frame, so a slow frame (or a
+/// background tab catching up) can't spiral into an unbounded tick burst.
+const MAX_TICKS_PER_FRAME: u32 = 1500;
+
+/// How fast the sim advances, decoupled from render. `accumulator` carries the
+/// fractional tick remainder between frames so the average rate matches exactly.
+#[derive(Resource)]
+struct SimSpeed {
+    ticks_per_second: f32,
+    accumulator: f32,
+}
+
+impl Default for SimSpeed {
+    fn default() -> Self {
+        Self {
+            ticks_per_second: SPEED_STEPS[0],
+            accumulator: 0.0,
+        }
+    }
+}
+
+/// Drive the fixed-tick `SimSchedule` from real time: bank `ticks_per_second · dt`
+/// ticks worth of work and run that many (capped). Frozen while paused. Exclusive so
+/// it can run a whole schedule per tick. (`World` here is Bevy's ECS world — the game
+/// map type `econ_sim::world::World` shadows the bare name in this module.)
+fn run_sim_ticks(world: &mut bevy::prelude::World) {
+    if world.resource::<Paused>().0 {
+        return;
+    }
+    let dt = world.resource::<Time>().delta_secs();
+    let n = {
+        let mut speed = world.resource_mut::<SimSpeed>();
+        speed.accumulator += speed.ticks_per_second * dt;
+        let whole = speed.accumulator.floor();
+        speed.accumulator -= whole; // keep only the sub-tick remainder (no backlog)
+        (whole as u32).min(MAX_TICKS_PER_FRAME)
+    };
+    for _ in 0..n {
+        world.run_schedule(SimSchedule);
+    }
 }
 
 /// The on-screen pause toggle and its caption.
@@ -92,6 +147,12 @@ struct NewWorldButton;
 /// Snapshots the full game state to localStorage (touch equivalent of the S key).
 #[derive(Component)]
 struct SaveButton;
+/// Cycles the simulation speed (ticks per second).
+#[derive(Component)]
+struct SpeedButton;
+/// Caption on the speed button, kept in sync with the active speed.
+#[derive(Component)]
+struct SpeedLabel;
 /// Caption on the noot-colouring button, kept in sync with the active mode.
 #[derive(Component)]
 struct NootColorLabel;
@@ -195,44 +256,45 @@ fn main() {
         .init_resource::<EconStats>()
         .init_resource::<Selection>()
         .init_resource::<Paused>()
+        .init_resource::<SimSpeed>()
         .init_resource::<Overlays>()
         .init_resource::<NootColoring>()
         .init_resource::<economy::IncomeControl>()
         .init_resource::<Trainer>()
         .add_systems(Startup, setup)
+        // The simulation runs on a fixed-tick schedule (each system advances the
+        // world by one `TICK_DT`), driven many times per frame by `run_sim_ticks`.
+        // Order matches the headless harness; chained so reads see prior writes.
+        .add_systems(
+            SimSchedule,
+            (
+                economy::simulate,
+                economy::income,
+                economy::income_controller,
+                economy::hunger_tick,
+                economy::hunger_pid,
+                economy::age_noots,
+                economy::policy_step,
+                economy::claim_deposits,
+                economy::extract,
+                economy::refine,
+                economy::meet_and_trade,
+                economy::consume,
+                economy::death_and_respawn,
+                economy::update_rates,
+                economy::train_policy,
+            )
+                .chain(),
+        )
+        // Per-frame (real-time) systems: drive the sim ticks, then render/input/HUD.
+        // `run_sim_ticks` is exclusive and runs first so the visuals reflect the
+        // freshest sim state; `movement::movement` glides sprites toward their tiles.
+        .add_systems(Update, run_sim_ticks.in_set(SimDriver))
         .add_systems(
             Update,
             (
-                // Nested into sub-tuples purely to stay under the 20-system
-                // tuple-arity limit; grouping imposes no ordering. The simulation
-                // groups are gated by `sim_running` so the pause button freezes
-                // them while input/camera/HUD keep working.
-                (
-                    economy::simulate,
-                    economy::income,
-                    economy::income_controller,
-                    economy::hunger_tick,
-                    economy::hunger_pid,
-                    economy::age_noots,
-                )
-                    .run_if(sim_running),
                 (
                     movement::movement,
-                    economy::policy_step,
-                    economy::claim_deposits,
-                    economy::extract,
-                    economy::refine,
-                    economy::meet_and_trade,
-                )
-                    .run_if(sim_running),
-                (
-                    economy::consume,
-                    economy::death_and_respawn,
-                    economy::update_rates,
-                    economy::train_policy,
-                )
-                    .run_if(sim_running),
-                (
                     pick_selection,
                     touch_camera,
                     keyboard_mouse_camera,
@@ -241,6 +303,7 @@ fn main() {
                     overlay_controls,
                     save_game,
                     new_world_controls,
+                    speed_controls,
                     fit_camera_to_screen,
                 ),
                 (
@@ -252,7 +315,8 @@ fn main() {
                     update_deposit_outlines,
                     hide_loading_screen,
                 ),
-            ),
+            )
+                .after(SimDriver),
         )
         .run();
 }
@@ -314,7 +378,7 @@ fn setup(
         None => {
             let world = generate(random_seed(), COLS, ROWS, HEX_SIZE);
             commands.insert_resource(HungerControl::new(
-                economy::TARGET_DEATH_FRAC_PER_MIN * N_NOOTS as f32,
+                economy::TARGET_DEATH_FRAC_PER_TICK * N_NOOTS as f32,
             ));
             (world, None, None)
         }
@@ -680,6 +744,36 @@ fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4], font: &Handle<F
     spawn_overlay_button(commands, font, "Save", SAVE_BTN_TOP, SaveButton);
     spawn_overlay_button(commands, font, "New", NEW_BTN_TOP, NewWorldButton);
 
+    // Speed cycle button (caption shows the active multiplier).
+    commands
+        .spawn((
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(PAUSE_BTN_MARGIN),
+                top: Val::Px(SPEED_BTN_TOP),
+                width: Val::Px(PAUSE_BTN_W),
+                height: Val::Px(PAUSE_BTN_H),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(BTN_OFF),
+            SpeedButton,
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(speed_label(SPEED_STEPS[0])),
+                TextFont {
+                    font: font.clone(),
+                    font_size: 15.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+                SpeedLabel,
+            ));
+        });
+
     // Noot-colouring cycle button (caption shows the active mode).
     commands
         .spawn((
@@ -746,6 +840,33 @@ fn spawn_overlay_button(
                 TextColor(Color::WHITE),
             ));
         });
+}
+
+/// Caption for the speed button: the tick rate as a multiple of the 60 t/s base.
+fn speed_label(tps: f32) -> String {
+    format!("Speed {:.0}\u{00d7}", tps / SPEED_STEPS[0])
+}
+
+/// Cycle the sim speed from the on-screen button, advancing to the next entry in
+/// `SPEED_STEPS` (wrapping), and keep the caption in sync.
+fn speed_controls(
+    button: Query<&Interaction, (Changed<Interaction>, With<SpeedButton>)>,
+    mut speed: ResMut<SimSpeed>,
+    mut label: Query<&mut Text, With<SpeedLabel>>,
+) {
+    if button.iter().any(|i| *i == Interaction::Pressed) {
+        let cur = SPEED_STEPS
+            .iter()
+            .position(|&s| s == speed.ticks_per_second)
+            .unwrap_or(0);
+        speed.ticks_per_second = SPEED_STEPS[(cur + 1) % SPEED_STEPS.len()];
+    }
+    if let Ok(mut text) = label.single_mut() {
+        let want = speed_label(speed.ticks_per_second);
+        if text.0 != want {
+            text.0 = want;
+        }
+    }
 }
 
 /// Toggle pause from the spacebar or the on-screen button, and keep the button
@@ -1367,19 +1488,19 @@ fn update_hud(
     if let Ok(mut text) = hud.single_mut() {
         let pause_tag = if paused.0 { "[PAUSED]  " } else { "" };
         let out = format!(
-            "{pause_tag}econ-sim  seed {:#x}  noots {}  trades {}  in circulation ₦{:.0}\n\
+            "{pause_tag}econ-sim  seed {:#x}  noots {}  tick {}  trades {}  in circulation ₦{:.0}\n\
              {}/{} deposits claimed   avg appetite {:.1}   avg discount {:.2}\n\
-             starving {}/{} ({:.0}%)   production {:.1}/s   consumption {:.1}/s\n\
-             trade margin ₦{:.1}/s   utility {:.1}/s\n\
-             deaths {:.2}/min → target {:.2}   hunger rate {:.2}\n\
-             income ₦{:.2}/s   sales infl {:+.2}%/min → target {:.1}%\n\
+             starving {}/{} ({:.0}%)   production {:.2}/t   consumption {:.2}/t\n\
+             trade margin ₦{:.2}/t   utility {:.2}/t\n\
+             deaths {:.2e}/t → target {:.2e}   hunger rate {:.2}\n\
+             income ₦{:.2}/t   sales infl {:+.3}% → target {:.3}%\n\
              drag to pan · pinch to zoom · tap a noot/deposit · V/T/N overlays · S save · G new\n\n",
-            world.seed, count, stats.trades_total, total_bucks, claimed, n_deposits, avg_appetite,
-            avg_discount, starving, count, starving_pct, stats.production_rate,
+            world.seed, count, stats.ticks, stats.trades_total, total_bucks, claimed, n_deposits,
+            avg_appetite, avg_discount, starving, count, starving_pct, stats.production_rate,
             stats.consumption_rate, stats.merchant_profit_rate, stats.utility_rate,
-            hunger_ctrl.measured_per_min, hunger_ctrl.target_per_min, hunger_ctrl.rate,
+            hunger_ctrl.measured_per_tick, hunger_ctrl.target_per_tick, hunger_ctrl.rate,
             income_ctrl.rate, income_ctrl.measured_inflation * 100.0,
-            economy::TARGET_INFLATION_PER_MIN * 100.0
+            economy::TARGET_INFLATION * 100.0
         );
         text.0 = out;
     }

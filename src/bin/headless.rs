@@ -1,21 +1,26 @@
 //! Headless simulation harness — runs the real rollouts without any graphics so the
-//! learning can be observed in a terminal. Drives a bare `bevy_ecs` World + Schedule
-//! with a manually-advanced clock (deterministic, fast), printing aggregate stats.
+//! learning can be observed and tuned offline. Drives a bare `bevy_ecs` World +
+//! Schedule on the fixed simulation tick (no real-time clock: every system advances
+//! the world by exactly one `economy::TICK_DT`), as fast as the CPU allows.
+//!
+//! Stdout is **JSONL**: one JSON object per sampled tick with the full econ stats
+//! (rates are per-tick, so they're speed-invariant). Human-readable progress goes to
+//! stderr, keeping stdout a clean stream to pipe into `jq`/pandas/etc.
 //!
 //! Build/run (needs the `headless` feature, which omits Bevy's GUI features so it
-//! compiles without GPU/windowing libraries):
+//! compiles without GPU/windowing libs):
 //!
 //! ```text
-//! cargo run --release --no-default-features --features headless --bin headless
+//! cargo run --release --no-default-features --features headless --bin headless \
+//!     -- [seed] [ticks] [sample_every]
 //! ```
-
-use std::time::Duration;
 
 use bevy::prelude::*;
 
 use econ_sim::economy::{self, EconStats, HungerControl, IncomeControl};
+use econ_sim::goods::ItemRole;
 use econ_sim::noot::{
-    Action, Claim, Hunger, Inventory, Noot, NootMeta, TilePos, Trader, Wallet, EXPLORE_MAX,
+    Action, Claim, Hunger, Inventory, NootMeta, Noot, TilePos, Trader, Wallet, EXPLORE_MAX,
     EXPLORE_MIN, STARTING_BUCKS,
 };
 use econ_sim::policy::{ActorCritic, PolicyMemory, Trainer};
@@ -27,15 +32,22 @@ const COLS: i32 = 30;
 const ROWS: i32 = 22;
 const HEX_SIZE: f32 = 26.0;
 const N_NOOTS: usize = 56;
-const DT: f32 = 1.0 / 30.0; // simulated seconds per step
-const MINUTES: f32 = 5.0;
-const PRINT_EVERY_SECS: f32 = 15.0;
+
+const DEFAULT_TICKS: u64 = 60_000;
+const DEFAULT_SAMPLE_EVERY: u64 = 600;
+
+fn arg<T: std::str::FromStr>(n: usize, default: T) -> T {
+    std::env::args()
+        .nth(n)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
 
 fn main() {
-    let seed: u64 = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0x0EC0_5EED);
+    let seed: u64 = arg(1, 0x0EC0_5EED);
+    let ticks: u64 = arg(2, DEFAULT_TICKS);
+    let sample_every: u64 = arg(3, DEFAULT_SAMPLE_EVERY).max(1);
+
     let world = generate(seed, COLS, ROWS, HEX_SIZE);
     let n_tiles = (world.cols * world.rows) as usize;
     let mut rng = Rng::new(seed ^ 0xA5A5_5A5A);
@@ -43,13 +55,12 @@ fn main() {
 
     let mut w = World::new();
     w.insert_resource(HungerControl::new(
-        economy::TARGET_DEATH_FRAC_PER_MIN * N_NOOTS as f32,
+        economy::TARGET_DEATH_FRAC_PER_TICK * N_NOOTS as f32,
     ));
     w.insert_resource(IncomeControl::default());
     w.insert_resource(EconStats::default());
     w.insert_resource(ac);
     w.insert_resource(Trainer::default());
-    w.insert_resource(Time::<()>::default());
 
     for _ in 0..N_NOOTS {
         let col = rng.below(COLS as usize) as i32;
@@ -72,7 +83,7 @@ fn main() {
     w.insert_resource(Sim(world));
     w.insert_resource(SimRng(rng));
 
-    // Same order the GUI app runs the sim groups in.
+    // Same order (and chaining) the GUI app runs the sim schedule in.
     let mut sched = Schedule::default();
     sched.add_systems(
         (
@@ -95,52 +106,36 @@ fn main() {
             .chain(),
     );
 
-    let steps = (MINUTES * 60.0 / DT) as usize;
-    let print_every = (PRINT_EVERY_SECS / DT) as usize;
-    println!(
-        "headless seed {:#x}: {} noots, {} deposits, {} steps ({:.0} min @ {:.0} Hz)",
-        seed,
-        N_NOOTS,
-        w.resource::<Sim>().0.deposits.len(),
-        steps,
-        MINUTES,
-        1.0 / DT
+    let n_deposits = w.resource::<Sim>().0.deposits.len();
+    eprintln!(
+        "headless seed {:#x}: {} noots, {} deposits, {} ticks (sample every {}, dt {:.5}s/tick)",
+        seed, N_NOOTS, n_deposits, ticks, sample_every, economy::TICK_DT
     );
-    println!("   t  prod  cons  util  trades | deaths/min(tgt) hung starv | claim | bucks  exp | move/mine/refine | income infl%");
 
-    for step in 0..=steps {
-        if step % print_every == 0 {
-            print_stats(&mut w, step as f32 * DT);
-        }
-        w.resource_mut::<Time>().advance_by(Duration::from_secs_f32(DT));
+    // Emit the initial state, then one JSONL record per `sample_every` ticks.
+    emit_record(&mut w);
+    for _ in 0..ticks {
         sched.run(&mut w);
+        if w.resource::<EconStats>().ticks.is_multiple_of(sample_every) {
+            emit_record(&mut w);
+        }
     }
 }
 
-fn print_stats(w: &mut World, t: f32) {
-    let (prod, cons, util, trades) = {
-        let s = w.resource::<EconStats>();
-        (
-            s.production_rate,
-            s.consumption_rate,
-            s.utility_rate,
-            s.trades_total,
-        )
-    };
-    let (dpm, tgt) = {
-        let h = w.resource::<HungerControl>();
-        (h.measured_per_min, h.target_per_min)
-    };
-    let (irate, infl) = {
-        let i = w.resource::<IncomeControl>();
-        (i.rate, i.measured_inflation)
-    };
+/// Print one JSONL line of the full econ state at the current tick.
+fn emit_record(w: &mut World) {
+    let stats = w.resource::<EconStats>().clone();
+    let hunger = w.resource::<HungerControl>().clone();
+    let income = w.resource::<IncomeControl>().clone();
 
-    let mut q = w.query::<(&Action, &Hunger, &Claim, &Wallet, &NootMeta)>();
-    let mut act = [0u32; 3];
-    let (mut starving, mut claimed, mut n) = (0u32, 0u32, 0u32);
-    let (mut bucks, mut exp, mut hsum) = (0.0f32, 0.0f32, 0.0f32);
-    for (a, h, c, wal, m) in q.iter(w) {
+    // Population aggregates (one pass over the noots).
+    let goods = w.resource::<Sim>().0.goods.clone();
+    let mut q = w.query::<(&Action, &Hunger, &Claim, &Wallet, &NootMeta, &Trader, &Inventory)>();
+    let mut act = [0u64; 3];
+    let (mut starving, mut claimed, mut n) = (0u64, 0u64, 0u64);
+    let (mut bucks, mut appetite, mut experience, mut discount, mut positional) =
+        (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for (a, h, c, wal, m, tr, inv) in q.iter(w) {
         match a {
             Action::Move => act[0] += 1,
             Action::Mine => act[1] += 1,
@@ -152,19 +147,46 @@ fn print_stats(w: &mut World, t: f32) {
         if c.deposit.is_some() {
             claimed += 1;
         }
-        bucks += wal.bucks;
-        exp += m.experience;
-        hsum += h.staple.iter().sum::<f32>() / h.staple.len() as f32;
+        bucks += wal.bucks as f64;
+        appetite += (h.staple.iter().sum::<f32>() / h.staple.len() as f32) as f64;
+        experience += m.experience as f64;
+        discount += tr.discount as f64;
+        positional += (0..econ_sim::goods::N_ITEMS)
+            .filter(|&i| matches!(goods.role_of(i), ItemRole::Positional(_)))
+            .map(|i| inv.items[i])
+            .sum::<f32>() as f64;
         n += 1;
     }
-    let nf = n.max(1) as f32;
-    println!(
-        "{:5.0} {:5.1} {:5.1} {:5.2} {:6} | {:5.2}({:.2}) {:4.1} {:3} | {:3} | {:5.0} {:4.0} | {:3}/{:3}/{:3} | {:.2} {:+.2}",
-        t, prod, cons, util, trades,
-        dpm, tgt, hsum / nf, starving,
-        claimed,
-        bucks / nf, exp / nf,
-        act[0], act[1], act[2],
-        irate, infl * 100.0,
-    );
+    let nf = n.max(1) as f64;
+
+    let record = serde_json::json!({
+        "tick": stats.ticks,
+        "trades_total": stats.trades_total,
+        "production_rate": stats.production_rate,
+        "consumption_rate": stats.consumption_rate,
+        "merchant_profit_rate": stats.merchant_profit_rate,
+        "utility_rate": stats.utility_rate,
+        "produced_total": stats.produced_total,
+        "consumed_total": stats.consumed_total,
+        "merchant_profit_total": stats.merchant_profit_total,
+        "utility_total": stats.utility_total,
+        "ewma_price": stats.ewma_price,
+        "hunger_rate": hunger.rate,
+        "deaths_per_tick": hunger.measured_per_tick,
+        "deaths_per_tick_target": hunger.target_per_tick,
+        "income_rate": income.rate,
+        "sales_inflation": income.measured_inflation,
+        "pop": n,
+        "starving": starving,
+        "claimed": claimed,
+        "act_move": act[0],
+        "act_mine": act[1],
+        "act_refine": act[2],
+        "mean_bucks": bucks / nf,
+        "mean_appetite": appetite / nf,
+        "mean_experience": experience / nf,
+        "mean_discount": discount / nf,
+        "mean_positional": positional / nf,
+    });
+    println!("{}", record);
 }
