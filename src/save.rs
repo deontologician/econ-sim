@@ -53,6 +53,39 @@ pub struct Snapshot {
     pub noots: Vec<NootSave>,
 }
 
+/// Upgrade a parsed save in place from `from_version` to `from_version + 1`. Called for
+/// each version the blob is behind, so a step only ever sees the shape produced by the
+/// previous step. Mutate the JSON tree here — add fields with defaults, rename/
+/// restructure keys — since the live `Snapshot` is always newest.
+///
+/// Add an arm whenever you bump [`SAVE_VERSION`], e.g. for a future v2:
+/// ```ignore
+/// 1 => { save["new_field"] = serde_json::json!(0.0); }
+/// ```
+fn migrate_step(from_version: u32, save: &mut serde_json::Value) {
+    // v1 → v2: the shared `policy` field was added. It's `#[serde(default)]`, so a v1
+    // save (which lacks it) deserializes with an empty net and `setup` re-initializes
+    // it to the world's tile count — no JSON surgery needed here.
+    let _ = (from_version, save);
+}
+
+/// Replay every pending migration on a parsed blob, then deserialize into the current
+/// `Snapshot`. Shared by both backends (localStorage and file). A version newer than
+/// this build, or any failure, yields `None` (treated as "no save").
+fn snapshot_from_value(mut value: serde_json::Value) -> Option<Snapshot> {
+    let mut version = value.get("version")?.as_u64()? as u32;
+    if version > SAVE_VERSION {
+        return None; // saved by a newer build than this one
+    }
+    while version < SAVE_VERSION {
+        migrate_step(version, &mut value);
+        version += 1;
+        value["version"] = serde_json::json!(version);
+    }
+    serde_json::from_value(value).ok()
+}
+
+// --- Browser backend (localStorage) -----------------------------------------
 #[cfg(target_arch = "wasm32")]
 const SAVE_KEY: &str = "econ-sim-save";
 
@@ -65,18 +98,7 @@ fn storage() -> Option<web_sys::Storage> {
 #[cfg(target_arch = "wasm32")]
 pub fn load() -> Option<Snapshot> {
     let raw = storage()?.get_item(SAVE_KEY).ok().flatten()?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let mut version = value.get("version")?.as_u64()? as u32;
-    if version > SAVE_VERSION {
-        return None; // saved by a newer build than this one
-    }
-    // Replay every missing migration in order: v → v+1 → … → SAVE_VERSION.
-    while version < SAVE_VERSION {
-        migrate_step(version, &mut value);
-        version += 1;
-        value["version"] = serde_json::json!(version);
-    }
-    serde_json::from_value(value).ok()
+    snapshot_from_value(serde_json::from_str(&raw).ok()?)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -84,23 +106,6 @@ pub fn store(snap: &Snapshot) {
     if let (Some(s), Ok(text)) = (storage(), serde_json::to_string(snap)) {
         let _ = s.set_item(SAVE_KEY, &text);
     }
-}
-
-/// Upgrade a parsed save in place from `from_version` to `from_version + 1`. `load`
-/// calls this for each version the file is behind, so a step only ever sees the
-/// shape produced by the previous step. Mutate the JSON tree here — add fields with
-/// defaults, rename/restructure keys — since the live `Snapshot` is always newest.
-///
-/// Add an arm whenever you bump [`SAVE_VERSION`], e.g. for a future v2:
-/// ```ignore
-/// 1 => { save["new_field"] = serde_json::json!(0.0); }
-/// ```
-#[cfg(target_arch = "wasm32")]
-fn migrate_step(from_version: u32, save: &mut serde_json::Value) {
-    // v1 → v2: the shared `policy` field was added. It's `#[serde(default)]`, so a v1
-    // save (which lacks it) deserializes with an empty net and `setup` re-initializes
-    // it to the world's tile count — no JSON surgery needed here.
-    let _ = (from_version, save);
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -118,14 +123,43 @@ pub fn reload_page() {
     }
 }
 
-// --- Native stubs (the app ships as wasm; keep it compiling on native too) ---
+// --- Native backend (JSON file) ---------------------------------------------
+// The same full-state round-trip the browser does, to a file instead of localStorage,
+// so the headless harness has the GUI's save/load/new affordances. The no-arg
+// `load`/`store`/`clear` use a default path (overridable via the `ECON_SIM_SAVE` env
+// var) so a native GUI build persists too; the headless binary passes explicit paths
+// via `load_from`/`store_to`.
+#[cfg(not(target_arch = "wasm32"))]
+fn default_path() -> String {
+    std::env::var("ECON_SIM_SAVE").unwrap_or_else(|_| "econ-sim-save.json".into())
+}
+
+/// Read a snapshot from `path` (migrating as needed); `None` if absent/corrupt/newer.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_from(path: &str) -> Option<Snapshot> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    snapshot_from_value(serde_json::from_str(&raw).ok()?)
+}
+
+/// Write a snapshot to `path` as JSON (best-effort; errors are ignored, as on the web).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn store_to(path: &str, snap: &Snapshot) {
+    if let Ok(text) = serde_json::to_string(snap) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load() -> Option<Snapshot> {
-    None
+    load_from(&default_path())
 }
 #[cfg(not(target_arch = "wasm32"))]
-pub fn store(_snap: &Snapshot) {}
+pub fn store(snap: &Snapshot) {
+    store_to(&default_path(), snap);
+}
 #[cfg(not(target_arch = "wasm32"))]
-pub fn clear() {}
+pub fn clear() {
+    let _ = std::fs::remove_file(default_path());
+}
 #[cfg(not(target_arch = "wasm32"))]
 pub fn reload_page() {}

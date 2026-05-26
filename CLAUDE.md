@@ -15,12 +15,16 @@ starvation. No gameplay input beyond pan/zoom/pause and tapping a noot to follow
   be visually verified on-device after deploy.
 - **Headless harness (runs here!):** the simulation core is a library; the `headless`
   feature uses core Bevy only (no GPU/windowing) so the rollouts run without graphics:
-  `cargo run --release --no-default-features --features headless --bin headless [seed]`.
-  It steps a bare ECS World on a manual clock for 5 simulated minutes and prints
-  aggregate stats — use it to actually watch the policy learn (production/utility
-  rates, action mix, deaths vs target). Also run `cargo clippy` on it (it builds
-  natively). The crate is split: `src/lib.rs` (sim core, GUI-free), `src/main.rs` (GUI
-  bin, `required-features=["gui"]`), `src/bin/headless.rs` (`headless`).
+  `cargo run --release --no-default-features --features headless --bin headless --
+  [seed] [ticks] [sample_every] [--load PATH] [--save PATH]`. It runs the **same**
+  fixed-tick pipeline (`economy::add_sim_systems`) the GUI does, as fast as the CPU
+  allows, and prints one **JSONL** line of full econ stats per sampled tick to stdout
+  (human progress to stderr) — pipe it into `jq`/pandas to watch the policy learn.
+  Mirrors the GUI's functional affordances: `--load`/`--save` are file-backed
+  save/resume (the GUI uses localStorage), no `--load` = New. Also run `cargo clippy`
+  on it (it builds natively). The crate is split: `src/lib.rs` (sim core, GUI-free),
+  `src/main.rs` (GUI bin, `required-features=["gui"]`), `src/bin/headless.rs`
+  (`headless`).
 
 ## Linting — zero-warning policy
 
