@@ -71,16 +71,23 @@ cargo clippy --target wasm32-unknown-unknown
   by the map sprites and the HUD images.
 - `noot.rs` — agent ECS components. **No roles**: every noot is one unified type
   (`Noot` marker) carrying `Claim` (which deposit it owns, if any), `Trader`
-  (learned arbitrage discount + cost basis), `Inventory`, `Wallet`, `Hunger`,
-  `RouteMemory`.
-- `economy.rs` — emergent claiming (`claim_deposits`), extraction, universal
-  refining, trade (`meet_and_trade`, unified consumption+arbitrage valuation),
-  consumption, the hunger-rate PID, reward plumbing, `EconStats`.
-- `movement.rs` — locomotion + the per-hex **TD(λ) value-learning** navigation
-  (`RouteMemory`); a claim-holder homes to its deposit to refill then value-walks to
-  sell, a claimless noot just roams the value gradient.
-- `main.rs` — Bevy app wiring, spawn/respawn, camera fit/input, HUD, pause, the
-  value/terrain overlays, deposit-claim outlines, and per-noot ownership colour.
+  (learned arbitrage discount + cost basis), `Inventory`, `Wallet`, `Hunger`, plus the
+  per-noot `Action` and `PolicyMemory` (transient RL cache, defined in `policy.rs`).
+- `policy.rs` — the shared **off-policy actor-critic** brain (`ActorCritic`), replay
+  buffer + `Trainer`, the per-noot `PolicyMemory`, masked softmax/sampling. Pure RL
+  machinery; game-specific featurization/utility live in `economy.rs`.
+- `economy.rs` — emergent claiming (`claim_deposits`), extraction, universal refining,
+  trade (`meet_and_trade`), consumption, the hunger-rate + income controllers,
+  `EconStats`, the learned decision step (`policy_step`, Maslow-utility reward), and
+  `add_sim_systems` — the single source of truth for the fixed-tick pipeline order
+  (shared by the GUI app and the headless harness).
+- `movement.rs` — GUI-only sprite glide toward each noot's current tile (visual only;
+  discrete hex steps are chosen by the policy in `economy::policy_step`).
+- `graph.rs` — GUI-only CPU line-chart rasterization (sparklines + correlation chart)
+  for the on-screen graphs strip.
+- `main.rs` — Bevy app wiring, spawn/respawn, camera fit/input, the fixed-tick speed
+  driver + transport bar, the collapsible sparkline strip, crowd/terrain overlays,
+  deposit-claim outlines, and per-noot colouring.
 
 ## Plans & the feature ledger
 

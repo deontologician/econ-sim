@@ -546,6 +546,33 @@ pub fn train_policy(mut ac: ResMut<ActorCritic>, mut trainer: ResMut<Trainer>, m
     }
 }
 
+/// Register the fixed-tick simulation pipeline on `schedule`, in canonical order and
+/// chained so each system sees the previous one's writes. The single source of truth
+/// for the sim order, shared by the GUI app's `SimSchedule` and the headless harness —
+/// neither defines the list itself. (Movement is a GUI-only sprite glide, not here.)
+pub fn add_sim_systems(schedule: &mut Schedule) {
+    schedule.add_systems(
+        (
+            simulate,
+            income,
+            income_controller,
+            hunger_tick,
+            hunger_pid,
+            age_noots,
+            policy_step,
+            claim_deposits,
+            extract,
+            refine,
+            meet_and_trade,
+            consume,
+            death_and_respawn,
+            update_rates,
+            train_policy,
+        )
+            .chain(),
+    );
+}
+
 /// Advance the resource simulation (deposit regrowth) by one tick.
 pub fn simulate(mut sim: ResMut<Sim>) {
     sim.0.tick(TICK_DT);
@@ -660,7 +687,7 @@ pub fn claim_deposits(sim: Res<Sim>, mut q: Query<(&TilePos, &mut Claim)>) {
 }
 
 /// Refine held intermediates — but only for noots whose chosen action this tick is
-/// `Refine` (set by `choose_action`), faster the more refining experience accrued.
+/// `Refine` (set by `policy_step`), faster the more refining experience accrued.
 pub fn refine(
     sim: Res<Sim>,
     mut q: Query<(&Action, &mut Inventory, &mut NootMeta)>,

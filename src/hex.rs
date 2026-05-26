@@ -58,6 +58,26 @@ pub fn torus_distance(ac: i32, ar: i32, bc: i32, br: i32, cols: i32, rows: i32) 
     best
 }
 
+/// Mean nearest-neighbour hex distance over a set of occupied tiles — a clumping proxy
+/// (lower = more clustered). O(n²), which is fine for this sim's small populations;
+/// returns 0 for fewer than two tiles.
+pub fn mean_nearest_neighbor(tiles: &[(i32, i32)], cols: i32, rows: i32) -> f32 {
+    if tiles.len() < 2 {
+        return 0.0;
+    }
+    let mut sum = 0.0f64;
+    for (i, &(c, r)) in tiles.iter().enumerate() {
+        let mut best = i32::MAX;
+        for (j, &(oc, or)) in tiles.iter().enumerate() {
+            if i != j {
+                best = best.min(torus_distance(c, r, oc, or, cols, rows));
+            }
+        }
+        sum += best as f64;
+    }
+    (sum / tiles.len() as f64) as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

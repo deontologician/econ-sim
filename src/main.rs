@@ -306,8 +306,7 @@ struct GraphLabel {
     series: usize,
 }
 
-/// Per-hex heat cell for the aggregated noot value-field overlay (`tile` indexes
-/// `RouteMemory::value`, i.e. `row * cols + col`).
+/// Per-hex heat cell for the crowd-density overlay (`tile` is `row * cols + col`).
 #[derive(Component)]
 struct ValueOverlay {
     tile: usize,
@@ -352,30 +351,14 @@ fn main() {
         .init_resource::<economy::IncomeControl>()
         .init_resource::<Trainer>()
         .add_systems(Startup, setup)
-        // The simulation runs on a fixed-tick schedule (each system advances the
-        // world by one `TICK_DT`), driven many times per frame by `run_sim_ticks`.
-        // Order matches the headless harness; chained so reads see prior writes.
-        .add_systems(
-            SimSchedule,
-            (
-                economy::simulate,
-                economy::income,
-                economy::income_controller,
-                economy::hunger_tick,
-                economy::hunger_pid,
-                economy::age_noots,
-                economy::policy_step,
-                economy::claim_deposits,
-                economy::extract,
-                economy::refine,
-                economy::meet_and_trade,
-                economy::consume,
-                economy::death_and_respawn,
-                economy::update_rates,
-                economy::train_policy,
-            )
-                .chain(),
-        )
+        // The fixed-tick simulation pipeline (each system advances the world by one
+        // `TICK_DT`), driven many times per frame by `run_sim_ticks`. The system list
+        // lives in `economy::add_sim_systems`, shared with the headless harness.
+        .add_schedule({
+            let mut sched = Schedule::new(SimSchedule);
+            economy::add_sim_systems(&mut sched);
+            sched
+        })
         // Per-frame (real-time) systems: drive the sim ticks, then render/input/HUD.
         // `run_sim_ticks` is exclusive and runs first so the visuals reflect the
         // freshest sim state; `movement::movement` glides sprites toward their tiles.
@@ -518,9 +501,9 @@ fn setup(
     commands.spawn((Camera2d, Transform::from_scale(Vec3::splat(init_zoom))));
 
     // Tiles share one neutral material — difficulty is shown *only* via the
-    // toggleable terrain overlay, so it never fights the value heat overlay. Each
+    // toggleable terrain overlay, so it never fights the crowd-density overlay. Each
     // tile also gets two hidden overlay cells stacked above it (z 0.4 terrain,
-    // z 1.6 value) — the value heat sits just under the noot layer (z 2.0).
+    // z 1.6 crowd) — the crowd heat sits just under the noot layer (z 2.0).
     let hex_mesh = meshes.add(RegularPolygon::new(hex_size * 0.96, 6));
     let tile_mat = materials.add(Color::srgb(0.18, 0.20, 0.22));
     for tile in &world.tiles {
@@ -1174,18 +1157,7 @@ fn sample_stats(
         n += 1;
     }
     let nf = n.max(1) as f32;
-    let mut nn = 0.0f32;
-    for (i, &(c, r)) in tiles.iter().enumerate() {
-        let mut best = i32::MAX;
-        for (j, &(oc, or)) in tiles.iter().enumerate() {
-            if i != j {
-                best = best.min(hex::torus_distance(c, r, oc, or, cols, rows));
-            }
-        }
-        if best != i32::MAX {
-            nn += best as f32;
-        }
-    }
+    let nn = hex::mean_nearest_neighbor(&tiles, cols, rows);
 
     let trades = stats.trades_total;
     let dtrades = trades.saturating_sub(*prev_trades) as f32;
@@ -1206,7 +1178,7 @@ fn sample_stats(
     s[11] = income.rate;
     s[12] = income.measured_inflation * 100.0;
     s[13] = age / nf;
-    s[14] = nn / nf;
+    s[14] = nn;
 
     hist.samples.push_back(s);
     while hist.samples.len() > HISTORY_CAP {
@@ -1608,7 +1580,7 @@ fn new_world_controls(
     }
 }
 
-/// Drive the inspection controls: V/Value toggles the value heat overlay, T/Terrain
+/// Drive the inspection controls: V/Crowd toggles the crowd-density overlay, T/Terrain
 /// the difficulty overlay, and N/Noots cycles how noots are coloured. Keeps the
 /// hidden hex cells and the button captions/tints in sync.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]

@@ -38,10 +38,9 @@ pub const DISCOUNT_LR: f32 = 0.04;
 #[derive(Component)]
 pub struct Noot;
 
-/// The single action a noot takes this tick. A heuristic `choose_action` sets it
-/// today; this is the seam for a learned action rollout (the policy will pick among
-/// these per step). Mining and refining are mutually exclusive — picking one means
-/// forgoing the other this tick.
+/// The single action a noot takes this tick, chosen by the learned policy in
+/// `economy::policy_step`. Mining and refining are mutually exclusive — picking one
+/// means forgoing the other this tick.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Action {
     /// Took a relative directional step this tick (which neighbour is resolved by

@@ -94,28 +94,9 @@ fn main() {
     w.insert_resource(Sim(world));
     w.insert_resource(SimRng(rng));
 
-    // Same order (and chaining) the GUI app runs the sim schedule in.
+    // Identical pipeline to the GUI app — both build it from `add_sim_systems`.
     let mut sched = Schedule::default();
-    sched.add_systems(
-        (
-            economy::simulate,
-            economy::income,
-            economy::income_controller,
-            economy::hunger_tick,
-            economy::hunger_pid,
-            economy::age_noots,
-            economy::policy_step,
-            economy::claim_deposits,
-            economy::extract,
-            economy::refine,
-            economy::meet_and_trade,
-            economy::consume,
-            economy::death_and_respawn,
-            economy::update_rates,
-            economy::train_policy,
-        )
-            .chain(),
-    );
+    economy::add_sim_systems(&mut sched);
 
     let n_deposits = w.resource::<Sim>().0.deposits.len();
     eprintln!(
@@ -175,21 +156,7 @@ fn emit_record(w: &mut World) {
         n += 1;
     }
     let nf = n.max(1) as f64;
-
-    // Clumping proxy: mean nearest-neighbour hex distance (lower = more clustered).
-    let mut nn_sum = 0.0f64;
-    for (i, &(c, r)) in tiles.iter().enumerate() {
-        let mut best = i32::MAX;
-        for (j, &(oc, or)) in tiles.iter().enumerate() {
-            if i != j {
-                best = best.min(econ_sim::hex::torus_distance(c, r, oc, or, cols, rows));
-            }
-        }
-        if best != i32::MAX {
-            nn_sum += best as f64;
-        }
-    }
-    let mean_nn_dist = nn_sum / nf;
+    let mean_nn_dist = econ_sim::hex::mean_nearest_neighbor(&tiles, cols, rows);
 
     let record = serde_json::json!({
         "tick": stats.ticks,
