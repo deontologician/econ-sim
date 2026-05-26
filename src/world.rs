@@ -255,20 +255,17 @@ fn generate_terrain(rng: &mut Rng, cols: i32, rows: i32) -> Vec<Tile> {
     let mut d: Vec<f32> = (0..count).map(|_| rng.next_f32()).collect();
 
     // Relax toward the neighbourhood mean so difficulty varies *continuously* and
-    // every hex is anchored to its surroundings. Out-of-bounds reads as max
-    // difficulty, giving the map rugged, hard edges.
+    // every hex is anchored to its surroundings. The map is a torus, so neighbours
+    // wrap and there are no edges (seamless terrain).
     for _ in 0..SMOOTHING_PASSES {
         let mut next = d.clone();
         for r in 0..rows {
             for c in 0..cols {
                 let mut sum = 0.0;
-                let mut n = 0.0;
-                for (nc, nr) in neighbors(c, r) {
-                    let oob = nc < 0 || nr < 0 || nc >= cols || nr >= rows;
-                    sum += if oob { 1.0 } else { d[idx(nc, nr)] };
-                    n += 1.0;
+                for (nc, nr) in neighbors(c, r, cols, rows) {
+                    sum += d[idx(nc, nr)];
                 }
-                let mean = sum / n;
+                let mean = sum / 6.0;
                 next[idx(c, r)] =
                     SMOOTH_SELF_WEIGHT * d[idx(c, r)] + (1.0 - SMOOTH_SELF_WEIGHT) * mean;
             }
@@ -294,9 +291,8 @@ fn generate_terrain(rng: &mut Rng, cols: i32, rows: i32) -> Vec<Tile> {
         for c in 0..cols {
             if rng.chance(CLIFF_CHANCE) {
                 d[idx(c, r)] = rng.range(0.85, 1.0);
-                for (nc, nr) in neighbors(c, r) {
-                    let oob = nc < 0 || nr < 0 || nc >= cols || nr >= rows;
-                    if !oob && rng.chance(0.4) {
+                for (nc, nr) in neighbors(c, r, cols, rows) {
+                    if rng.chance(0.4) {
                         d[idx(nc, nr)] = rng.range(0.8, 1.0);
                     }
                 }

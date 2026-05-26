@@ -19,12 +19,14 @@ pub fn hex_center(col: i32, row: i32, size: f32) -> (f32, f32) {
 const EVEN_ROW: [(i32, i32); 6] = [(1, 0), (0, -1), (-1, -1), (-1, 0), (-1, 1), (0, 1)];
 const ODD_ROW: [(i32, i32); 6] = [(1, 0), (1, -1), (0, -1), (-1, 0), (0, 1), (1, 1)];
 
-/// The six neighbour offset coordinates of `(col, row)`. Callers must bounds-check.
-pub fn neighbors(col: i32, row: i32) -> [(i32, i32); 6] {
+/// The six neighbour offset coordinates of `(col, row)` on a **torus**: the map wraps
+/// in both axes, so every tile has six in-bounds neighbours and there are no edges.
+/// `cols` and `rows` should be even so odd-r parity stays consistent across the seam.
+pub fn neighbors(col: i32, row: i32, cols: i32, rows: i32) -> [(i32, i32); 6] {
     let deltas = if row.rem_euclid(2) == 0 { EVEN_ROW } else { ODD_ROW };
     let mut out = [(0, 0); 6];
     for (i, (dc, dr)) in deltas.iter().enumerate() {
-        out[i] = (col + dc, row + dr);
+        out[i] = ((col + dc).rem_euclid(cols), (row + dr).rem_euclid(rows));
     }
     out
 }

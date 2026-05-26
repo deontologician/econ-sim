@@ -342,8 +342,9 @@ fn features(world: &crate::world::World, pos_idx: usize, hunger: &Hunger, inv: &
 /// not an action.) Directions are indexed identically to `hex::neighbors`.
 fn action_mask(world: &crate::world::World, claim: &Claim, pos: &TilePos, inv: &Inventory) -> [bool; N_ACT] {
     let mut mask = [false; N_ACT];
-    for (i, (c, r)) in neighbors(pos.col, pos.row).into_iter().enumerate() {
-        mask[i] = c >= 0 && r >= 0 && c < world.cols && r < world.rows;
+    // The map is a torus, so every move direction is always valid.
+    for m in mask.iter_mut().take(policy::N_DIRS) {
+        *m = true;
     }
     mask[policy::A_MINE] = claim.deposit.is_some_and(|d| {
         let dep = &world.deposits[d];
@@ -432,7 +433,7 @@ pub fn policy_step(
         } else if act == policy::A_REFINE {
             Action::Refine
         } else {
-            let (nc, nr) = neighbors(pos.col, pos.row)[act];
+            let (nc, nr) = neighbors(pos.col, pos.row, world.cols, world.rows)[act];
             pos.col = nc;
             pos.row = nr;
             Action::Move

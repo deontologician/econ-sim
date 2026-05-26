@@ -23,9 +23,18 @@ pub fn movement(
 ) {
     let hex_size = sim.0.hex_size;
     let t = (time.delta_secs() * 8.0).min(1.0);
+    // A torus wrap moves a noot across the whole map in one step; snap instead of
+    // gliding so it doesn't streak across the screen.
+    let snap2 = (hex_size * 4.0).powi(2);
     for (pos, mut transform) in &mut noots {
         let target = tile_to_pixel(pos.col, pos.row, hex_size, view.offset);
-        transform.translation.x += (target.x - transform.translation.x) * t;
-        transform.translation.y += (target.y - transform.translation.y) * t;
+        let cur = transform.translation.truncate();
+        if target.distance_squared(cur) > snap2 {
+            transform.translation.x = target.x;
+            transform.translation.y = target.y;
+        } else {
+            transform.translation.x += (target.x - cur.x) * t;
+            transform.translation.y += (target.y - cur.y) * t;
+        }
     }
 }
