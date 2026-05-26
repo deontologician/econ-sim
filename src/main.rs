@@ -326,7 +326,7 @@ fn main() {
                     update_selection_ring,
                     update_selection_panel,
                     update_noot_color,
-                    update_value_overlay,
+                    update_crowd_overlay,
                     update_deposit_outlines,
                     hide_loading_screen,
                 ),
@@ -456,7 +456,7 @@ fn setup(
             TerrainOverlay,
         ));
 
-        // Value-field heat overlay: recoloured each tick by `update_value_overlay`.
+        // Crowd-density heat overlay: recoloured each tick by `update_crowd_overlay`.
         // Born translucent (alpha < 1) so the material is created in blend mode.
         let idx = (tile.row * world.cols + tile.col) as usize;
         commands.spawn((
@@ -782,7 +782,7 @@ fn spawn_ui(commands: &mut Commands, icons: &[Handle<Image>; 4], font: &Handle<F
         });
 
     // Overlay toggles, stacked under the transport bar (same touch-target size).
-    spawn_overlay_button(commands, font, "Value", VALUE_BTN_TOP, ValueButton);
+    spawn_overlay_button(commands, font, "Crowd", VALUE_BTN_TOP, ValueButton);
     spawn_overlay_button(commands, font, "Terrain", TERRAIN_BTN_TOP, TerrainButton);
     spawn_overlay_button(commands, font, "Save", SAVE_BTN_TOP, SaveButton);
     spawn_overlay_button(commands, font, "New", NEW_BTN_TOP, NewWorldButton);
@@ -1331,20 +1331,20 @@ fn rank_color(t: f32) -> Color {
     Color::srgb(1.0 - 0.8 * t, 1.0 - 0.7 * t, 1.0 - 0.05 * t)
 }
 
-/// Recolour the value-heat cells from the shared critic's value over each tile
-/// (red = most valued), normalized across the map. Uses a neutral, hungry-and-broke
-/// feature snapshot so the surface highlights where the policy expects to do well.
-/// Throttled — the net drifts slowly and recolouring every cell each frame is wasteful.
-fn update_value_overlay(
+/// Recolour the heat cells as a **crowd-density** map: how many noots stand on each
+/// tile, normalized to the busiest tile (red = most crowded). This replaced the old
+/// critic-value surface, which went uniform once navigation moved to the engineered
+/// heading features — density actually shows the clumping/trade hot-spots. Throttled.
+fn update_crowd_overlay(
     time: Res<Time>,
     overlays: Res<Overlays>,
     sim: Res<Sim>,
-    policy: Res<ActorCritic>,
+    noots: Query<&TilePos, With<Noot>>,
     mut timer: Local<f32>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     cells: Query<(&ValueOverlay, &MeshMaterial2d<ColorMaterial>)>,
 ) {
-    if !overlays.value || policy.n_tiles == 0 {
+    if !overlays.value {
         return;
     }
     *timer += time.delta_secs();
@@ -1353,26 +1353,21 @@ fn update_value_overlay(
     }
     *timer = 0.0;
 
-    let n = (sim.0.cols * sim.0.rows) as usize;
-    // Neutral probe: hungry, broke, no claim, bias; deposit-direction and on-minable
-    // features left at zero (the overlay shows the position value surface alone).
-    let mut probe = [0.0f32; econ_sim::policy::N_OTHER];
-    probe[1] = 1.0;
-    probe[2] = 1.0;
-    probe[5] = 1.0;
-    let mut agg = vec![0.0f32; n];
-    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
-    for (t, a) in agg.iter_mut().enumerate() {
-        let v = policy.value(t, &probe);
-        *a = v;
-        lo = lo.min(v);
-        hi = hi.max(v);
+    let cols = sim.0.cols;
+    let n = (cols * sim.0.rows) as usize;
+    let mut count = vec![0u32; n];
+    for pos in &noots {
+        let idx = (pos.row * cols + pos.col) as usize;
+        if idx < n {
+            count[idx] += 1;
+        }
     }
-    let span = (hi - lo).max(1e-3);
+    let max = count.iter().copied().max().unwrap_or(0).max(1) as f32;
     for (cell, mat) in &cells {
         if let Some(m) = materials.get_mut(&mat.0) {
-            let v = ((agg[cell.tile] - lo) / span).clamp(0.0, 1.0);
-            m.color = Color::srgba(1.0, 0.12, 0.04, v * 0.85);
+            // Sub-linear ramp (sqrt) so a single noot is already faintly visible.
+            let v = (count[cell.tile] as f32 / max).sqrt();
+            m.color = Color::srgba(1.0, 0.35, 0.05, v * 0.9);
         }
     }
 }
