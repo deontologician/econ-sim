@@ -94,7 +94,12 @@ pub struct World {
     pub goods: WorldGoods,
 }
 
-const DEPOSITS_PER_ELEMENT: usize = 3;
+/// Each element spawns this many clusters, each packing `DEPOSITS_PER_CLUSTER`
+/// deposits within `CLUSTER_RADIUS` tiles — so resources come in related fields,
+/// not lone scattered tiles. Total deposits = elements × clusters × per-cluster.
+const CLUSTERS_PER_ELEMENT: usize = 3;
+const DEPOSITS_PER_CLUSTER: usize = 4;
+const CLUSTER_RADIUS: i32 = 2;
 const SMOOTHING_PASSES: usize = 5;
 /// How much a smoothing pass keeps a hex's own difficulty vs. its neighbours'
 /// mean. Lower = smoother, so terrain clumps into larger regions.
@@ -357,36 +362,63 @@ fn place_deposits(rng: &mut Rng, world: &mut World) {
         let role = world.chosen[slot].role;
         // Replenishables thrive on easy land; finite stocks hide in hard terrain.
         let prefer_hard = matches!(role, ResourceRole::Finite);
-        for _ in 0..DEPOSITS_PER_ELEMENT {
-            let Some(tile) = pick_empty_tile(rng, &world.tiles, prefer_hard) else {
-                break;
+        // Deposits come in clusters (a "field" of the same element): seed a cluster
+        // centre on the preferred terrain, then pack the rest nearby.
+        for _ in 0..CLUSTERS_PER_ELEMENT {
+            let Some(center) = pick_empty_tile(rng, &world.tiles, prefer_hard) else {
+                continue;
             };
-            let kind = match role {
-                ResourceRole::Replenishable => {
-                    let capacity = rng.range(30.0, 60.0) as f64;
-                    DepositKind::Replenishable {
-                        rate: rng.range(0.6, 1.8),
-                        stock: capacity * 0.5,
-                        capacity,
-                    }
-                }
-                ResourceRole::Finite => {
-                    let initial = rng.range(800.0, 1600.0) as f64;
-                    DepositKind::Finite {
-                        remaining: initial,
-                        initial,
-                    }
-                }
-            };
-            let di = world.deposits.len();
-            world.deposits.push(Deposit {
-                element_slot: slot,
-                tile,
-                kind,
-            });
-            world.tiles[tile].deposit = Some(di);
+            push_deposit(rng, world, slot, role, center);
+            for _ in 1..DEPOSITS_PER_CLUSTER {
+                let Some(tile) = pick_near_empty(rng, world, center, CLUSTER_RADIUS) else {
+                    break;
+                };
+                push_deposit(rng, world, slot, role, tile);
+            }
         }
     }
+}
+
+fn push_deposit(rng: &mut Rng, world: &mut World, slot: usize, role: ResourceRole, tile: usize) {
+    let kind = match role {
+        ResourceRole::Replenishable => {
+            let capacity = rng.range(30.0, 60.0) as f64;
+            DepositKind::Replenishable {
+                rate: rng.range(0.6, 1.8),
+                stock: capacity * 0.5,
+                capacity,
+            }
+        }
+        ResourceRole::Finite => {
+            let initial = rng.range(800.0, 1600.0) as f64;
+            DepositKind::Finite {
+                remaining: initial,
+                initial,
+            }
+        }
+    };
+    let di = world.deposits.len();
+    world.deposits.push(Deposit {
+        element_slot: slot,
+        tile,
+        kind,
+    });
+    world.tiles[tile].deposit = Some(di);
+}
+
+/// An empty tile within `radius` (in col/row) of `center`, for packing a cluster.
+fn pick_near_empty(rng: &mut Rng, world: &World, center: usize, radius: i32) -> Option<usize> {
+    let (cc, cr) = (world.tiles[center].col, world.tiles[center].row);
+    let span = (2 * radius + 1) as usize;
+    for _ in 0..30 {
+        let c = (cc + rng.below(span) as i32 - radius).clamp(0, world.cols - 1);
+        let r = (cr + rng.below(span) as i32 - radius).clamp(0, world.rows - 1);
+        let t = (r * world.cols + c) as usize;
+        if world.tiles[t].deposit.is_none() {
+            return Some(t);
+        }
+    }
+    None
 }
 
 fn pick_empty_tile(rng: &mut Rng, tiles: &[Tile], prefer_hard: bool) -> Option<usize> {

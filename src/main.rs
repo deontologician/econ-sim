@@ -30,8 +30,11 @@ const ROWS: i32 = 22;
 const HEX_SIZE: f32 = 26.0;
 
 // --- Population -------------------------------------------------------------
-/// Free-roaming noots spawned in addition to one seeded onto each deposit.
+/// Free-roaming noots spawned alongside the seeded miners.
 const N_ROAMERS: usize = 44;
+/// At most this many deposits get a noot pre-seeded on them at a fresh start (the
+/// rest are claimed emergently). Caps the population independent of deposit count.
+const MAX_SEEDED_MINERS: usize = 12;
 
 /// Seconds a noot can sit fully starving (all staples maxed) before it dies and
 /// is reborn fresh at a random tile (its deposit claim, if any, is released).
@@ -331,7 +334,8 @@ fn setup(
         }
         None => {
             let world = generate(random_seed(), COLS, ROWS, HEX_SIZE);
-            let n_noots = (world.deposits.len() + N_ROAMERS) as f32;
+            let n_seed = world.deposits.len().min(MAX_SEEDED_MINERS);
+            let n_noots = (n_seed + N_ROAMERS) as f32;
             commands.insert_resource(HungerControl::new(
                 economy::TARGET_DEATH_FRAC_PER_MIN * n_noots,
             ));
@@ -477,10 +481,11 @@ fn setup(
                 );
             }
         }
-        // Fresh: one noot seeded (pre-claimed) onto each deposit so mining starts,
-        // the rest free-roaming and unclaimed (ownership is otherwise emergent).
+        // Fresh: seed a capped number of deposits with a pre-claimed miner so mining
+        // starts at once; the rest free-roam and claim deposits emergently.
         None => {
-            for di in 0..world.deposits.len() {
+            let n_seed = world.deposits.len().min(MAX_SEEDED_MINERS);
+            for di in 0..n_seed {
                 let tile = world.deposits[di].tile;
                 let (col, row) = (world.tiles[tile].col, world.tiles[tile].row);
                 spawn_noot(
