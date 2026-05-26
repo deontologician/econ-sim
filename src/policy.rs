@@ -20,17 +20,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::rng::Rng;
 
-/// Action layout: indices 0..6 are the six hex move directions (relative steps),
-/// then Mine and Refine. Trading is automatic (not an action) — see `meet_and_trade`.
+/// Action layout: the policy chooses among four **committed options** (semi-MDP
+/// macro-actions), not primitive steps. Each option locks in a multi-step plan that a
+/// deterministic executor (`economy::policy_step`) drives to completion — go mine a load,
+/// haul to the best market and sell, refine in place, or scout — before the policy
+/// decides again. This is the fix for the long produce→haul→sell credit-assignment chain:
+/// the policy only has to learn *which intent is worthwhile here*, never how to navigate
+/// (deterministic), so directed behaviour replaces per-step dithering. Trading itself is
+/// automatic on proximity (not an option) — see `meet_and_trade`.
+pub const A_MINE: usize = 0;
+pub const A_SELL: usize = 1;
+pub const A_REFINE: usize = 2;
+pub const A_EXPLORE: usize = 3;
+pub const N_ACT: usize = 4;
+/// Hex move directions — still the width of the engineered *heading* features below
+/// (the executor navigates by these), even though they are no longer policy actions.
 pub const N_DIRS: usize = 6;
-pub const A_MINE: usize = N_DIRS;
-pub const A_REFINE: usize = N_DIRS + 1;
-pub const N_ACT: usize = N_DIRS + 2;
 
 /// Non-positional state features (position is a separate embedding lookup). Layout:
 /// 0 `tanh(bucks/100)`, 1–2 hunger per staple, 3 positional utility, 4 owns-a-deposit,
 /// 5 bias, 6–11 per-direction "does this step shorten the path to my target deposit"
-/// (∈ {−1,0,1}), 12 "Mine is available right now", 13–18 the same directional gradient
+/// (∈ {−1,0,1}), 12 "standing on my claimed deposit with room to mine", 13–18 the same directional gradient
 /// toward the nearest *other noot*, 19 "another noot is within trade range", 20 the
 /// local terrain difficulty (harder ground drains hunger faster, so this lets the actor
 /// learn to avoid it), 21–26 the directional gradient toward the best market for the
@@ -42,7 +52,7 @@ pub const N_ACT: usize = N_DIRS + 2;
 pub const N_OTHER: usize = 28;
 /// Index of the first of the six directional deposit-gradient features.
 pub const O_DEPOSIT_DIR: usize = 6;
-/// Index of the "Mine available" feature.
+/// Index of the "standing on my claimed deposit, ready to mine" feature.
 pub const O_ON_MINABLE: usize = 12;
 /// Index of the first of the six directional nearest-noot-gradient features.
 pub const O_NOOT_DIR: usize = 13;
@@ -416,6 +426,15 @@ pub struct PolicyMemory {
     /// folded into the next transition's reward and then cleared. Bootstraps the long
     /// produce→sell→eat chain that bare ΔU rewards too sparsely for the policy to find.
     pub shaping: f32,
+    /// A committed option (the value in `last_act`) is mid-execution: the deterministic
+    /// executor drives it and the policy does not re-decide until it terminates.
+    pub committed: bool,
+    /// Tile the committed option is navigating toward (deposit for Mine, market for
+    /// Sell); `None` for in-place options (Refine) or scouting (Explore).
+    pub plan_target: Option<(i32, i32)>,
+    /// Steps left before the committed option is force-terminated, so a plan that can't
+    /// reach its goal (e.g. a market with no buyers) can't run forever.
+    pub plan_ticks: u32,
 }
 
 impl PolicyMemory {
@@ -431,6 +450,9 @@ impl PolicyMemory {
             last_u: 0.0,
             died: false,
             shaping: 0.0,
+            committed: false,
+            plan_target: None,
+            plan_ticks: 0,
         }
     }
 }

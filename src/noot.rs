@@ -51,6 +51,9 @@ pub enum Action {
     Mine,
     /// Convert a held intermediate into its refined good.
     Refine,
+    /// Holding position — e.g. lingering at a market while a committed Sell plan waits
+    /// for a buyer. Distinct from Move so it incurs no hauling (carry) hunger cost.
+    Idle,
 }
 
 /// Per-noot life stats, surfaced by the noot-colouring overlays. `age` is seconds

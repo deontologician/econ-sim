@@ -1902,6 +1902,7 @@ fn update_selection_panel(
         Action::Move => "move",
         Action::Mine => "mine",
         Action::Refine => "refine",
+        Action::Idle => "idle",
     };
 
     let utility = economy::maslow_utility(hunger, inv, wallet, &world.goods);

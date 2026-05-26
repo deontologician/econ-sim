@@ -255,7 +255,7 @@ fn emit_record(w: &mut World) {
     let (cols, rows) = (sim_ref.0.cols, sim_ref.0.rows);
     let mut q =
         w.query::<(&Action, &Hunger, &Claim, &Wallet, &NootMeta, &Trader, &Inventory, &TilePos)>();
-    let mut act = [0u64; 3];
+    let mut act = [0u64; 4];
     let (mut starving, mut claimed, mut n) = (0u64, 0u64, 0u64);
     let (mut bucks, mut appetite, mut experience, mut age, mut discount, mut positional) =
         (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
@@ -266,6 +266,7 @@ fn emit_record(w: &mut World) {
             Action::Move => act[0] += 1,
             Action::Mine => act[1] += 1,
             Action::Refine => act[2] += 1,
+            Action::Idle => act[3] += 1,
         }
         if h.is_starving() {
             starving += 1;
@@ -315,6 +316,7 @@ fn emit_record(w: &mut World) {
         "act_move": act[0],
         "act_mine": act[1],
         "act_refine": act[2],
+        "act_idle": act[3],
         "mean_bucks": bucks / nf,
         "mean_appetite": appetite / nf,
         "mean_experience": experience / nf,

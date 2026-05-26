@@ -51,16 +51,19 @@ pub const REFINE_RATE: f32 = 2.0;
 /// worthwhile — it just wanders. This is self-limiting: `extract`/`refine` yield nothing
 /// at full load or with no intermediates, so the bonus can't reward hoarding forever.
 const MINE_SHAPING: f32 = 0.05;
-/// When a noot explores while standing where it can produce, pick the production action
-/// (rather than a uniform random one) with this probability. Uniform ε almost never
-/// samples Mine on the deposit tile — one action out of up to eight, on the rare tick the
-/// noot is both there and exploring — so the policy never observes the payoff and never
-/// learns to mine. Guiding exploration toward the available production action lets value
-/// propagate back along the deposit heading without hand-coding the behaviour itself.
-const EXPLORE_PRODUCE_BIAS: f32 = 0.6;
 /// Refining is one step further along the chain than mining, so it earns a touch more —
 /// enough to teach the mine→refine→eat path for the refined staple without dominating.
 const REFINE_SHAPING: f32 = 0.07;
+
+// --- Committed options (semi-MDP macro-actions) -----------------------------
+/// Carried units at which a Mine option is "loaded enough" and terminates so the policy
+/// can decide to haul and sell. Below `CARRY_CAP`, so a noot tops up over several option
+/// rounds if it keeps choosing Mine, but doesn't have to fill completely before selling.
+const LOAD_THRESHOLD: f32 = 10.0;
+/// Hard cap on how many executor steps a single committed option runs before it is
+/// force-terminated and the policy re-decides — bounds a plan that can't reach its goal
+/// (an unminable claimed-away deposit, a market with no buyers) so noots never get stuck.
+const OPTION_MAX_TICKS: u32 = 48;
 
 /// Experience gained per unit produced (mining + refining); experience is per
 /// individual and resets on death.
@@ -508,7 +511,6 @@ fn features(
     inv: &Inventory,
     wallet: &Wallet,
     trader: &Trader,
-    mask: &[bool; N_ACT],
     nearest_noot: Option<(i32, i32)>,
 ) -> (usize, [f32; N_OTHER]) {
     let pos_idx = (pos.row * world.cols + pos.col) as usize;
@@ -522,7 +524,7 @@ fn features(
 
     let dep = heading_gradient(world, pos, target_deposit_tile(world, claim, pos));
     o[policy::O_DEPOSIT_DIR..policy::O_DEPOSIT_DIR + policy::N_DIRS].copy_from_slice(&dep);
-    o[policy::O_ON_MINABLE] = if mask[policy::A_MINE] { 1.0 } else { 0.0 };
+    o[policy::O_ON_MINABLE] = if can_mine_here(world, claim, pos, inv) { 1.0 } else { 0.0 };
 
     let noot = heading_gradient(world, pos, nearest_noot);
     o[policy::O_NOOT_DIR..policy::O_NOOT_DIR + policy::N_DIRS].copy_from_slice(&noot);
@@ -555,34 +557,119 @@ fn nearest_other_noot(
         .map(|&(_, c, r)| (c, r))
 }
 
-/// Which actions are valid: a move direction is valid iff that neighbour is in
-/// bounds; Mine/Refine match the gates in `extract`/`refine`. (Trading is automatic,
-/// not an action.) Directions are indexed identically to `hex::neighbors`.
-fn action_mask(world: &crate::world::World, claim: &Claim, pos: &TilePos, inv: &Inventory) -> [bool; N_ACT] {
-    let mut mask = [false; N_ACT];
-    // The map is a torus, so every move direction is always valid.
-    for m in mask.iter_mut().take(policy::N_DIRS) {
-        *m = true;
-    }
-    mask[policy::A_MINE] = claim.deposit.is_some_and(|d| {
+/// True when the noot is standing on its own claimed deposit with room to extract more
+/// — the precondition for the `extract` system to actually mine, and the `on_minable`
+/// state feature. (A noot can also mine the tick *after* it lands on an unclaimed deposit
+/// it's heading for, once `claim_deposits` has assigned it; the Mine executor stays put
+/// on the target tile so that handoff happens.)
+fn can_mine_here(world: &crate::world::World, claim: &Claim, pos: &TilePos, inv: &Inventory) -> bool {
+    claim.deposit.is_some_and(|d| {
         let dep = &world.deposits[d];
         let t = &world.tiles[dep.tile];
         t.col == pos.col
             && t.row == pos.row
             && inv.items[goods::item_index(dep.element_slot, GoodForm::Raw)] < CARRY_CAP
-    });
-    mask[policy::A_REFINE] = claim.deposit.is_none()
-        && (0..N_ITEMS).any(|i| {
-            matches!(world.goods.role_of(i), ItemRole::Intermediate) && inv.items[i] > 0.0
-        });
+    })
+}
+
+/// Units of held goods worth taking to market: everything non-junk, minus the food
+/// reserve a noot keeps for itself (it won't sell within `FOOD_RESERVE` of a staple).
+fn sellable_units(world: &crate::world::World, inv: &Inventory) -> f32 {
+    (0..N_ITEMS)
+        .map(|i| {
+            let reserve = if matches!(world.goods.role_of(i), ItemRole::Staple(_)) {
+                FOOD_RESERVE
+            } else {
+                0.0
+            };
+            let junk = matches!(world.goods.role_of(i), ItemRole::Junk);
+            (inv.items[i] - reserve).max(0.0) * if junk { 0.0 } else { 1.0 }
+        })
+        .sum()
+}
+
+/// Whether the noot holds any unrefined intermediate (the precondition for `refine`).
+fn has_intermediate(world: &crate::world::World, inv: &Inventory) -> bool {
+    (0..N_ITEMS)
+        .any(|i| matches!(world.goods.role_of(i), ItemRole::Intermediate) && inv.items[i] > 0.0)
+}
+
+/// Total non-junk units a noot is carrying (its haul load).
+fn carried_units(world: &crate::world::World, inv: &Inventory) -> f32 {
+    (0..N_ITEMS)
+        .filter(|&i| !matches!(world.goods.role_of(i), ItemRole::Junk))
+        .map(|i| inv.items[i])
+        .sum()
+}
+
+/// Which committed options the policy may choose from this state. Mine is always open
+/// (there is always a deposit to head for); Sell needs surplus to sell; Refine needs an
+/// intermediate to convert; Explore (scout/wander) is always available as a fallback.
+fn option_mask(world: &crate::world::World, inv: &Inventory) -> [bool; N_ACT] {
+    let mut mask = [false; N_ACT];
+    mask[policy::A_MINE] = !world.deposits.is_empty();
+    mask[policy::A_SELL] = sellable_units(world, inv) >= 1.0;
+    mask[policy::A_REFINE] = has_intermediate(world, inv);
+    mask[policy::A_EXPLORE] = true;
     mask
 }
 
-/// The learned decision step (replaces the heuristic). Once per noot per cadence:
-/// observe the reward since the last decision, record the transition, pick a new
-/// action from the shared policy, and — if Move — step toward the best-valued
-/// neighbour hex. Between decisions the chosen action persists and the extract/
-/// refine/trade systems apply it each frame.
+/// The destination a committed option navigates toward: the deposit for Mine, the best
+/// market for the carried cargo for Sell; in-place options (Refine, Explore) have none.
+fn option_target(
+    act: usize,
+    world: &crate::world::World,
+    field: &PriceField,
+    claim: &Claim,
+    pos: &TilePos,
+    inv: &Inventory,
+    trader: &Trader,
+) -> Option<(i32, i32)> {
+    match act {
+        policy::A_MINE => target_deposit_tile(world, claim, pos),
+        policy::A_SELL => best_market_tile(field, world, pos, inv, trader),
+        _ => None,
+    }
+}
+
+/// Whether the committed option has run its course and the policy should decide afresh:
+/// mined a worthwhile load, sold off the surplus, refined everything, or hit the step cap.
+fn option_done(
+    act: usize,
+    world: &crate::world::World,
+    inv: &Inventory,
+    plan_ticks: u32,
+) -> bool {
+    if plan_ticks == 0 {
+        return true;
+    }
+    match act {
+        policy::A_MINE => carried_units(world, inv) >= LOAD_THRESHOLD,
+        policy::A_SELL => sellable_units(world, inv) < 1.0,
+        policy::A_REFINE => !has_intermediate(world, inv),
+        policy::A_EXPLORE => false,
+        _ => true,
+    }
+}
+
+/// One greedy hex step from `(col,row)` toward `target`: the neighbour that most reduces
+/// toroidal hex distance. The map has no impassable tiles, so greedy stepping always
+/// makes progress — no pathfinding needed.
+fn step_toward(world: &crate::world::World, col: i32, row: i32, target: (i32, i32)) -> (i32, i32) {
+    neighbors(col, row, world.cols, world.rows)
+        .into_iter()
+        .min_by_key(|&(c, r)| torus_distance(c, r, target.0, target.1, world.cols, world.rows))
+        .unwrap_or((col, row))
+}
+
+/// The learned decision step, over **committed options** rather than primitive steps.
+/// Once per noot per cadence: if a committed option is still in progress, the executor
+/// drives its next step (navigate toward the goal, mine, refine, or scout) and the policy
+/// stays out of it — that commitment is what turns per-step dithering into directed
+/// produce→haul→sell behaviour. When the option terminates (or the noot died), close out
+/// the option's transition (reward = the ΔU it accrued plus production shaping, or a death
+/// penalty), pick a fresh option from the shared policy, and lock in its target. Each
+/// executor step persists an `Action` the extract/refine/trade systems apply every frame.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn policy_step(
     sim: Res<Sim>,
@@ -612,73 +699,100 @@ pub fn policy_step(
         if mem.cooldown > 0.0 && !mem.died {
             continue;
         }
-        let mask = action_mask(world, claim, &pos, inv);
-        let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world.cols, world.rows);
-        let (s_pos, s_o) =
-            features(world, &field, &pos, claim, hunger, inv, wallet, trader, &mask, nearest_noot);
-        let u_now = maslow_utility(hunger, inv, wallet, &world.goods);
 
-        // Close out the previous transition (reward = ΔU, or a death penalty).
-        if mem.has_prev {
-            let (r, done) = if mem.died {
-                (-DEATH_PENALTY, true)
-            } else {
-                (u_now - mem.last_u + mem.shaping, false)
-            };
-            trainer.record(Transition {
-                pos: mem.last_pos,
-                o: mem.last_o,
-                mask: mem.last_mask,
-                act: mem.last_act,
-                r,
-                pos2: s_pos,
-                o2: s_o,
-                done,
-            });
-        }
-        mem.died = false;
-        mem.shaping = 0.0;
+        // Re-decide only at option boundaries: when the committed plan is finished, was
+        // never set, or the noot just died (banking one terminal transition).
+        let finished =
+            !mem.committed || mem.died || option_done(mem.last_act, world, inv, mem.plan_ticks);
+        if finished {
+            let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world.cols, world.rows);
+            let (s_pos, s_o) =
+                features(world, &field, &pos, claim, hunger, inv, wallet, trader, nearest_noot);
+            let u_now = maslow_utility(hunger, inv, wallet, &world.goods);
 
-        // Choose the next action: masked softmax, with an ε chance of a random valid
-        // action (the per-noot exploration temperament).
-        let act = if rng.0.chance(mem.explore) {
-            // Guided exploration: prefer producing when the noot can, so the policy
-            // actually samples the high-value Mine/Refine actions; else uniform.
-            if mask[policy::A_MINE] && rng.0.chance(EXPLORE_PRODUCE_BIAS) {
-                policy::A_MINE
-            } else if mask[policy::A_REFINE] && rng.0.chance(EXPLORE_PRODUCE_BIAS) {
-                policy::A_REFINE
-            } else {
+            // Close out the previous option's transition (reward = ΔU over the option +
+            // production shaping it earned, or a death penalty).
+            if mem.has_prev {
+                let (r, done) = if mem.died {
+                    (-DEATH_PENALTY, true)
+                } else {
+                    (u_now - mem.last_u + mem.shaping, false)
+                };
+                trainer.record(Transition {
+                    pos: mem.last_pos,
+                    o: mem.last_o,
+                    mask: mem.last_mask,
+                    act: mem.last_act,
+                    r,
+                    pos2: s_pos,
+                    o2: s_o,
+                    done,
+                });
+            }
+            mem.died = false;
+            mem.shaping = 0.0;
+
+            // Pick the next option: masked softmax, or an ε-chance uniform random option
+            // (the per-noot exploration temperament). With only four options, uniform ε
+            // already samples Mine often, so no extra production bias is needed.
+            let mask = option_mask(world, inv);
+            let act = if rng.0.chance(mem.explore) {
                 let valid: Vec<usize> = (0..N_ACT).filter(|&a| mask[a]).collect();
                 valid[rng.0.below(valid.len())]
+            } else {
+                let logits = ac.logits(s_pos, &s_o);
+                let probs = policy::masked_softmax(&logits, &mask);
+                policy::sample(&probs, &mut rng.0)
+            };
+
+            mem.last_pos = s_pos;
+            mem.last_o = s_o;
+            mem.last_mask = mask;
+            mem.last_act = act;
+            mem.last_u = u_now;
+            mem.has_prev = true;
+            mem.committed = true;
+            mem.plan_target = option_target(act, world, &field, claim, &pos, inv, trader);
+            mem.plan_ticks = OPTION_MAX_TICKS;
+        }
+
+        // Execute one step of the committed option, setting this tick's Action.
+        match mem.last_act {
+            policy::A_MINE => match mem.plan_target {
+                // On the deposit tile: mine (or hold here so claim_deposits can claim it
+                // before mining starts next tick). Otherwise step toward it.
+                Some((tc, tr)) if pos.col == tc && pos.row == tr => *action = Action::Mine,
+                Some((tc, tr)) => {
+                    let (nc, nr) = step_toward(world, pos.col, pos.row, (tc, tr));
+                    pos.col = nc;
+                    pos.row = nr;
+                    *action = Action::Move;
+                }
+                None => *action = Action::Idle,
+            },
+            policy::A_SELL => match mem.plan_target {
+                // At the market: linger (Idle, no haul cost) so a passing buyer can trade.
+                Some((tc, tr)) if pos.col == tc && pos.row == tr => *action = Action::Idle,
+                Some((tc, tr)) => {
+                    let (nc, nr) = step_toward(world, pos.col, pos.row, (tc, tr));
+                    pos.col = nc;
+                    pos.row = nr;
+                    *action = Action::Move;
+                }
+                None => *action = Action::Idle,
+            },
+            policy::A_REFINE => *action = Action::Refine,
+            _ => {
+                // Explore: a random hex step (scouting for deposits/markets/partners).
+                let (nc, nr) = neighbors(pos.col, pos.row, world.cols, world.rows)
+                    [rng.0.below(policy::N_DIRS)];
+                pos.col = nc;
+                pos.row = nr;
+                *action = Action::Move;
             }
-        } else {
-            let logits = ac.logits(s_pos, &s_o);
-            let probs = policy::masked_softmax(&logits, &mask);
-            policy::sample(&probs, &mut rng.0)
-        };
-
-        // Indices 0..6 are relative move directions (step to that neighbour hex);
-        // the rest are Mine/Refine in place.
-        *action = if act == policy::A_MINE {
-            Action::Mine
-        } else if act == policy::A_REFINE {
-            Action::Refine
-        } else {
-            let (nc, nr) = neighbors(pos.col, pos.row, world.cols, world.rows)[act];
-            pos.col = nc;
-            pos.row = nr;
-            Action::Move
-        };
-
-        // Cache this state/action for the next transition.
-        mem.last_pos = s_pos;
-        mem.last_o = s_o;
-        mem.last_mask = mask;
-        mem.last_act = act;
-        mem.last_u = u_now;
-        mem.has_prev = true;
-        let tf = terrain_factor(world.tiles[s_pos].difficulty);
+        }
+        mem.plan_ticks = mem.plan_ticks.saturating_sub(1);
+        let tf = terrain_factor(world.tiles[(pos.row * world.cols + pos.col) as usize].difficulty);
         mem.cooldown = BASE_STEP_TIME / tf;
     }
 }
@@ -769,6 +883,10 @@ pub fn death_and_respawn(
         mem.died = true;
         mem.explore = rng.0.range(EXPLORE_MIN, EXPLORE_MAX);
         mem.cooldown = 0.0;
+        // Drop any committed plan so the reborn noot decides fresh next tick.
+        mem.committed = false;
+        mem.plan_target = None;
+        mem.plan_ticks = 0;
         *trader = Trader::new();
         *meta = NootMeta::new();
         claim.deposit = None;
