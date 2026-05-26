@@ -290,6 +290,20 @@ fn emit_record(w: &mut World) {
     let nf = n.max(1) as f64;
     let mean_nn_dist = econ_sim::hex::mean_nearest_neighbor(&tiles, cols, rows);
 
+    // Spatial trade concentration: the share of all cleared trades that happened in the
+    // busiest 5% of hexes (an agglomeration / "cities" index — high means commerce
+    // pools into a few marketplaces), plus how many hexes have ever seen a trade.
+    let (trade_top5_share, trade_active_hexes) = {
+        let mut h = stats.trade_hexes.clone();
+        let active = h.iter().filter(|&&c| c > 0).count();
+        let total: u64 = h.iter().map(|&c| c as u64).sum();
+        h.sort_unstable_by(|a, b| b.cmp(a));
+        let k = (h.len() as f64 * 0.05).ceil() as usize;
+        let top: u64 = h.iter().take(k).map(|&c| c as u64).sum();
+        let share = if total > 0 { top as f64 / total as f64 } else { 0.0 };
+        (share, active)
+    };
+
     let record = serde_json::json!({
         "tick": stats.ticks,
         "trades_total": stats.trades_total,
@@ -325,6 +339,8 @@ fn emit_record(w: &mut World) {
         "mean_discount": discount / nf,
         "mean_positional": positional / nf,
         "mean_nn_dist": mean_nn_dist,
+        "trade_top5_share": trade_top5_share,
+        "trade_active_hexes": trade_active_hexes,
     });
     println!("{}", record);
 }

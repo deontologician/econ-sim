@@ -422,10 +422,6 @@ pub struct PolicyMemory {
     pub last_act: usize,
     pub last_u: f32,
     pub died: bool,
-    /// Intrinsic reward accrued since the last decision (e.g. for units produced),
-    /// folded into the next transition's reward and then cleared. Bootstraps the long
-    /// produce→sell→eat chain that bare ΔU rewards too sparsely for the policy to find.
-    pub shaping: f32,
     /// A committed option (the value in `last_act`) is mid-execution: the deterministic
     /// executor drives it and the policy does not re-decide until it terminates.
     pub committed: bool,
@@ -449,7 +445,6 @@ impl PolicyMemory {
             last_act: 0,
             last_u: 0.0,
             died: false,
-            shaping: 0.0,
             committed: false,
             plan_target: None,
             plan_ticks: 0,

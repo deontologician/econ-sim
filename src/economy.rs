@@ -44,17 +44,6 @@ const TRAIN_ITERS_PER_FRAME: usize = 4;
 pub const WORK_RATE: f32 = 3.0;
 pub const REFINE_RATE: f32 = 2.0;
 
-// --- Learning by doing ------------------------------------------------------
-/// Intrinsic reward per unit produced (mined or refined), added to the policy reward to
-/// bootstrap production. The downstream payoff (eating, or selling for bucks) is gated
-/// and far down a multi-step chain, so bare ΔU never teaches a noot that *producing* is
-/// worthwhile — it just wanders. This is self-limiting: `extract`/`refine` yield nothing
-/// at full load or with no intermediates, so the bonus can't reward hoarding forever.
-const MINE_SHAPING: f32 = 0.05;
-/// Refining is one step further along the chain than mining, so it earns a touch more —
-/// enough to teach the mine→refine→eat path for the refined staple without dominating.
-const REFINE_SHAPING: f32 = 0.07;
-
 // --- Committed options (semi-MDP macro-actions) -----------------------------
 /// Carried units at which a Mine option is "loaded enough" and terminates so the policy
 /// can decide to haul and sell. Below `CARRY_CAP`, so a noot tops up over several option
@@ -184,6 +173,11 @@ pub struct EconStats {
     /// goods are being hauled (a trekking-merchant readout). 0 when nothing sold.
     #[serde(default)]
     pub mean_haul_dist: f32,
+    /// Cumulative trades that cleared on each tile (`row * cols + col`) — a spatial
+    /// heatmap of where commerce happens, for the Trades map overlay. Sized lazily to
+    /// the map on first trade; persists across saves so the picture survives a reload.
+    #[serde(default)]
+    pub trade_hexes: Vec<u32>,
     // Accumulators for the in-progress rate window.
     produced_window: f32,
     consumed_window: f32,
@@ -710,13 +704,16 @@ pub fn policy_step(
                 features(world, &field, &pos, claim, hunger, inv, wallet, trader, nearest_noot);
             let u_now = maslow_utility(hunger, inv, wallet, &world.goods);
 
-            // Close out the previous option's transition (reward = ΔU over the option +
-            // production shaping it earned, or a death penalty).
+            // Close out the previous option's transition (reward = the ΔU the option
+            // accrued, or a death penalty). Committed options make the long
+            // produce→haul→sell chain learnable from this bare ΔU alone — the Mine
+            // option's value bootstraps from the later Sell/eat reward — so no
+            // production shaping bonus is needed.
             if mem.has_prev {
                 let (r, done) = if mem.died {
                     (-DEATH_PENALTY, true)
                 } else {
-                    (u_now - mem.last_u + mem.shaping, false)
+                    (u_now - mem.last_u, false)
                 };
                 trainer.record(Transition {
                     pos: mem.last_pos,
@@ -730,7 +727,6 @@ pub fn policy_step(
                 });
             }
             mem.died = false;
-            mem.shaping = 0.0;
 
             // Pick the next option: masked softmax, or an ε-chance uniform random option
             // (the per-noot exploration temperament). With only four options, uniform ε
@@ -898,16 +894,9 @@ pub fn death_and_respawn(
 pub fn extract(
     mut sim: ResMut<Sim>,
     mut stats: ResMut<EconStats>,
-    mut q: Query<(
-        &Action,
-        &Claim,
-        &TilePos,
-        &mut Inventory,
-        &mut NootMeta,
-        &mut PolicyMemory,
-    )>,
+    mut q: Query<(&Action, &Claim, &TilePos, &mut Inventory, &mut NootMeta)>,
 ) {
-    for (action, claim, pos, mut inv, mut meta, mut mem) in &mut q {
+    for (action, claim, pos, mut inv, mut meta) in &mut q {
         if *action != Action::Mine {
             continue;
         }
@@ -929,7 +918,6 @@ pub fn extract(
         let got = sim.0.extract_from(deposit, rate, TICK_DT) as f32;
         inv.items[raw] += got;
         meta.experience += got;
-        mem.shaping += MINE_SHAPING * got;
         stats.produced_window += got;
         stats.produced_total += got as f64;
     }
@@ -961,8 +949,8 @@ pub fn claim_deposits(sim: Res<Sim>, mut q: Query<(&TilePos, &mut Claim)>) {
 
 /// Refine held intermediates — but only for noots whose chosen action this tick is
 /// `Refine` (set by `policy_step`), faster the more refining experience accrued.
-pub fn refine(sim: Res<Sim>, mut q: Query<(&Action, &mut Inventory, &mut NootMeta, &mut PolicyMemory)>) {
-    for (action, mut inv, mut meta, mut mem) in &mut q {
+pub fn refine(sim: Res<Sim>, mut q: Query<(&Action, &mut Inventory, &mut NootMeta)>) {
+    for (action, mut inv, mut meta) in &mut q {
         if *action != Action::Refine {
             continue;
         }
@@ -977,7 +965,6 @@ pub fn refine(sim: Res<Sim>, mut q: Query<(&Action, &mut Inventory, &mut NootMet
             inv.items[raw] -= amount;
             inv.items[refined] += amount;
             meta.experience += amount;
-            mem.shaping += REFINE_SHAPING * amount;
         }
     }
 }
@@ -1360,6 +1347,13 @@ pub fn meet_and_trade(
                 stats.gdp_total += price as f64;
                 stats.haul_window += field.source_dist(snaps[si].tile, item / 2) as f64;
                 stats.haul_count_window += 1;
+                // Spatial trade heatmap: tally the sale at the seller's tile (where the
+                // price clears). Sized lazily so fresh and loaded games both work.
+                let n_tiles = (cols * sim.0.rows) as usize;
+                if stats.trade_hexes.len() != n_tiles {
+                    stats.trade_hexes = vec![0; n_tiles];
+                }
+                stats.trade_hexes[snaps[si].tile] += 1;
                 income.this_window += price as f64;
                 // EWMA of realized sale prices (lazy-init to the first sample).
                 stats.ewma_price[item] = if stats.ewma_price[item] <= 0.0 {

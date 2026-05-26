@@ -106,46 +106,45 @@ design. Newest first within each section.
 
 ## Agents (noots)
 
-### Action selection (learned actor-critic)
+### Action selection (learned actor-critic over committed options)
 - **NOW**: a **shared off-policy actor-critic** (`policy.rs`, `economy::policy_step`)
-  picks each noot's action from a masked softmax over its state. The state mixes an
-  absolute position embedding with **position-invariant cues**: bucks/hunger/positional/
-  ownership, a six-way *deposit-direction gradient* (does each move shorten the toroidal
-  hex path to my claimed — or nearest — deposit, ∈{−1,0,1}), and an *on-minable* flag.
-  Those last cues make the mining/navigation subtask Markov: without them the shared
-  brain couldn't tell where its deposit was or that it was standing on it, and mining
-  essentially never happened. It also reads the local **terrain difficulty**, a six-way
-  *best-market gradient* (does each move head toward the tile where its carried cargo
-  sells dearest, net of the haul) and a *has-cargo* gate, so a loaded noot can perceive
-  where to trek and sell. Actions are **relative**: 6 hex move directions (the actor
-  learns a directional policy directly) plus Mine and Refine. **Trading is automatic** —
-  any nearby pair clears a mutually-beneficial trade, gated by each noot's learned
-  `discount`/reservation thresholds (no explicit Trade action). Reward = Δ of a
-  Maslow-tiered utility (physiological ≫ safety ≫ esteem, with a softened tier gate so a
-  half-hungry noot still gets gradient for stocking food and earning), **plus a small
-  intrinsic bonus per unit produced**. Trained A2C-style (several minibatches/frame) from
-  a shared replay buffer with a slow target critic; one brain persists across deaths and
-  saves. *(partial)*
-- **INTENDED**: richer relative/local state (observed prices/inventories, who's nearby);
-  more reward/entropy/lr tuning; validation that it beats the old heuristic on-device.
+  picks each noot's **committed option** (a semi-MDP macro-action) from a masked softmax
+  over its state — not a primitive step. The four options are **Mine** (go to the
+  deposit and extract a load), **Sell** (haul to the best market for the cargo and linger
+  to trade), **Refine** (convert intermediates in place), and **Explore** (scout). A
+  deterministic executor drives the chosen option to completion (greedy hex navigation —
+  no pathfinding needed on the impassable-free torus) and the policy only re-decides at
+  option boundaries, where **one transition** is recorded (reward = the ΔU the option
+  accrued). This is what makes the long produce→haul→sell chain learnable: the policy
+  never has to crack navigation as a sparse-reward subtask, so directed behaviour
+  replaces per-step dithering, and the Mine option's value bootstraps from the later
+  Sell/eat reward — **no production-shaping bonus needed** (see below). The state mixes an
+  absolute position embedding with position-invariant cues: bucks/hunger/positional/
+  ownership, an *on-minable* flag, the local **terrain difficulty**, and six-way
+  *direction gradients* toward the target deposit, the nearest other noot, and the best
+  market for the carried cargo (these still inform option *value*; the executor navigates
+  by them). **Trading is automatic** — any nearby pair clears a mutually-beneficial trade,
+  gated by each noot's learned `discount`/reservation thresholds (no explicit Trade
+  action). Reward = Δ of a Maslow-tiered utility (physiological ≫ safety ≫ esteem, with a
+  softened tier gate). Trained A2C-style (several minibatches/frame) from a shared replay
+  buffer with a slow target critic; one brain persists across deaths and saves. Headless
+  (60k ticks): structured mine/haul/sell/refine behaviour, consumption ~3.1k, ~86–94% of
+  trades pooling into the busiest 5% of hexes (emergent marketplaces), deaths regulated.
+  *(partial)*
+- **INTENDED**: the option set is approximate (one-step TD on variable-length options,
+  ignoring option length in the discount); richer relative/local state (observed
+  prices/inventories, who's nearby); reward/entropy/lr tuning; on-device validation.
 - **STATUS**: partial
 
-### Production reward-shaping & guided exploration *(stand-in)*
-- **NOW**: bare ΔU never taught noots to mine — the payoff (eating, or selling for
-  bucks) is gated and many steps down the chain, so the policy just wandered (≈0
-  production, mass starvation). Two crutches fix it: a small **intrinsic reward per unit
-  mined/refined** (`MINE_SHAPING`/`REFINE_SHAPING`, self-limiting since `extract`/`refine`
-  yield nothing at full load), and **guided exploration** — when a noot explores while
-  standing where it can produce, it picks the production action with `EXPLORE_PRODUCE_BIAS`
-  probability instead of uniformly, so the rare high-value Mine/Refine action actually
-  gets sampled and its value can propagate back along the deposit heading. Headless
-  rollouts go from ~1k cumulative units produced to ~6k, consumption ~0→~2.4k, trade
-  ~12k→~190k, and deaths regulate near target. *(stub)*
-- **INTENDED**: the principled fix is to make the long produce→sell→eat chain learnable
-  *without* hand-tuned bonuses — e.g. committed multi-step options/plans (the noot locks
-  in "go mine a load → haul → sell" and is rewarded on completion), better credit
-  assignment (n-step/eligibility traces), or curriculum — then retire the shaping.
-- **STATUS**: stub
+### Production reward-shaping & guided exploration *(retired)*
+- **NOW**: an earlier stop-gap — a small intrinsic reward per unit mined/refined plus an
+  exploration bias toward producing — bootstrapped mining under the old flat per-step
+  action space, where bare ΔU left the policy wandering (≈0 production, mass starvation).
+  **Both have been removed**: the committed-options action space above makes the chain
+  learnable from bare ΔU, and rollouts are if anything slightly *better* without the
+  bonus (production ~6.4k→~6.7k, consumption ~3.1k→~3.4k), so the crutch was dead weight.
+- **INTENDED**: nothing — the principled fix (committed options) replaced it.
+- **STATUS**: done
 
 ### Welfare / utility
 - **NOW**: a noot's utility = "not starving" (per staple, `(satiation−appetite)/
@@ -239,6 +238,17 @@ design. Newest first within each section.
 - **STATUS**: partial
 
 ## Rendering / UI
+
+### Trade-density (commerce) map overlay
+- **NOW**: `EconStats::trade_hexes` accumulates a per-hex tally of every trade that
+  clears (counted at the seller's tile), persisted in saves. A **Trades** toggle (button
+  or `X`) shows it as a gold hex heatmap (sqrt ramp, like the Crowd overlay) so the
+  emergent marketplaces stand out; the headless harness reports `trade_top5_share`
+  (~0.86–0.94: commerce pools hard into the busiest 5% of hexes) and `trade_active_hexes`.
+  *(partial — heatmap data verified headless; the overlay render is unconfirmed on device)*
+- **INTENDED**: optionally a decaying/windowed variant to show *current* hot markets
+  rather than all-time; maybe per-good breakdown; legend/scale on the overlay.
+- **STATUS**: partial
 
 ### Currency glyph `₦`
 - **NOW**: render the `₦` (U+20A6) glyph; if the bundled/default font lacks it we
