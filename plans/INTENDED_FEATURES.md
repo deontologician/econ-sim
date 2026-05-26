@@ -16,15 +16,16 @@ design. Newest first within each section.
 ## Persistence
 
 ### Save / load / migrations
-- **NOW**: the **full ECS state** is serialized to `localStorage` (serde → RON,
+- **NOW**: the **full ECS state** is serialized to `localStorage` (serde → JSON,
   `save.rs`): the world (tiles/deposits/stocks/chosen/goods), the hunger & income
   controllers, `EconStats`, and every noot (position, inventory, wallet, hunger,
   claim, trader, meta, and its learned value field). **S**/Save snapshots; boot
-  resumes it; **G**/New clears it for a fresh world. Versioned: a parse failure or
-  version mismatch falls back to a fresh start; additive fields use `#[serde(default)]`,
-  breaking changes bump `SAVE_VERSION`. *(partial)*
-- **INTENDED**: autosave + multiple named slots; export/import; explicit per-version
-  `migrate` arms (vs. discard) so old saves upgrade in place rather than resetting.
+  resumes it; **G**/New clears it. Each save carries a `version`; load parses to a
+  `serde_json::Value` and **replays every migration step** (`migrate_step`) from the
+  file's version up to `SAVE_VERSION` before deserializing, so old saves upgrade in
+  place. A parse failure / newer-than-this-build version falls back to fresh. *(partial)*
+- **INTENDED**: autosave + multiple named slots; export/import. (The migration
+  framework exists; it just has no steps yet — v1 is the first schema.)
 - **STATUS**: partial
 
 ## Economy

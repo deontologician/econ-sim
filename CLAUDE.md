@@ -45,7 +45,7 @@ cargo clippy --target wasm32-unknown-unknown
     SplitMix64 in `rng.rs` (also keeps worldgen reproducible from one seed) — don't
     reach for `rand`; icons are drawn procedurally in `icon.rs`, not an image crate.
   - **A crate already in Bevy's tree is nearly free** (no real bundle/compile cost) —
-    prefer those. `serde`+`ron` (save system) are already pulled in by Bevy.
+    prefer those. `serde`+`serde_json` (save system) are already pulled in by Bevy.
   - **A genuinely new dep needs a reason**: significant effort saved or correctness
     gained, weighed against bundle size on mobile. When in doubt, ask.
 - **Comments explain *why*, not *what*** — hidden constraints, invariants,
