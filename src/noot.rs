@@ -38,6 +38,21 @@ pub const DISCOUNT_LR: f32 = 0.04;
 #[derive(Component)]
 pub struct Noot;
 
+/// The single action a noot takes this tick. A heuristic `choose_action` sets it
+/// today; this is the seam for a learned action rollout (the policy will pick among
+/// these per step). Mining and refining are mutually exclusive — picking one means
+/// forgoing the other this tick.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Action {
+    /// Locomotion (home to a claim, roam the value gradient).
+    #[default]
+    Move,
+    /// Extract from the claimed deposit underfoot.
+    Mine,
+    /// Convert a held intermediate into its refined good.
+    Refine,
+}
+
 /// Per-noot life stats, surfaced by the noot-colouring overlays. `age` is seconds
 /// lived (reset on respawn); `transactions` counts trades made (buys + sells);
 /// `experience` is accumulated productive work (mining + refining), driving a

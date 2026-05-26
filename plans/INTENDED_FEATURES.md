@@ -105,6 +105,19 @@ design. Newest first within each section.
 
 ## Agents (noots)
 
+### Action selection (rollout seam)
+- **NOW**: each tick a noot has one `Action` (`Move`/`Mine`/`Refine`), set by a
+  heuristic `choose_action`: mine if a claimed deposit is underfoot with carry room,
+  else refine if it's claimless and holding intermediates, else move. Mining and
+  refining are mutually exclusive per tick, so producers don't refine their own
+  output for free — raw intermediates are sold and the claimless specialize as
+  refiners. *(stub)*
+- **INTENDED**: a learned **action rollout** — a policy scoring the full action set
+  (mine / refine / trade / move, and their parameters) from the noot's state, with
+  movement and trade also gated by the chosen action. `choose_action` is the seam
+  the policy slots into.
+- **STATUS**: stub
+
 ### Welfare / utility
 - **NOW**: a noot's utility = "not starving" (per staple, `(satiation−appetite)/
   satiation`) + diminishing positional welfare (`Σ ln(1+held)`) from the durable

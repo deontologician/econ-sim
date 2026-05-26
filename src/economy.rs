@@ -292,14 +292,46 @@ pub fn hunger_tick(time: Res<Time>, ctrl: Res<HungerControl>, mut q: Query<&mut 
     }
 }
 
+/// Pick each noot's single action for this tick — the seam for a future learned
+/// rollout. Mining and refining compete for the tick (never both): a noot mines
+/// when it can (a claim underfoot with carry room), otherwise the *claimless*
+/// refine intermediates they hold. So producers don't refine their own output for
+/// free — refining is left to those who can't mine, who buy raw intermediates.
+pub fn choose_action(sim: Res<Sim>, mut q: Query<(&Claim, &TilePos, &Inventory, &mut Action)>) {
+    let world = &sim.0;
+    for (claim, pos, inv, mut action) in &mut q {
+        let can_mine = claim.deposit.is_some_and(|d| {
+            let dep = &world.deposits[d];
+            let t = &world.tiles[dep.tile];
+            t.col == pos.col
+                && t.row == pos.row
+                && inv.items[goods::item_index(dep.element_slot, GoodForm::Raw)] < CARRY_CAP
+        });
+        let refines = claim.deposit.is_none()
+            && (0..N_ITEMS).any(|i| {
+                matches!(world.goods.role_of(i), ItemRole::Intermediate) && inv.items[i] > 0.0
+            });
+        *action = if can_mine {
+            Action::Mine
+        } else if refines {
+            Action::Refine
+        } else {
+            Action::Move
+        };
+    }
+}
+
 pub fn extract(
     time: Res<Time>,
     mut sim: ResMut<Sim>,
     mut stats: ResMut<EconStats>,
-    mut q: Query<(&Claim, &TilePos, &mut Inventory, &mut NootMeta)>,
+    mut q: Query<(&Action, &Claim, &TilePos, &mut Inventory, &mut NootMeta)>,
 ) {
     let dt = time.delta_secs();
-    for (claim, pos, mut inv, mut meta) in &mut q {
+    for (action, claim, pos, mut inv, mut meta) in &mut q {
+        if *action != Action::Mine {
+            continue;
+        }
         let Some(deposit) = claim.deposit else {
             continue;
         };
@@ -347,11 +379,18 @@ pub fn claim_deposits(sim: Res<Sim>, mut q: Query<(&TilePos, &mut Claim)>) {
     }
 }
 
-/// Every noot refines any intermediate it holds (refining is a universal ability),
-/// faster the more refining experience it has accrued.
-pub fn refine(time: Res<Time>, sim: Res<Sim>, mut q: Query<(&mut Inventory, &mut NootMeta)>) {
+/// Refine held intermediates — but only for noots whose chosen action this tick is
+/// `Refine` (set by `choose_action`), faster the more refining experience accrued.
+pub fn refine(
+    time: Res<Time>,
+    sim: Res<Sim>,
+    mut q: Query<(&Action, &mut Inventory, &mut NootMeta)>,
+) {
     let dt = time.delta_secs();
-    for (mut inv, mut meta) in &mut q {
+    for (action, mut inv, mut meta) in &mut q {
+        if *action != Action::Refine {
+            continue;
+        }
         let rate = REFINE_RATE * skill_factor(meta.experience);
         for slot in 0..4 {
             let raw = goods::item_index(slot, GoodForm::Raw);

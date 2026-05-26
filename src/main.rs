@@ -18,8 +18,8 @@ use economy::{EconStats, HungerControl};
 use goods::{GoodCategory, GoodForm};
 use movement::tile_to_pixel;
 use noot::{
-    Claim, Hunger, Inventory, Noot, NootMeta, RouteMemory, TilePos, Trader, Wallet, EXPLORE_MAX,
-    EXPLORE_MIN, STARTING_BUCKS,
+    Action, Claim, Hunger, Inventory, Noot, NootMeta, RouteMemory, TilePos, Trader, Wallet,
+    EXPLORE_MAX, EXPLORE_MIN, STARTING_BUCKS,
 };
 use rng::Rng;
 use world::{generate, ResourceRole, World};
@@ -30,11 +30,9 @@ const ROWS: i32 = 22;
 const HEX_SIZE: f32 = 26.0;
 
 // --- Population -------------------------------------------------------------
-/// Free-roaming noots spawned alongside the seeded miners.
-const N_ROAMERS: usize = 44;
-/// At most this many deposits get a noot pre-seeded on them at a fresh start (the
-/// rest are claimed emergently). Caps the population independent of deposit count.
-const MAX_SEEDED_MINERS: usize = 12;
+/// Total noots at a fresh start. All spawn claimless and free-roaming — anyone can
+/// become a miner by claiming a deposit it wanders onto (no pre-seeded miners).
+const N_NOOTS: usize = 56;
 
 /// Seconds a noot can sit fully starving (all staples maxed) before it dies and
 /// is reborn fresh at a random tile (its deposit claim, if any, is released).
@@ -246,6 +244,7 @@ fn main() {
                     .run_if(sim_running),
                 (
                     movement::movement,
+                    economy::choose_action,
                     economy::claim_deposits,
                     economy::extract,
                     economy::refine,
@@ -334,10 +333,8 @@ fn setup(
         }
         None => {
             let world = generate(random_seed(), COLS, ROWS, HEX_SIZE);
-            let n_seed = world.deposits.len().min(MAX_SEEDED_MINERS);
-            let n_noots = (n_seed + N_ROAMERS) as f32;
             commands.insert_resource(HungerControl::new(
-                economy::TARGET_DEATH_FRAC_PER_MIN * n_noots,
+                economy::TARGET_DEATH_FRAC_PER_MIN * N_NOOTS as f32,
             ));
             (world, None)
         }
@@ -481,26 +478,10 @@ fn setup(
                 );
             }
         }
-        // Fresh: seed a capped number of deposits with a pre-claimed miner so mining
-        // starts at once; the rest free-roam and claim deposits emergently.
+        // Fresh: everyone spawns claimless and free-roaming; mining is emergent
+        // (a noot claims the first unowned deposit it crosses).
         None => {
-            let n_seed = world.deposits.len().min(MAX_SEEDED_MINERS);
-            for di in 0..n_seed {
-                let tile = world.deposits[di].tile;
-                let (col, row) = (world.tiles[tile].col, world.tiles[tile].row);
-                spawn_noot(
-                    &mut commands,
-                    &mut sim_rng,
-                    noot_mesh.clone(),
-                    materials.add(NOOT_OWNER),
-                    Some(di),
-                    col,
-                    row,
-                    n_tiles,
-                    tile_to_pixel(col, row, hex_size, offset),
-                );
-            }
-            for _ in 0..N_ROAMERS {
+            for _ in 0..N_NOOTS {
                 let (col, row) = random_tile(&mut sim_rng, &world);
                 spawn_noot(
                     &mut commands,
@@ -538,6 +519,7 @@ fn spawn_restored_noot(
         MeshMaterial2d(material),
         Transform::from_xyz(pixel.x, pixel.y, 2.0),
         Noot,
+        Action::default(),
         ns.claim,
         ns.trader,
         ns.meta,
@@ -575,6 +557,7 @@ fn spawn_noot(
         MeshMaterial2d(material),
         Transform::from_xyz(pixel.x, pixel.y, 2.0),
         Noot,
+        Action::default(),
         Claim::new(claim),
         Trader::new(),
         NootMeta::new(),
