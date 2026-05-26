@@ -114,17 +114,38 @@ design. Newest first within each section.
   hex path to my claimed — or nearest — deposit, ∈{−1,0,1}), and an *on-minable* flag.
   Those last cues make the mining/navigation subtask Markov: without them the shared
   brain couldn't tell where its deposit was or that it was standing on it, and mining
-  essentially never happened. Actions are **relative**: 6 hex move directions (the actor
+  essentially never happened. It also reads the local **terrain difficulty**, a six-way
+  *best-market gradient* (does each move head toward the tile where its carried cargo
+  sells dearest, net of the haul) and a *has-cargo* gate, so a loaded noot can perceive
+  where to trek and sell. Actions are **relative**: 6 hex move directions (the actor
   learns a directional policy directly) plus Mine and Refine. **Trading is automatic** —
   any nearby pair clears a mutually-beneficial trade, gated by each noot's learned
   `discount`/reservation thresholds (no explicit Trade action). Reward = Δ of a
   Maslow-tiered utility (physiological ≫ safety ≫ esteem, with a softened tier gate so a
-  half-hungry noot still gets gradient for stocking food and earning). Trained A2C-style
-  (several minibatches/frame) from a shared replay buffer with a slow target critic; one
-  brain persists across deaths and saves. *(partial)*
+  half-hungry noot still gets gradient for stocking food and earning), **plus a small
+  intrinsic bonus per unit produced**. Trained A2C-style (several minibatches/frame) from
+  a shared replay buffer with a slow target critic; one brain persists across deaths and
+  saves. *(partial)*
 - **INTENDED**: richer relative/local state (observed prices/inventories, who's nearby);
   more reward/entropy/lr tuning; validation that it beats the old heuristic on-device.
 - **STATUS**: partial
+
+### Production reward-shaping & guided exploration *(stand-in)*
+- **NOW**: bare ΔU never taught noots to mine — the payoff (eating, or selling for
+  bucks) is gated and many steps down the chain, so the policy just wandered (≈0
+  production, mass starvation). Two crutches fix it: a small **intrinsic reward per unit
+  mined/refined** (`MINE_SHAPING`/`REFINE_SHAPING`, self-limiting since `extract`/`refine`
+  yield nothing at full load), and **guided exploration** — when a noot explores while
+  standing where it can produce, it picks the production action with `EXPLORE_PRODUCE_BIAS`
+  probability instead of uniformly, so the rare high-value Mine/Refine action actually
+  gets sampled and its value can propagate back along the deposit heading. Headless
+  rollouts go from ~1k cumulative units produced to ~6k, consumption ~0→~2.4k, trade
+  ~12k→~190k, and deaths regulate near target. *(stub)*
+- **INTENDED**: the principled fix is to make the long produce→sell→eat chain learnable
+  *without* hand-tuned bonuses — e.g. committed multi-step options/plans (the noot locks
+  in "go mine a load → haul → sell" and is rewarded on completion), better credit
+  assignment (n-step/eligibility traces), or curriculum — then retire the shaping.
+- **STATUS**: stub
 
 ### Welfare / utility
 - **NOW**: a noot's utility = "not starving" (per staple, `(satiation−appetite)/

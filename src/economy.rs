@@ -45,6 +45,23 @@ pub const WORK_RATE: f32 = 3.0;
 pub const REFINE_RATE: f32 = 2.0;
 
 // --- Learning by doing ------------------------------------------------------
+/// Intrinsic reward per unit produced (mined or refined), added to the policy reward to
+/// bootstrap production. The downstream payoff (eating, or selling for bucks) is gated
+/// and far down a multi-step chain, so bare ΔU never teaches a noot that *producing* is
+/// worthwhile — it just wanders. This is self-limiting: `extract`/`refine` yield nothing
+/// at full load or with no intermediates, so the bonus can't reward hoarding forever.
+const MINE_SHAPING: f32 = 0.05;
+/// When a noot explores while standing where it can produce, pick the production action
+/// (rather than a uniform random one) with this probability. Uniform ε almost never
+/// samples Mine on the deposit tile — one action out of up to eight, on the rare tick the
+/// noot is both there and exploring — so the policy never observes the payoff and never
+/// learns to mine. Guiding exploration toward the available production action lets value
+/// propagate back along the deposit heading without hand-coding the behaviour itself.
+const EXPLORE_PRODUCE_BIAS: f32 = 0.6;
+/// Refining is one step further along the chain than mining, so it earns a touch more —
+/// enough to teach the mine→refine→eat path for the refined staple without dominating.
+const REFINE_SHAPING: f32 = 0.07;
+
 /// Experience gained per unit produced (mining + refining); experience is per
 /// individual and resets on death.
 const SKILL_PER_UNIT: f32 = 0.001;
@@ -606,7 +623,7 @@ pub fn policy_step(
             let (r, done) = if mem.died {
                 (-DEATH_PENALTY, true)
             } else {
-                (u_now - mem.last_u, false)
+                (u_now - mem.last_u + mem.shaping, false)
             };
             trainer.record(Transition {
                 pos: mem.last_pos,
@@ -620,12 +637,21 @@ pub fn policy_step(
             });
         }
         mem.died = false;
+        mem.shaping = 0.0;
 
         // Choose the next action: masked softmax, with an ε chance of a random valid
         // action (the per-noot exploration temperament).
         let act = if rng.0.chance(mem.explore) {
-            let valid: Vec<usize> = (0..N_ACT).filter(|&a| mask[a]).collect();
-            valid[rng.0.below(valid.len())]
+            // Guided exploration: prefer producing when the noot can, so the policy
+            // actually samples the high-value Mine/Refine actions; else uniform.
+            if mask[policy::A_MINE] && rng.0.chance(EXPLORE_PRODUCE_BIAS) {
+                policy::A_MINE
+            } else if mask[policy::A_REFINE] && rng.0.chance(EXPLORE_PRODUCE_BIAS) {
+                policy::A_REFINE
+            } else {
+                let valid: Vec<usize> = (0..N_ACT).filter(|&a| mask[a]).collect();
+                valid[rng.0.below(valid.len())]
+            }
         } else {
             let logits = ac.logits(s_pos, &s_o);
             let probs = policy::masked_softmax(&logits, &mask);
@@ -754,9 +780,16 @@ pub fn death_and_respawn(
 pub fn extract(
     mut sim: ResMut<Sim>,
     mut stats: ResMut<EconStats>,
-    mut q: Query<(&Action, &Claim, &TilePos, &mut Inventory, &mut NootMeta)>,
+    mut q: Query<(
+        &Action,
+        &Claim,
+        &TilePos,
+        &mut Inventory,
+        &mut NootMeta,
+        &mut PolicyMemory,
+    )>,
 ) {
-    for (action, claim, pos, mut inv, mut meta) in &mut q {
+    for (action, claim, pos, mut inv, mut meta, mut mem) in &mut q {
         if *action != Action::Mine {
             continue;
         }
@@ -778,6 +811,7 @@ pub fn extract(
         let got = sim.0.extract_from(deposit, rate, TICK_DT) as f32;
         inv.items[raw] += got;
         meta.experience += got;
+        mem.shaping += MINE_SHAPING * got;
         stats.produced_window += got;
         stats.produced_total += got as f64;
     }
@@ -809,11 +843,8 @@ pub fn claim_deposits(sim: Res<Sim>, mut q: Query<(&TilePos, &mut Claim)>) {
 
 /// Refine held intermediates — but only for noots whose chosen action this tick is
 /// `Refine` (set by `policy_step`), faster the more refining experience accrued.
-pub fn refine(
-    sim: Res<Sim>,
-    mut q: Query<(&Action, &mut Inventory, &mut NootMeta)>,
-) {
-    for (action, mut inv, mut meta) in &mut q {
+pub fn refine(sim: Res<Sim>, mut q: Query<(&Action, &mut Inventory, &mut NootMeta, &mut PolicyMemory)>) {
+    for (action, mut inv, mut meta, mut mem) in &mut q {
         if *action != Action::Refine {
             continue;
         }
@@ -828,6 +859,7 @@ pub fn refine(
             inv.items[raw] -= amount;
             inv.items[refined] += amount;
             meta.experience += amount;
+            mem.shaping += REFINE_SHAPING * amount;
         }
     }
 }
