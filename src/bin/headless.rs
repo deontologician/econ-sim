@@ -130,6 +130,7 @@ fn main() {
         }
     };
     w.insert_resource(Trainer::default());
+    w.insert_resource(economy::PriceField::default());
 
     match restore_noots {
         Some(noots) => {

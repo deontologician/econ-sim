@@ -355,6 +355,7 @@ fn main() {
         .init_resource::<StatHistory>()
         .init_resource::<GraphSelection>()
         .init_resource::<economy::IncomeControl>()
+        .init_resource::<economy::PriceField>()
         .init_resource::<Trainer>()
         .add_systems(Startup, setup)
         // The fixed-tick simulation pipeline (each system advances the world by one

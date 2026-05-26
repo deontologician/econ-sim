@@ -13,7 +13,7 @@ use bevy::prelude::*;
 use crate::goods::{self, form_of, GoodForm, ItemRole, N_ITEMS};
 use crate::hex::{hex_center, neighbors, torus_distance};
 use crate::noot::*;
-use crate::world::terrain_factor;
+use crate::world::{terrain_factor, DepositKind, World};
 use crate::policy::{self, ActorCritic, PolicyMemory, Trainer, Transition, N_ACT, N_OTHER};
 use crate::{Sim, SimRng};
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,26 @@ const SURPLUS_FLOOR: f32 = 0.35;
 /// A noot only buys surplus to resell when fed and holding more bucks than this,
 /// so speculation never starves it of food money.
 const ARBITRAGE_RESERVE: f32 = 30.0;
+
+// --- Spatial price gradient (the merchant's reason to travel) ---------------
+// A good's *local* market ask varies across the map: cheap on top of a rich source
+// (a glut), dear in a region with no nearby source (scarce). The spread is the markup
+// a merchant captures by hauling goods from source to deficit — and the gradient the
+// planner reads when valuing where to go sell. (`meet_and_trade` prices the seller's
+// ask at the *seller's tile*, so a noot earns more selling the same good far from
+// where it was mined.)
+/// Local ask on top of a full source, as a fraction of the good's base ask (glut).
+const PRICE_FLOOR: f32 = 0.5;
+/// Local ask in a region with no nearby source, as a multiple of the base ask. Kept
+/// modest so even refined staples stay under a starving buyer's WTP and still clear.
+const PRICE_CEIL: f32 = 1.6;
+/// Hex distance over which a deposit suppresses local prices; past a few of these the
+/// good is effectively scarce. A deposit's pull is also weighted by how full it is, so
+/// a depleted finite source stops glutting its surroundings and the region dears up.
+const SUPPLY_RANGE: f32 = 6.0;
+/// Rebuild the supply-driven price field this often (deposit tiles are fixed, but their
+/// fullness drifts as they deplete/regrow, so a periodic rebuild tracks that cheaply).
+const PRICE_FIELD_REBUILD_TICKS: u32 = 600;
 
 /// Ticks each production/consumption rate sample covers.
 const RATE_WINDOW_TICKS: u32 = 30;
@@ -569,6 +589,7 @@ pub fn add_sim_systems(schedule: &mut Schedule) {
             hunger_tick,
             hunger_pid,
             age_noots,
+            update_price_field,
             policy_step,
             claim_deposits,
             extract,
@@ -765,6 +786,7 @@ pub fn positional_utility(goods: &goods::WorldGoods, inv: &Inventory) -> f32 {
 struct Snap {
     e: Entity,
     pos: Vec2,
+    tile: usize,
     inv: [f32; N_ITEMS],
     bucks: f32,
     hunger: [f32; N_STAPLES],
@@ -866,11 +888,112 @@ fn surplus_discount(held: f32) -> f32 {
     }
 }
 
-/// The price a noot offers one unit at: its surplus-discounted ask, but never
-/// below its cost basis — so freshly mined goods (cost ≈ 0) dump cheap when
-/// glutted, while goods bought to flip won't be resold at a loss.
-fn seller_ask(goods: &goods::WorldGoods, item: usize, held: f32, cost_basis: f32) -> f32 {
-    (base_ask(goods, item) * surplus_discount(held)).max(cost_basis)
+/// The price a noot offers one unit at: the *local* market ask (cheap near a source,
+/// dear in a deficit region) discounted for its own surplus, but never below its cost
+/// basis — so freshly mined goods (cost ≈ 0) dump cheap when glutted, while goods
+/// bought to flip won't be resold at a loss.
+fn seller_ask(local_ask: f32, held: f32, cost_basis: f32) -> f32 {
+    (local_ask * surplus_discount(held)).max(cost_basis)
+}
+
+/// Spatial good prices: the local market ask for each item at each tile. The same good
+/// is cheap on top of a rich source (glut) and dear in regions with no nearby source
+/// (scarce), so hauling it across the map earns a real markup. Derived from a
+/// distance-decayed, fullness-weighted supply potential per element slot (both the raw
+/// and refined item of a slot share its supply). Transient: rebuilt from the world,
+/// never serialized.
+#[derive(Resource, Default)]
+pub struct PriceField {
+    cols: i32,
+    rows: i32,
+    /// `price[tile][item]` = local market ask (bucks) for `item` at `tile`.
+    price: Vec<[f32; N_ITEMS]>,
+    elapsed: u32,
+}
+
+impl PriceField {
+    /// Local market ask for `item` at tile index `tile`, falling back to the global
+    /// base ask before the field is first built.
+    pub fn local_ask(&self, goods: &goods::WorldGoods, tile: usize, item: usize) -> f32 {
+        self.price
+            .get(tile)
+            .map(|row| row[item])
+            .unwrap_or_else(|| base_ask(goods, item))
+    }
+}
+
+/// A deposit's pull on local prices: how full it is (0 when depleted, 1 when brimming),
+/// so a worked-out finite source stops glutting its surroundings.
+fn supply_weight(dep: &crate::world::Deposit) -> f32 {
+    match &dep.kind {
+        DepositKind::Replenishable {
+            stock, capacity, ..
+        } => (*stock / *capacity).clamp(0.0, 1.0) as f32,
+        DepositKind::Finite {
+            remaining, initial,
+        } => (*remaining / *initial).clamp(0.0, 1.0) as f32,
+    }
+}
+
+/// Recompute the whole price field from the current deposit layout/fullness: for each
+/// slot, accumulate a linear distance kernel from every deposit (weighted by fullness),
+/// normalize to `[0,1]`, then map full→`PRICE_FLOOR` and empty→`PRICE_CEIL` of base.
+fn rebuild_price_field(field: &mut PriceField, world: &World) {
+    let (cols, rows) = (world.cols, world.rows);
+    let n = (cols * rows) as usize;
+    let n_slots = world.chosen.len();
+    field.cols = cols;
+    field.rows = rows;
+    field.price = vec![[0.0f32; N_ITEMS]; n];
+
+    let mut pot = vec![vec![0.0f32; n]; n_slots];
+    for dep in &world.deposits {
+        let slot = dep.element_slot;
+        let dt = &world.tiles[dep.tile];
+        let weight = supply_weight(dep);
+        if weight <= 0.0 {
+            continue;
+        }
+        for r in 0..rows {
+            for c in 0..cols {
+                let dist = torus_distance(c, r, dt.col, dt.row, cols, rows) as f32;
+                let k = (1.0 - dist / SUPPLY_RANGE).max(0.0);
+                if k > 0.0 {
+                    pot[slot][(r * cols + c) as usize] += weight * k;
+                }
+            }
+        }
+    }
+
+    for slot in 0..n_slots {
+        let maxp = pot[slot].iter().copied().fold(0.0f32, f32::max).max(1e-6);
+        for tile in 0..n {
+            let norm = (pot[slot][tile] / maxp).clamp(0.0, 1.0);
+            // norm 1 (right on a full source) → FLOOR; norm 0 (no source near) → CEIL.
+            let mult = PRICE_CEIL + (PRICE_FLOOR - PRICE_CEIL) * norm;
+            for form in 0..2 {
+                let item = slot * 2 + form;
+                field.price[tile][item] = base_ask(&world.goods, item) * mult;
+            }
+        }
+    }
+}
+
+/// Keep the spatial price field current: build it on first run (and if the map resizes),
+/// then rebuild every `PRICE_FIELD_REBUILD_TICKS` to track deposit depletion/regrowth.
+pub fn update_price_field(sim: Res<Sim>, mut field: ResMut<PriceField>) {
+    let world = &sim.0;
+    let resized = field.cols != world.cols || field.rows != world.rows;
+    if field.price.is_empty() || resized {
+        rebuild_price_field(&mut field, world);
+        field.elapsed = 0;
+        return;
+    }
+    field.elapsed += 1;
+    if field.elapsed >= PRICE_FIELD_REBUILD_TICKS {
+        rebuild_price_field(&mut field, world);
+        field.elapsed = 0;
+    }
 }
 
 struct Tx {
@@ -883,6 +1006,7 @@ struct Tx {
 #[allow(clippy::type_complexity)]
 pub fn meet_and_trade(
     sim: Res<Sim>,
+    field: Res<PriceField>,
     mut stats: ResMut<EconStats>,
     mut income: ResMut<IncomeControl>,
     mut q: Query<(
@@ -896,6 +1020,7 @@ pub fn meet_and_trade(
     )>,
 ) {
     let goods = &sim.0.goods;
+    let cols = sim.0.cols;
     let hex_size = sim.0.hex_size;
     let radius2 = (hex_size * TRADE_RADIUS_FACTOR).powi(2);
 
@@ -908,6 +1033,7 @@ pub fn meet_and_trade(
             Snap {
                 e,
                 pos: Vec2::new(px, py),
+                tile: (tp.row * cols + tp.col) as usize,
                 inv: inv.items,
                 bucks: wal.bucks,
                 hunger: hunger.staple,
@@ -938,8 +1064,8 @@ pub fn meet_and_trade(
                     if snaps[si].inv[item] < 1.0 {
                         continue;
                     }
-                    let price =
-                        seller_ask(goods, item, snaps[si].inv[item], snaps[si].cost_basis[item]);
+                    let local_ask = field.local_ask(goods, snaps[si].tile, item);
+                    let price = seller_ask(local_ask, snaps[si].inv[item], snaps[si].cost_basis[item]);
                     let buyer_wtp = wtp(goods, item, &snaps[bi]);
                     let seller_res = reservation(goods, item, &snaps[si]);
                     if buyer_wtp >= price && seller_res < price && snaps[bi].bucks >= price {
