@@ -290,9 +290,18 @@ pub fn age_noots(mut q: Query<&mut NootMeta>) {
     }
 }
 
-pub fn hunger_tick(ctrl: Res<HungerControl>, mut q: Query<&mut Hunger>) {
-    let d = ctrl.rate * TICK_DT;
-    for mut h in &mut q {
+/// How much the hardest terrain accelerates hunger: a noot on a cliff (difficulty 1)
+/// burns `1 + this`× the appetite per tick of one on the easiest ground (difficulty 0).
+/// Rough ground costs energy, giving the terrain-difficulty feature something to act on.
+const HUNGER_TERRAIN_K: f32 = 1.0;
+
+pub fn hunger_tick(ctrl: Res<HungerControl>, sim: Res<Sim>, mut q: Query<(&TilePos, &mut Hunger)>) {
+    let base = ctrl.rate * TICK_DT;
+    let world = &sim.0;
+    for (pos, mut h) in &mut q {
+        let idx = (pos.row * world.cols + pos.col) as usize;
+        let difficulty = world.tiles[idx].difficulty.clamp(0.0, 1.0);
+        let d = base * (1.0 + HUNGER_TERRAIN_K * difficulty);
         for a in &mut h.staple {
             *a = (*a + d).min(STAPLE_SATIATION);
         }
@@ -338,10 +347,31 @@ fn target_deposit_tile(world: &crate::world::World, claim: &Claim, pos: &TilePos
         .min_by_key(|&(c, r)| torus_distance(pos.col, pos.row, c, r, world.cols, world.rows))
 }
 
-/// Build the policy's non-positional feature vector and the tile index. The six
-/// directional features score each move by how much it shortens the toroidal hex path
-/// to the target deposit (+1 closer, −1 farther), so the actor can learn to walk to a
-/// deposit and then mine; `on_minable` flags that Mine is legal right now.
+/// Per-direction signed change in toroidal hex distance to `target` if the noot steps
+/// that way: +1 if the step gets closer, −1 farther, 0 otherwise (and all-zero when
+/// there is no target). Indexed identically to `hex::neighbors`, so it lines up with the
+/// six directional move actions — a ready-made "head toward X" gradient for the actor.
+fn heading_gradient(world: &crate::world::World, pos: &TilePos, target: Option<(i32, i32)>) -> [f32; policy::N_DIRS] {
+    let mut g = [0.0f32; policy::N_DIRS];
+    if let Some((tc, tr)) = target {
+        let here = torus_distance(pos.col, pos.row, tc, tr, world.cols, world.rows);
+        for (d, &(nc, nr)) in neighbors(pos.col, pos.row, world.cols, world.rows)
+            .iter()
+            .enumerate()
+        {
+            g[d] = (here - torus_distance(nc, nr, tc, tr, world.cols, world.rows)) as f32;
+        }
+    }
+    g
+}
+
+/// Build the policy's non-positional feature vector and the tile index. Two engineered
+/// headings — a per-direction gradient toward the target deposit and toward the nearest
+/// other noot — let the actor learn to walk to a resource (then mine) and to seek out
+/// trade partners (clumping); `on_minable`/`noot_near` flag that those actions are live.
+// A featurizer naturally pulls in every slice of agent state; splitting it would only
+// scatter the feature layout that's deliberately kept in one place.
+#[allow(clippy::too_many_arguments)]
 fn features(
     world: &crate::world::World,
     pos: &TilePos,
@@ -350,6 +380,7 @@ fn features(
     inv: &Inventory,
     wallet: &Wallet,
     mask: &[bool; N_ACT],
+    nearest_noot: Option<(i32, i32)>,
 ) -> (usize, [f32; N_OTHER]) {
     let pos_idx = (pos.row * world.cols + pos.col) as usize;
     let mut o = [0.0f32; N_OTHER];
@@ -360,16 +391,34 @@ fn features(
     o[4] = if claim.deposit.is_some() { 1.0 } else { 0.0 };
     o[5] = 1.0; // bias
 
-    if let Some((tc, tr)) = target_deposit_tile(world, claim, pos) {
-        let here = torus_distance(pos.col, pos.row, tc, tr, world.cols, world.rows);
-        let nbrs = neighbors(pos.col, pos.row, world.cols, world.rows);
-        for (d, &(nc, nr)) in nbrs.iter().enumerate() {
-            let there = torus_distance(nc, nr, tc, tr, world.cols, world.rows);
-            o[policy::O_DEPOSIT_DIR + d] = (here - there) as f32;
-        }
-    }
+    let dep = heading_gradient(world, pos, target_deposit_tile(world, claim, pos));
+    o[policy::O_DEPOSIT_DIR..policy::O_DEPOSIT_DIR + policy::N_DIRS].copy_from_slice(&dep);
     o[policy::O_ON_MINABLE] = if mask[policy::A_MINE] { 1.0 } else { 0.0 };
+
+    let noot = heading_gradient(world, pos, nearest_noot);
+    o[policy::O_NOOT_DIR..policy::O_NOOT_DIR + policy::N_DIRS].copy_from_slice(&noot);
+    if let Some((tc, tr)) = nearest_noot {
+        // "Within trade range" ≈ adjacent or co-located (the trade radius is ~1 hex).
+        let d = torus_distance(pos.col, pos.row, tc, tr, world.cols, world.rows);
+        o[policy::O_NOOT_NEAR] = if d <= 1 { 1.0 } else { 0.0 };
+    }
+    o[policy::O_TERRAIN] = world.tiles[pos_idx].difficulty.clamp(0.0, 1.0);
     (pos_idx, o)
+}
+
+/// The tile of the nearest noot other than `me` (for the trade-partner heading).
+fn nearest_other_noot(
+    snapshot: &[(Entity, i32, i32)],
+    me: Entity,
+    pos: &TilePos,
+    cols: i32,
+    rows: i32,
+) -> Option<(i32, i32)> {
+    snapshot
+        .iter()
+        .filter(|(e, _, _)| *e != me)
+        .min_by_key(|(_, c, r)| torus_distance(pos.col, pos.row, *c, *r, cols, rows))
+        .map(|&(_, c, r)| (c, r))
 }
 
 /// Which actions are valid: a move direction is valid iff that neighbour is in
@@ -407,6 +456,7 @@ pub fn policy_step(
     mut trainer: ResMut<Trainer>,
     mut rng: ResMut<SimRng>,
     mut q: Query<(
+        Entity,
         &mut TilePos,
         &Claim,
         &Inventory,
@@ -417,13 +467,18 @@ pub fn policy_step(
     )>,
 ) {
     let world = &sim.0;
-    for (mut pos, claim, inv, hunger, wallet, mut action, mut mem) in &mut q {
+    // Snapshot every noot's tile up front so each can read the others' positions while
+    // we hold the query mutably (positions only shift one hex/tick, so this is fresh).
+    let snapshot: Vec<(Entity, i32, i32)> =
+        q.iter().map(|(e, p, ..)| (e, p.col, p.row)).collect();
+    for (e, mut pos, claim, inv, hunger, wallet, mut action, mut mem) in &mut q {
         mem.cooldown -= TICK_DT;
         if mem.cooldown > 0.0 && !mem.died {
             continue;
         }
         let mask = action_mask(world, claim, &pos, inv);
-        let (s_pos, s_o) = features(world, &pos, claim, hunger, inv, wallet, &mask);
+        let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world.cols, world.rows);
+        let (s_pos, s_o) = features(world, &pos, claim, hunger, inv, wallet, &mask, nearest_noot);
         let u_now = maslow_utility(hunger, inv, wallet, &world.goods);
 
         // Close out the previous transition (reward = ΔU, or a death penalty).

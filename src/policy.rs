@@ -30,14 +30,23 @@ pub const N_ACT: usize = N_DIRS + 2;
 /// Non-positional state features (position is a separate embedding lookup). Layout:
 /// 0 `tanh(bucks/100)`, 1–2 hunger per staple, 3 positional utility, 4 owns-a-deposit,
 /// 5 bias, 6–11 per-direction "does this step shorten the path to my target deposit"
-/// (∈ {−1,0,1}), 12 "Mine is available right now". The last seven make the
-/// mining/navigation subtask Markov — without them the shared brain can't tell where
-/// its deposit is or that it's standing on it.
-pub const N_OTHER: usize = 13;
+/// (∈ {−1,0,1}), 12 "Mine is available right now", 13–18 the same directional gradient
+/// toward the nearest *other noot*, 19 "another noot is within trade range", 20 the
+/// local terrain difficulty (harder ground drains hunger faster, so this lets the actor
+/// learn to avoid it). The engineered headings make the navigation subtask Markov:
+/// without them the shared brain can't tell where its deposit or a trade partner is, so
+/// mining and clumping never emerge from the position embedding alone.
+pub const N_OTHER: usize = 21;
 /// Index of the first of the six directional deposit-gradient features.
 pub const O_DEPOSIT_DIR: usize = 6;
 /// Index of the "Mine available" feature.
 pub const O_ON_MINABLE: usize = 12;
+/// Index of the first of the six directional nearest-noot-gradient features.
+pub const O_NOOT_DIR: usize = 13;
+/// Index of the "a noot is within trade range" feature.
+pub const O_NOOT_NEAR: usize = 19;
+/// Index of the local terrain-difficulty feature.
+pub const O_TERRAIN: usize = 20;
 /// Hidden width of the shared trunk.
 pub const H: usize = 32;
 
@@ -90,6 +99,7 @@ impl ActorCritic {
     pub fn fits(&self, n_tiles: usize) -> bool {
         self.n_tiles == n_tiles
             && self.embed.len() == n_tiles * H
+            && self.w_other.len() == H * N_OTHER
             && self.wa.len() == N_ACT * H
             && self.wv.len() == H
     }

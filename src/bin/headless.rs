@@ -140,13 +140,17 @@ fn emit_record(w: &mut World) {
     let income = w.resource::<IncomeControl>().clone();
 
     // Population aggregates (one pass over the noots).
-    let goods = w.resource::<Sim>().0.goods.clone();
-    let mut q = w.query::<(&Action, &Hunger, &Claim, &Wallet, &NootMeta, &Trader, &Inventory)>();
+    let sim_ref = w.resource::<Sim>();
+    let goods = sim_ref.0.goods.clone();
+    let (cols, rows) = (sim_ref.0.cols, sim_ref.0.rows);
+    let mut q =
+        w.query::<(&Action, &Hunger, &Claim, &Wallet, &NootMeta, &Trader, &Inventory, &TilePos)>();
     let mut act = [0u64; 3];
     let (mut starving, mut claimed, mut n) = (0u64, 0u64, 0u64);
-    let (mut bucks, mut appetite, mut experience, mut discount, mut positional) =
-        (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    for (a, h, c, wal, m, tr, inv) in q.iter(w) {
+    let (mut bucks, mut appetite, mut experience, mut age, mut discount, mut positional) =
+        (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let mut tiles: Vec<(i32, i32)> = Vec::new();
+    for (a, h, c, wal, m, tr, inv, tp) in q.iter(w) {
         match a {
             Action::Move => act[0] += 1,
             Action::Mine => act[1] += 1,
@@ -161,14 +165,31 @@ fn emit_record(w: &mut World) {
         bucks += wal.bucks as f64;
         appetite += (h.staple.iter().sum::<f32>() / h.staple.len() as f32) as f64;
         experience += m.experience as f64;
+        age += m.age as f64;
         discount += tr.discount as f64;
         positional += (0..econ_sim::goods::N_ITEMS)
             .filter(|&i| matches!(goods.role_of(i), ItemRole::Positional(_)))
             .map(|i| inv.items[i])
             .sum::<f32>() as f64;
+        tiles.push((tp.col, tp.row));
         n += 1;
     }
     let nf = n.max(1) as f64;
+
+    // Clumping proxy: mean nearest-neighbour hex distance (lower = more clustered).
+    let mut nn_sum = 0.0f64;
+    for (i, &(c, r)) in tiles.iter().enumerate() {
+        let mut best = i32::MAX;
+        for (j, &(oc, or)) in tiles.iter().enumerate() {
+            if i != j {
+                best = best.min(econ_sim::hex::torus_distance(c, r, oc, or, cols, rows));
+            }
+        }
+        if best != i32::MAX {
+            nn_sum += best as f64;
+        }
+    }
+    let mean_nn_dist = nn_sum / nf;
 
     let record = serde_json::json!({
         "tick": stats.ticks,
@@ -196,8 +217,10 @@ fn emit_record(w: &mut World) {
         "mean_bucks": bucks / nf,
         "mean_appetite": appetite / nf,
         "mean_experience": experience / nf,
+        "mean_age": age / nf,
         "mean_discount": discount / nf,
         "mean_positional": positional / nf,
+        "mean_nn_dist": mean_nn_dist,
     });
     println!("{}", record);
 }
