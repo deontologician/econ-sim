@@ -125,6 +125,11 @@ const SUPPLY_RANGE: f32 = 6.0;
 /// Rebuild the supply-driven price field this often (deposit tiles are fixed, but their
 /// fullness drifts as they deplete/regrow, so a periodic rebuild tracks that cheaply).
 const PRICE_FIELD_REBUILD_TICKS: u32 = 600;
+/// Per-hex penalty (in buck-equivalent margin) when choosing which market to head for,
+/// so a noot prefers a near market and only bothers hauling a load far when the expected
+/// markup justifies the trek. This gates the market heading — a tiny load won't pull a
+/// noot off its deposit; a full one will.
+const MARKET_DIST_PENALTY: f32 = 3.0;
 
 /// Ticks each production/consumption rate sample covers.
 const RATE_WINDOW_TICKS: u32 = 30;
@@ -155,6 +160,10 @@ pub struct EconStats {
     /// Trade value cleared per tick (nominal GDP rate).
     #[serde(default)]
     pub gdp_rate: f32,
+    /// Mean hex distance from source to point of sale over the last window — how far
+    /// goods are being hauled (a trekking-merchant readout). 0 when nothing sold.
+    #[serde(default)]
+    pub mean_haul_dist: f32,
     // Accumulators for the in-progress rate window.
     produced_window: f32,
     consumed_window: f32,
@@ -162,6 +171,10 @@ pub struct EconStats {
     utility_window: f32,
     #[serde(default)]
     gdp_window: f32,
+    #[serde(default)]
+    haul_window: f64,
+    #[serde(default)]
+    haul_count_window: u32,
     window_ticks: u32,
 }
 
@@ -176,11 +189,18 @@ pub fn update_rates(mut stats: ResMut<EconStats>) {
         stats.merchant_profit_rate = stats.merchant_profit_window * inv;
         stats.utility_rate = stats.utility_window * inv;
         stats.gdp_rate = stats.gdp_window * inv;
+        stats.mean_haul_dist = if stats.haul_count_window > 0 {
+            (stats.haul_window / stats.haul_count_window as f64) as f32
+        } else {
+            0.0
+        };
         stats.produced_window = 0.0;
         stats.consumed_window = 0.0;
         stats.merchant_profit_window = 0.0;
         stats.utility_window = 0.0;
         stats.gdp_window = 0.0;
+        stats.haul_window = 0.0;
+        stats.haul_count_window = 0;
         stats.window_ticks = 0;
     }
 }
@@ -325,13 +345,30 @@ pub fn age_noots(mut q: Query<&mut NootMeta>) {
 /// Rough ground costs energy, giving the terrain-difficulty feature something to act on.
 const HUNGER_TERRAIN_K: f32 = 1.0;
 
-pub fn hunger_tick(ctrl: Res<HungerControl>, sim: Res<Sim>, mut q: Query<(&TilePos, &mut Hunger)>) {
+/// Transport cost: a noot moving with a full load burns `1 + this`× the hunger of an
+/// empty one. Carried goods have weight, so hauling them across the map costs energy —
+/// which gives distance a real price, rewards efficient routes over wandering, and makes
+/// it cheaper to settle near where you trade (agglomeration) than to roam loaded.
+const CARRY_HUNGER_K: f32 = 0.6;
+
+pub fn hunger_tick(
+    ctrl: Res<HungerControl>,
+    sim: Res<Sim>,
+    mut q: Query<(&TilePos, &Action, &Inventory, &mut Hunger)>,
+) {
     let base = ctrl.rate * TICK_DT;
     let world = &sim.0;
-    for (pos, mut h) in &mut q {
+    for (pos, action, inv, mut h) in &mut q {
         let idx = (pos.row * world.cols + pos.col) as usize;
         let difficulty = world.tiles[idx].difficulty.clamp(0.0, 1.0);
-        let d = base * (1.0 + HUNGER_TERRAIN_K * difficulty);
+        // Carrying weighs on a noot only while it's actually hauling (a Move tick).
+        let carry = if *action == Action::Move {
+            let load: f32 = inv.items.iter().sum();
+            CARRY_HUNGER_K * (load / CARRY_CAP).min(1.0)
+        } else {
+            0.0
+        };
+        let d = base * (1.0 + HUNGER_TERRAIN_K * difficulty + carry);
         for a in &mut h.staple {
             *a = (*a + d).min(STAPLE_SATIATION);
         }
@@ -377,6 +414,49 @@ fn target_deposit_tile(world: &crate::world::World, claim: &Claim, pos: &TilePos
         .min_by_key(|&(c, r)| torus_distance(pos.col, pos.row, c, r, world.cols, world.rows))
 }
 
+/// The tile where the goods this noot is carrying would fetch the most, net of the haul
+/// to get there: argmax over tiles of `Σ_held (local_ask − cost_basis)·held` minus a
+/// per-hex transport penalty. `None` when it carries nothing worth selling — so the
+/// gate naturally keeps a lightly-loaded noot mining and only sends a full one trekking.
+fn best_market_tile(
+    field: &PriceField,
+    world: &crate::world::World,
+    pos: &TilePos,
+    inv: &Inventory,
+    trader: &Trader,
+) -> Option<(i32, i32)> {
+    let carried: Vec<(usize, f32)> = (0..N_ITEMS)
+        .filter(|&i| inv.items[i] >= 1.0 && !matches!(world.goods.role_of(i), ItemRole::Junk))
+        .map(|i| (i, inv.items[i]))
+        .collect();
+    if carried.is_empty() {
+        return None;
+    }
+    let (cols, rows) = (world.cols, world.rows);
+    let mut best: Option<((i32, i32), f32)> = None;
+    for r in 0..rows {
+        for c in 0..cols {
+            let tile = (r * cols + c) as usize;
+            let mut val = 0.0f32;
+            for &(item, held) in &carried {
+                let margin = field.local_ask(&world.goods, tile, item) - trader.cost_basis[item];
+                if margin > 0.0 {
+                    val += margin * held;
+                }
+            }
+            if val <= 0.0 {
+                continue;
+            }
+            let dist = torus_distance(pos.col, pos.row, c, r, cols, rows) as f32;
+            let score = val - MARKET_DIST_PENALTY * dist;
+            if best.is_none_or(|(_, s)| score > s) {
+                best = Some(((c, r), score));
+            }
+        }
+    }
+    best.map(|(t, _)| t)
+}
+
 /// Per-direction signed change in toroidal hex distance to `target` if the noot steps
 /// that way: +1 if the step gets closer, −1 farther, 0 otherwise (and all-zero when
 /// there is no target). Indexed identically to `hex::neighbors`, so it lines up with the
@@ -404,11 +484,13 @@ fn heading_gradient(world: &crate::world::World, pos: &TilePos, target: Option<(
 #[allow(clippy::too_many_arguments)]
 fn features(
     world: &crate::world::World,
+    field: &PriceField,
     pos: &TilePos,
     claim: &Claim,
     hunger: &Hunger,
     inv: &Inventory,
     wallet: &Wallet,
+    trader: &Trader,
     mask: &[bool; N_ACT],
     nearest_noot: Option<(i32, i32)>,
 ) -> (usize, [f32; N_OTHER]) {
@@ -433,6 +515,11 @@ fn features(
         o[policy::O_NOOT_NEAR] = if d <= 1 { 1.0 } else { 0.0 };
     }
     o[policy::O_TERRAIN] = world.tiles[pos_idx].difficulty.clamp(0.0, 1.0);
+
+    let market = best_market_tile(field, world, pos, inv, trader);
+    let market_dir = heading_gradient(world, pos, market);
+    o[policy::O_MARKET_DIR..policy::O_MARKET_DIR + policy::N_DIRS].copy_from_slice(&market_dir);
+    o[policy::O_HAS_CARGO] = if market.is_some() { 1.0 } else { 0.0 };
     (pos_idx, o)
 }
 
@@ -482,6 +569,7 @@ fn action_mask(world: &crate::world::World, claim: &Claim, pos: &TilePos, inv: &
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn policy_step(
     sim: Res<Sim>,
+    field: Res<PriceField>,
     ac: Res<ActorCritic>,
     mut trainer: ResMut<Trainer>,
     mut rng: ResMut<SimRng>,
@@ -492,6 +580,7 @@ pub fn policy_step(
         &Inventory,
         &Hunger,
         &Wallet,
+        &Trader,
         &mut Action,
         &mut PolicyMemory,
     )>,
@@ -501,14 +590,15 @@ pub fn policy_step(
     // we hold the query mutably (positions only shift one hex/tick, so this is fresh).
     let snapshot: Vec<(Entity, i32, i32)> =
         q.iter().map(|(e, p, ..)| (e, p.col, p.row)).collect();
-    for (e, mut pos, claim, inv, hunger, wallet, mut action, mut mem) in &mut q {
+    for (e, mut pos, claim, inv, hunger, wallet, trader, mut action, mut mem) in &mut q {
         mem.cooldown -= TICK_DT;
         if mem.cooldown > 0.0 && !mem.died {
             continue;
         }
         let mask = action_mask(world, claim, &pos, inv);
         let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world.cols, world.rows);
-        let (s_pos, s_o) = features(world, &pos, claim, hunger, inv, wallet, &mask, nearest_noot);
+        let (s_pos, s_o) =
+            features(world, &field, &pos, claim, hunger, inv, wallet, trader, &mask, nearest_noot);
         let u_now = maslow_utility(hunger, inv, wallet, &world.goods);
 
         // Close out the previous transition (reward = ΔU, or a death penalty).
@@ -906,8 +996,12 @@ fn seller_ask(local_ask: f32, held: f32, cost_basis: f32) -> f32 {
 pub struct PriceField {
     cols: i32,
     rows: i32,
+    n_slots: usize,
     /// `price[tile][item]` = local market ask (bucks) for `item` at `tile`.
     price: Vec<[f32; N_ITEMS]>,
+    /// `src_dist[tile*n_slots + slot]` = hex distance from `tile` to the nearest deposit
+    /// of `slot` — how far a unit of that good has been hauled when sold there.
+    src_dist: Vec<f32>,
     elapsed: u32,
 }
 
@@ -919,6 +1013,18 @@ impl PriceField {
             .get(tile)
             .map(|row| row[item])
             .unwrap_or_else(|| base_ask(goods, item))
+    }
+
+    /// Hex distance from `tile` to the nearest deposit of the element `slot` (0 before
+    /// the field is built) — the haul distance of a good of that slot sold here.
+    pub fn source_dist(&self, tile: usize, slot: usize) -> f32 {
+        if self.n_slots == 0 {
+            return 0.0;
+        }
+        self.src_dist
+            .get(tile * self.n_slots + slot)
+            .copied()
+            .unwrap_or(0.0)
     }
 }
 
@@ -944,31 +1050,41 @@ fn rebuild_price_field(field: &mut PriceField, world: &World) {
     let n_slots = world.chosen.len();
     field.cols = cols;
     field.rows = rows;
+    field.n_slots = n_slots;
     field.price = vec![[0.0f32; N_ITEMS]; n];
+    field.src_dist = vec![f32::MAX; n * n_slots];
 
     let mut pot = vec![vec![0.0f32; n]; n_slots];
     for dep in &world.deposits {
         let slot = dep.element_slot;
         let dt = &world.tiles[dep.tile];
         let weight = supply_weight(dep);
-        if weight <= 0.0 {
-            continue;
-        }
         for r in 0..rows {
             for c in 0..cols {
+                let tile = (r * cols + c) as usize;
                 let dist = torus_distance(c, r, dt.col, dt.row, cols, rows) as f32;
+                // Nearest source (physical, regardless of fullness) for the haul metric.
+                let sd = &mut field.src_dist[tile * n_slots + slot];
+                *sd = sd.min(dist);
+                // Glut suppression scales with how full the deposit is.
                 let k = (1.0 - dist / SUPPLY_RANGE).max(0.0);
-                if k > 0.0 {
-                    pot[slot][(r * cols + c) as usize] += weight * k;
+                if weight > 0.0 && k > 0.0 {
+                    pot[slot][tile] += weight * k;
                 }
             }
         }
     }
+    // A slot with no deposits keeps its sentinel; clamp those to 0 so the metric is sane.
+    for d in &mut field.src_dist {
+        if !d.is_finite() {
+            *d = 0.0;
+        }
+    }
 
-    for slot in 0..n_slots {
-        let maxp = pot[slot].iter().copied().fold(0.0f32, f32::max).max(1e-6);
-        for tile in 0..n {
-            let norm = (pot[slot][tile] / maxp).clamp(0.0, 1.0);
+    for (slot, pot_slot) in pot.iter().enumerate() {
+        let maxp = pot_slot.iter().copied().fold(0.0f32, f32::max).max(1e-6);
+        for (tile, &p) in pot_slot.iter().enumerate() {
+            let norm = (p / maxp).clamp(0.0, 1.0);
             // norm 1 (right on a full source) → FLOOR; norm 0 (no source near) → CEIL.
             let mult = PRICE_CEIL + (PRICE_FLOOR - PRICE_CEIL) * norm;
             for form in 0..2 {
@@ -1092,6 +1208,8 @@ pub fn meet_and_trade(
                 stats.trades_total += 1;
                 stats.gdp_window += price;
                 stats.gdp_total += price as f64;
+                stats.haul_window += field.source_dist(snaps[si].tile, item / 2) as f64;
+                stats.haul_count_window += 1;
                 income.this_window += price as f64;
                 // EWMA of realized sale prices (lazy-init to the first sample).
                 stats.ewma_price[item] = if stats.ewma_price[item] <= 0.0 {

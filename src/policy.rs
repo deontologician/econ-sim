@@ -33,10 +33,13 @@ pub const N_ACT: usize = N_DIRS + 2;
 /// (∈ {−1,0,1}), 12 "Mine is available right now", 13–18 the same directional gradient
 /// toward the nearest *other noot*, 19 "another noot is within trade range", 20 the
 /// local terrain difficulty (harder ground drains hunger faster, so this lets the actor
-/// learn to avoid it). The engineered headings make the navigation subtask Markov:
-/// without them the shared brain can't tell where its deposit or a trade partner is, so
-/// mining and clumping never emerge from the position embedding alone.
-pub const N_OTHER: usize = 21;
+/// learn to avoid it), 21–26 the directional gradient toward the best market for the
+/// goods it's carrying (where they sell dearest, net of the haul), 27 "carrying
+/// sellable goods" (gates the market heading). The engineered headings make the
+/// navigation subtask Markov: without them the shared brain can't tell where its
+/// deposit, a trade partner, or a lucrative market is, so mining, clumping, and trekking
+/// never emerge from the position embedding alone.
+pub const N_OTHER: usize = 28;
 /// Index of the first of the six directional deposit-gradient features.
 pub const O_DEPOSIT_DIR: usize = 6;
 /// Index of the "Mine available" feature.
@@ -47,6 +50,10 @@ pub const O_NOOT_DIR: usize = 13;
 pub const O_NOOT_NEAR: usize = 19;
 /// Index of the local terrain-difficulty feature.
 pub const O_TERRAIN: usize = 20;
+/// Index of the first of the six directional best-market-gradient features.
+pub const O_MARKET_DIR: usize = 21;
+/// Index of the "carrying sellable goods" feature.
+pub const O_HAS_CARGO: usize = 27;
 /// Hidden width of the shared trunk.
 pub const H: usize = 32;
 
