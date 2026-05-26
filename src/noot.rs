@@ -44,15 +44,14 @@ pub struct Noot;
 /// forgoing the other this tick.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Action {
-    /// Step toward the highest-value neighbour hex (critic-greedy locomotion).
+    /// Took a relative directional step this tick (which neighbour is resolved by
+    /// the policy's chosen direction in `economy::policy_step`).
     #[default]
     Move,
     /// Extract from the claimed deposit underfoot.
     Mine,
     /// Convert a held intermediate into its refined good.
     Refine,
-    /// Buy/sell with a nearby noot.
-    Trade,
 }
 
 /// Per-noot life stats, surfaced by the noot-colouring overlays. `age` is seconds

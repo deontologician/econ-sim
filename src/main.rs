@@ -471,7 +471,7 @@ fn setup(
 
     // Shared actor-critic brain: reuse the saved one if it fits this map, else fresh.
     let policy = match restore_policy {
-        Some(p) if p.n_tiles == n_tiles => p,
+        Some(p) if p.fits(n_tiles) => p,
         _ => ActorCritic::new(n_tiles, &mut sim_rng),
     };
     commands.insert_resource(policy);
@@ -1387,7 +1387,6 @@ fn update_selection_panel(
         Action::Move => "move",
         Action::Mine => "mine",
         Action::Refine => "refine",
-        Action::Trade => "trade",
     };
 
     let utility = economy::maslow_utility(hunger, inv, wallet, &world.goods);

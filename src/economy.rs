@@ -29,6 +29,8 @@ const SAFETY_BUCKS: f32 = 60.0;
 const ESTEEM_NORM: f32 = 4.0;
 /// Reward penalty applied to the transition that ends in starvation death.
 const DEATH_PENALTY: f32 = 2.0;
+/// Minibatch updates per frame for the shared policy.
+const TRAIN_ITERS_PER_FRAME: usize = 4;
 
 // Production rates.
 pub const WORK_RATE: f32 = 3.0;
@@ -335,26 +337,25 @@ fn features(world: &crate::world::World, pos_idx: usize, hunger: &Hunger, inv: &
     (pos_idx, o)
 }
 
-/// Which actions are valid in the current state. Move and Trade are always allowed
-/// (Trade simply won't clear with no counterparty); Mine/Refine match the gates in
-/// `extract`/`refine`.
+/// Which actions are valid: a move direction is valid iff that neighbour is in
+/// bounds; Mine/Refine match the gates in `extract`/`refine`. (Trading is automatic,
+/// not an action.) Directions are indexed identically to `hex::neighbors`.
 fn action_mask(world: &crate::world::World, claim: &Claim, pos: &TilePos, inv: &Inventory) -> [bool; N_ACT] {
-    let can_mine = claim.deposit.is_some_and(|d| {
+    let mut mask = [false; N_ACT];
+    for (i, (c, r)) in neighbors(pos.col, pos.row).into_iter().enumerate() {
+        mask[i] = c >= 0 && r >= 0 && c < world.cols && r < world.rows;
+    }
+    mask[policy::A_MINE] = claim.deposit.is_some_and(|d| {
         let dep = &world.deposits[d];
         let t = &world.tiles[dep.tile];
         t.col == pos.col
             && t.row == pos.row
             && inv.items[goods::item_index(dep.element_slot, GoodForm::Raw)] < CARRY_CAP
     });
-    let can_refine = claim.deposit.is_none()
+    mask[policy::A_REFINE] = claim.deposit.is_none()
         && (0..N_ITEMS).any(|i| {
             matches!(world.goods.role_of(i), ItemRole::Intermediate) && inv.items[i] > 0.0
         });
-    let mut mask = [false; N_ACT];
-    mask[policy::A_MOVE] = true;
-    mask[policy::A_MINE] = can_mine;
-    mask[policy::A_REFINE] = can_refine;
-    mask[policy::A_TRADE] = true;
     mask
 }
 
@@ -413,23 +414,29 @@ pub fn policy_step(
         }
         mem.died = false;
 
-        // Choose the next action from the shared policy (masked softmax).
-        let logits = ac.logits(s_pos, &s_o);
-        let probs = policy::masked_softmax(&logits, &mask);
-        let act = policy::sample(&probs, &mut rng.0);
-        *action = match act {
-            policy::A_MINE => Action::Mine,
-            policy::A_REFINE => Action::Refine,
-            policy::A_TRADE => Action::Trade,
-            _ => Action::Move,
+        // Choose the next action: masked softmax, with an ε chance of a random valid
+        // action (the per-noot exploration temperament).
+        let act = if rng.0.chance(mem.explore) {
+            let valid: Vec<usize> = (0..N_ACT).filter(|&a| mask[a]).collect();
+            valid[rng.0.below(valid.len())]
+        } else {
+            let logits = ac.logits(s_pos, &s_o);
+            let probs = policy::masked_softmax(&logits, &mask);
+            policy::sample(&probs, &mut rng.0)
         };
 
-        // Move resolves direction via the critic's value over neighbour positions.
-        if act == policy::A_MOVE {
-            let (nc, nr) = best_move(world, &ac, &s_o, pos.col, pos.row, mem.explore, &mut rng.0);
+        // Indices 0..6 are relative move directions (step to that neighbour hex);
+        // the rest are Mine/Refine in place.
+        *action = if act == policy::A_MINE {
+            Action::Mine
+        } else if act == policy::A_REFINE {
+            Action::Refine
+        } else {
+            let (nc, nr) = neighbors(pos.col, pos.row)[act];
             pos.col = nc;
             pos.row = nr;
-        }
+            Action::Move
+        };
 
         // Cache this state/action for the next transition.
         mem.last_pos = s_pos;
@@ -443,41 +450,13 @@ pub fn policy_step(
     }
 }
 
-/// Pick the neighbour hex with the highest critic value (ε-greedy via `explore`).
-fn best_move(
-    world: &crate::world::World,
-    ac: &ActorCritic,
-    o: &[f32; N_OTHER],
-    col: i32,
-    row: i32,
-    explore: f32,
-    rng: &mut crate::rng::Rng,
-) -> (i32, i32) {
-    let inb: Vec<(i32, i32)> = neighbors(col, row)
-        .into_iter()
-        .filter(|&(c, r)| c >= 0 && r >= 0 && c < world.cols && r < world.rows)
-        .collect();
-    if inb.is_empty() {
-        return (col, row);
-    }
-    if rng.chance(explore) {
-        return inb[rng.below(inb.len())];
-    }
-    let mut best = inb[0];
-    let mut best_v = f32::MIN;
-    for (c, r) in inb {
-        let v = ac.value((r * world.cols + c) as usize, o);
-        if v > best_v {
-            best_v = v;
-            best = (c, r);
-        }
-    }
-    best
-}
-
-/// One A2C minibatch update on the shared policy each frame (warms up first).
+/// A few A2C minibatch updates on the shared policy each frame (warms up first) —
+/// several per frame so the shared buffer's experience is reused and learning keeps
+/// pace with the ~160 decisions/sec the population generates.
 pub fn train_policy(mut ac: ResMut<ActorCritic>, mut trainer: ResMut<Trainer>, mut rng: ResMut<SimRng>) {
-    trainer.train(&mut ac, &mut rng.0);
+    for _ in 0..TRAIN_ITERS_PER_FRAME {
+        trainer.train(&mut ac, &mut rng.0);
+    }
 }
 
 pub fn extract(
@@ -613,9 +592,6 @@ struct Snap {
     bucks: f32,
     hunger: [f32; N_STAPLES],
     satisfied: bool,
-    /// Whether this noot chose the Trade action this step (a trade clears if at
-    /// least one party is trading).
-    trading: bool,
     /// Learned discount on anticipated resale value, and average price paid per
     /// held item (the floor a noot will resell at).
     discount: f32,
@@ -738,7 +714,6 @@ pub fn meet_and_trade(
         &mut Inventory,
         &mut Wallet,
         &Hunger,
-        &Action,
         &mut Trader,
         &mut NootMeta,
     )>,
@@ -749,14 +724,13 @@ pub fn meet_and_trade(
     // Snapshot (immutable read) so we can reason about pairs without aliasing.
     let mut snaps: Vec<Snap> = q
         .iter()
-        .map(|(e, t, inv, wal, hunger, action, trader, _meta)| Snap {
+        .map(|(e, t, inv, wal, hunger, trader, _meta)| Snap {
             e,
             pos: t.translation.truncate(),
             inv: inv.items,
             bucks: wal.bucks,
             hunger: hunger.staple,
             satisfied: hunger.satisfied(),
-            trading: *action == Action::Trade,
             discount: trader.discount,
             cost_basis: trader.cost_basis,
         })
@@ -764,12 +738,11 @@ pub fn meet_and_trade(
 
     let mut txs: Vec<Tx> = Vec::new();
 
+    // Trading is automatic: any two nearby noots clear their best mutually-beneficial
+    // trade. Each noot's learned `discount` (and hunger-driven reservation) are the
+    // internal thresholds that decide what it will buy/sell and at what price.
     for i in 0..snaps.len() {
         for j in (i + 1)..snaps.len() {
-            // A trade needs at least one willing trader and proximity.
-            if !(snaps[i].trading || snaps[j].trading) {
-                continue;
-            }
             if snaps[i].pos.distance_squared(snaps[j].pos) > radius2 {
                 continue;
             }
@@ -820,7 +793,7 @@ pub fn meet_and_trade(
     // Apply to the ECS, one entity borrow at a time.
     for tx in txs {
         // Buyer side: average in the cost basis and grow more cautious.
-        if let Ok((_, _, mut inv, mut wal, _, _, mut trader, mut meta)) = q.get_mut(tx.buyer) {
+        if let Ok((_, _, mut inv, mut wal, _, mut trader, mut meta)) = q.get_mut(tx.buyer) {
             let held_before = inv.items[tx.item];
             inv.items[tx.item] += 1.0;
             wal.bucks -= tx.price;
@@ -832,7 +805,7 @@ pub fn meet_and_trade(
         }
 
         // Seller side: realized margin grows trade optimism; tally the profit stat.
-        if let Ok((_, _, mut inv, mut wal, _, _, mut trader, mut meta)) = q.get_mut(tx.seller) {
+        if let Ok((_, _, mut inv, mut wal, _, mut trader, mut meta)) = q.get_mut(tx.seller) {
             inv.items[tx.item] -= 1.0;
             wal.bucks += tx.price;
             let margin = tx.price - trader.cost_basis[tx.item];

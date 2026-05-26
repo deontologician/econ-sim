@@ -107,15 +107,19 @@ design. Newest first within each section.
 
 ### Action selection (learned actor-critic)
 - **NOW**: a **shared off-policy actor-critic** (`policy.rs`, `economy::policy_step`)
-  picks each noot's action (Move/Mine/Refine/Trade) from a masked softmax over its
-  state (absolute position embedding + bucks/hunger/positional/ownership). The critic
-  drives Move (step to the best-valued neighbour, replacing the old per-hex TD field).
-  Reward = Δ of a Maslow-tiered utility (physiological ≫ safety ≫ esteem). Trained
-  A2C-style from a shared replay buffer with a slow target critic; one brain persists
-  across deaths and saves. *(partial)*
-- **INTENDED**: tune/scale the net and reward; richer state (local observations,
-  others nearby), parameterized actions, and validation that learning beats the old
-  heuristic on-device. Possibly per-archetype policies or curricula.
+  picks each noot's action from a masked softmax over its state (absolute position
+  embedding + bucks/hunger/positional/ownership). Actions are **relative**: 6 hex move
+  directions (the actor learns a directional policy directly, rather than navigating
+  by the critic's absolute value surface) plus Mine and Refine. **Trading is
+  automatic** — any nearby pair clears a mutually-beneficial trade, gated by each
+  noot's learned `discount`/reservation thresholds (no explicit Trade action). Reward
+  = Δ of a Maslow-tiered utility (physiological ≫ safety ≫ esteem). Trained A2C-style
+  (several minibatches/frame) from a shared replay buffer with a slow target critic;
+  one brain persists across deaths and saves. *(partial)*
+- **INTENDED**: faster learning — likely **relative/local state** too (position-
+  invariant cues like direction-to-nearest-deposit) so one rule generalizes across
+  the map instead of a per-tile flow field; reward/entropy/lr tuning; validation that
+  it beats the old heuristic on-device.
 - **STATUS**: partial
 
 ### Welfare / utility

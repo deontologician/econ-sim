@@ -20,12 +20,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::rng::Rng;
 
-/// Action indices (kept in sync with `noot::Action`).
-pub const A_MOVE: usize = 0;
-pub const A_MINE: usize = 1;
-pub const A_REFINE: usize = 2;
-pub const A_TRADE: usize = 3;
-pub const N_ACT: usize = 4;
+/// Action layout: indices 0..6 are the six hex move directions (relative steps),
+/// then Mine and Refine. Trading is automatic (not an action) — see `meet_and_trade`.
+pub const N_DIRS: usize = 6;
+pub const A_MINE: usize = N_DIRS;
+pub const A_REFINE: usize = N_DIRS + 1;
+pub const N_ACT: usize = N_DIRS + 2;
 
 /// Non-positional state features (position is a separate embedding lookup).
 pub const N_OTHER: usize = 6;
@@ -73,6 +73,16 @@ impl ActorCritic {
             wv: (0..H).map(|_| r(0.3)).collect(),
             bv: 0.0,
         }
+    }
+
+    /// Whether a (deserialized) net matches the current architecture and map size.
+    /// A save from a different tile count or action layout fails this and is replaced
+    /// with a fresh net rather than indexed out of bounds.
+    pub fn fits(&self, n_tiles: usize) -> bool {
+        self.n_tiles == n_tiles
+            && self.embed.len() == n_tiles * H
+            && self.wa.len() == N_ACT * H
+            && self.wv.len() == H
     }
 
     /// A same-shaped all-zero net (for gradient/velocity accumulators).
@@ -277,7 +287,7 @@ pub fn sample(probs: &[f32; N_ACT], rng: &mut Rng) -> usize {
         }
     }
     // Fallback (numerical drift): last valid action.
-    (0..N_ACT).rev().find(|&a| probs[a] > 0.0).unwrap_or(A_MOVE)
+    (0..N_ACT).rev().find(|&a| probs[a] > 0.0).unwrap_or(0)
 }
 
 // --- Replay buffer ----------------------------------------------------------
@@ -387,7 +397,7 @@ impl PolicyMemory {
             last_pos: 0,
             last_o: [0.0; N_OTHER],
             last_mask: [true; N_ACT],
-            last_act: A_MOVE,
+            last_act: 0,
             last_u: 0.0,
             died: false,
         }
