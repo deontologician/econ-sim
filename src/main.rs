@@ -96,6 +96,11 @@ const FIT_SETTLE_SECS: f32 = 0.3;
 #[derive(Resource, Default)]
 struct Selection(Option<Entity>);
 
+/// The map tile the player tapped to inspect (terrain / deposit / structure), if any.
+/// Mutually exclusive with `Selection`: a tap picks either a noot to follow or a hex.
+#[derive(Resource, Default)]
+struct SelectedHex(Option<usize>);
+
 /// When true the simulation systems are frozen; input/camera/HUD keep running.
 #[derive(Resource, Default)]
 struct Paused(bool);
@@ -269,6 +274,10 @@ struct SelectionText;
 #[derive(Component)]
 struct SelectionRing;
 
+/// The highlight ring drawn around the tapped (inspected) hex.
+#[derive(Component)]
+struct HexHighlight;
+
 /// Which inspection overlays are currently shown. `map` is the cycled map heatmap
 /// (none / terrain / trades); `strip` is the always-on top sparkline strip (shown by
 /// default, collapsible); `graphs`/`prices` are the on-demand chart panels.
@@ -429,6 +438,7 @@ fn main() {
         }))
         .init_resource::<EconStats>()
         .init_resource::<Selection>()
+        .init_resource::<SelectedHex>()
         .init_resource::<Paused>()
         .init_resource::<SimSpeed>()
         .init_resource::<Overlays>()
@@ -473,6 +483,7 @@ fn main() {
                 ),
                 (
                     update_selection_ring,
+                    update_hex_highlight,
                     update_selection_panel,
                     update_noot_color,
                     update_trade_overlay,
@@ -703,6 +714,16 @@ fn setup(
         SelectionRing,
     ));
 
+    // Wider white ring marking the tapped (inspected) hex; sits just above the terrain.
+    let hex_ring = meshes.add(Annulus::new(hex_size * 0.7, hex_size * 0.82));
+    commands.spawn((
+        Mesh2d(hex_ring),
+        MeshMaterial2d(materials.add(Color::srgba(1.0, 1.0, 1.0, 0.85))),
+        Transform::from_xyz(0.0, 0.0, 0.5),
+        Visibility::Hidden,
+        HexHighlight,
+    ));
+
     // Each noot owns a unique material so `update_noot_color` can tint it alone.
     let mut sim_rng = Rng::new(world.seed ^ 0xA5A5_5A5A);
     let noot_mesh = meshes.add(Circle::new(hex_size * 0.28));
@@ -844,7 +865,7 @@ fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) 
             ))
             .with_children(|panel| {
                 panel.spawn((
-                    Text::new("tap a noot to follow it"),
+                    Text::new("tap a noot to follow it, or a hex to inspect it"),
                     TextFont {
                         font: font.clone(),
                         font_size: 13.0,
@@ -1875,6 +1896,7 @@ fn pick_selection(
     sim: Res<Sim>,
     view: Res<MapView>,
     mut selection: ResMut<Selection>,
+    mut selected_hex: ResMut<SelectedHex>,
 ) {
     // The graphs panel covers the map; taps there drive the panel, not noot selection.
     if overlays.graphs {
@@ -1926,12 +1948,12 @@ fn pick_selection(
     }
 
     let pick_r2 = (view.hex_size * 0.6).powi(2);
-    let dep_r2 = (view.hex_size * 0.5).powi(2);
+    let hex_r2 = (view.hex_size * 1.1).powi(2);
     for screen in points {
         let Ok(world_pos) = camera.viewport_to_world_2d(cam_tf, screen) else {
             continue;
         };
-        // Prefer the nearest noot under the pointer.
+        // Prefer the nearest noot under the pointer — tapping a noot follows it.
         let mut best: Option<(Entity, f32)> = None;
         for (e, tf, _) in &noots {
             let d2 = tf.translation.truncate().distance_squared(world_pos);
@@ -1941,20 +1963,20 @@ fn pick_selection(
         }
         if let Some((e, _)) = best {
             selection.0 = Some(e);
+            selected_hex.0 = None;
             continue;
         }
-        // No noot hit: if a deposit was tapped, select (and follow) its owner.
-        let owner_tile = sim.0.deposits.iter().find_map(|dep| {
-            let t = &sim.0.tiles[dep.tile];
+        // No noot hit: inspect the tapped hex (nearest tile centre to the pointer).
+        let mut nearest: Option<(usize, f32)> = None;
+        for (i, t) in sim.0.tiles.iter().enumerate() {
             let c = tile_to_pixel(t.col, t.row, view.hex_size, view.offset);
-            (c.distance_squared(world_pos) <= dep_r2).then_some(dep.tile)
-        });
-        selection.0 = owner_tile.and_then(|tile| {
-            noots
-                .iter()
-                .find(|(_, _, claim)| claim.hex == Some(tile))
-                .map(|(e, _, _)| e)
-        });
+            let d2 = c.distance_squared(world_pos);
+            if d2 <= hex_r2 && nearest.is_none_or(|(_, bd)| d2 < bd) {
+                nearest = Some((i, d2));
+            }
+        }
+        selection.0 = None;
+        selected_hex.0 = nearest.map(|(i, _)| i);
     }
 }
 
@@ -2340,10 +2362,95 @@ fn update_selection_ring(
     }
 }
 
+/// Show/hide and reposition the ring highlighting the inspected hex.
+fn update_hex_highlight(
+    selected: Res<SelectedHex>,
+    sim: Res<Sim>,
+    view: Res<MapView>,
+    mut highlight: Query<(&mut Transform, &mut Visibility), With<HexHighlight>>,
+) {
+    let Ok((mut tf, mut visibility)) = highlight.single_mut() else {
+        return;
+    };
+    match selected.0 {
+        Some(tile) => {
+            let t = &sim.0.tiles[tile];
+            tf.translation = tile_to_pixel(t.col, t.row, view.hex_size, view.offset).extend(0.5);
+            *visibility = Visibility::Visible;
+        }
+        None => *visibility = Visibility::Hidden,
+    }
+}
+
+/// One-word gloss of an item's economic role, for the hex inspector.
+fn role_word(role: goods::ItemRole) -> &'static str {
+    match role {
+        goods::ItemRole::Staple(_) => "food",
+        goods::ItemRole::Intermediate => "needs refining",
+        goods::ItemRole::Positional(_) => "luxury",
+        goods::ItemRole::Junk => "unused",
+    }
+}
+
+/// Human-readable description of a map tile: its terrain, and whatever is on it (a
+/// deposit and what it produces, a shop/refinery and its ownership, or open ground).
+fn describe_hex(world: &econ_sim::world::World, tile: usize, claimed: bool) -> String {
+    use econ_sim::world::{DepositKind, StructureKind};
+    let t = &world.tiles[tile];
+    let speed = (econ_sim::world::terrain_factor(t.difficulty) * 100.0).round() as i32;
+    let terrain = if t.difficulty < 0.33 {
+        "open ground"
+    } else if t.difficulty < 0.66 {
+        "rough ground"
+    } else {
+        "cliffs"
+    };
+    let mut s = format!("[hex] col {} row {} — {terrain}, work {speed}%\n", t.col, t.row);
+    if let Some(d) = t.deposit {
+        let dep = &world.deposits[d];
+        let slot = dep.element_slot;
+        let el = elements::element(world.chosen[slot].id);
+        let stock = match &dep.kind {
+            DepositKind::Replenishable { stock, capacity, .. } => {
+                format!("replenishable, {stock:.0}/{capacity:.0}")
+            }
+            DepositKind::Finite { remaining, initial } => {
+                format!("finite, {remaining:.0}/{initial:.0} left")
+            }
+        };
+        let raw_role = role_word(world.goods.role_of(goods::item_index(slot, GoodForm::Raw)));
+        let ref_role = role_word(world.goods.role_of(goods::item_index(slot, GoodForm::Refined)));
+        let who = if claimed {
+            "being mined"
+        } else {
+            "unclaimed — free to mine"
+        };
+        s.push_str(&format!(
+            "{} deposit · {stock} · produces {} ({raw_role}) → {} ({ref_role}) · {who}",
+            el.name, el.name, el.refined,
+        ));
+    } else if let Some(kind) = world.structure_kind(tile) {
+        let (what, note) = match kind {
+            StructureKind::Shop => ("shop", "a sell waypoint — trade clears here"),
+            StructureKind::Refinery => ("refinery", "noots refine intermediates here"),
+        };
+        let who = if claimed {
+            "owned"
+        } else {
+            "abandoned — free to claim or build over"
+        };
+        s.push_str(&format!("{what} · {who} · {note}"));
+    } else {
+        s.push_str("empty ground · a noot could build a shop or refinery here");
+    }
+    s
+}
+
 /// Fill the bottom panel with the selected noot's details.
 #[allow(clippy::type_complexity)]
 fn update_selection_panel(
     selection: Res<Selection>,
+    selected_hex: Res<SelectedHex>,
     sim: Res<Sim>,
     noots: Query<(
         &Claim,
@@ -2360,13 +2467,20 @@ fn update_selection_panel(
     let Ok(mut text) = panel.single_mut() else {
         return;
     };
-    let stale = "tap a noot to follow it";
+    let hint = "tap a noot to follow it, or a hex to inspect it";
+    // No noot followed: show the inspected hex, or the hint.
     let Some(entity) = selection.0 else {
-        text.0 = stale.into();
+        text.0 = match selected_hex.0 {
+            Some(tile) => {
+                let claimed = noots.iter().any(|(c, ..)| c.hex == Some(tile));
+                describe_hex(&sim.0, tile, claimed)
+            }
+            None => hint.into(),
+        };
         return;
     };
     let Ok((claim, trader, wallet, hunger, inv, mem, meta, action)) = noots.get(entity) else {
-        text.0 = stale.into();
+        text.0 = hint.into();
         return;
     };
 

@@ -88,20 +88,22 @@ design. Newest first within each section.
 - **STATUS**: partial
 
 ### Refining
-- **NOW**: a *refiner role* converts a raw intermediate into the element's
-  hardcoded refined good at a fixed 1:1 ratio after a short work delay. *(partial)*
-- **INTENDED**: refineries as capital/sites, recipes with real input ratios and
-  byproducts, multi-step chains, and an LLM-generated tech tree feeding the
-  refined-product definitions (currently hardcoded in `elements.rs`).
+- **NOW**: refining converts a raw intermediate into the element's hardcoded refined
+  good at a fixed 1:1 ratio, and now happens **only inside a refinery** (a built site;
+  see *Generic hex ownership*) — a noot must stand on one to refine (any refinery,
+  shared). *(partial)*
+- **INTENDED**: recipes with real input ratios and byproducts, multi-step chains, and
+  an LLM-generated tech tree feeding the refined-product definitions (currently
+  hardcoded in `elements.rs`).
 - **STATUS**: partial
 
 ### Ownership
-- **NOW**: emergent claims (Plan 007). Deposits start unowned; a claimless noot
-  standing on an unclaimed deposit claims it (sticky — keeps its first), and only
-  the claimant may mine it. A claim frees when its holder dies. One noot is seeded
-  per deposit at spawn so mining starts immediately. *(partial)*
+- **NOW**: emergent claims, now unified into **one improved hex per noot** (see
+  *Generic hex ownership*): a claimless noot adopts the deposit it works or refinery it
+  uses, building claims a hex, and the claim frees on death. Fresh worlds spawn everyone
+  claimless (mining/roles are emergent). *(partial)*
 - **INTENDED**: buying/selling deposits, contested ownership, inheritance of claims,
-  and richer claim lifecycles (abandonment, multiple holdings, defense).
+  voluntary role-switching, and richer claim lifecycles (upkeep, defense).
 - **STATUS**: partial
 
 ## Agents (noots)
@@ -271,6 +273,18 @@ design. Newest first within each section.
 - **STATUS**: partial
 
 ## Rendering / UI
+
+### Tap-to-inspect (noots and hexes)
+- **NOW**: a tap picks the nearest noot under it (follows it, bottom panel shows its
+  details), or — on a miss — **inspects the tapped hex** (`SelectedHex` + `describe_hex`):
+  the panel shows terrain + work-speed, and whatever is on the tile — a deposit (element,
+  stock, what it produces raw→refined and each form's role, and whether it's being
+  mined), a shop/refinery (and owned vs abandoned), or open ground. A white ring
+  (`HexHighlight`) marks the inspected tile. Selection and hex-inspection are mutually
+  exclusive. *(partial — render unconfirmed on device)*
+- **INTENDED**: tap a structure to also see/jump to its owner; show a deposit's current
+  extraction rate / regrowth; richer per-tile economic readouts.
+- **STATUS**: partial
 
 ### Noot stack indicator
 - **NOW**: noots can share a hex and their sprites overlap, so a pooled set of
