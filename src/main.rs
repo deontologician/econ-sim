@@ -56,10 +56,8 @@ const XPORT_BAR_W: f32 = XPORT_SIDE_W * 2.0 + XPORT_MID_W + XPORT_READOUT_W + XP
 
 // The toggle column begins one transport-bar height below the top margin, so its first
 // button lines up just under the transport bar.
-const VALUE_BTN_TOP: f32 = PAUSE_BTN_MARGIN + PAUSE_BTN_H + BTN_GAP;
-const TERRAIN_BTN_TOP: f32 = VALUE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
-const TRADES_BTN_TOP: f32 = TERRAIN_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
-const NOOT_BTN_TOP: f32 = TRADES_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
+const OVERLAY_BTN_TOP: f32 = PAUSE_BTN_MARGIN + PAUSE_BTN_H + BTN_GAP;
+const NOOT_BTN_TOP: f32 = OVERLAY_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const SAVE_BTN_TOP: f32 = NOOT_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const NEW_BTN_TOP: f32 = SAVE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const GRAPHS_BTN_TOP: f32 = NEW_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
@@ -167,11 +165,12 @@ struct PauseButton;
 #[derive(Component)]
 struct PauseLabel;
 
-/// On-screen overlay toggles (touch equivalents of the V / T keys).
+/// Cycles the map overlay (none → terrain → trades), touch equivalent of the V key.
 #[derive(Component)]
-struct ValueButton;
+struct MapOverlayButton;
+/// Caption on the map-overlay button, kept in sync with the active mode.
 #[derive(Component)]
-struct TerrainButton;
+struct MapOverlayLabel;
 /// Cycles the noot-colouring mode (touch equivalent of the N key).
 #[derive(Component)]
 struct NootColorButton;
@@ -233,6 +232,34 @@ impl NootColorMode {
 #[derive(Resource, Default)]
 struct NootColoring(NootColorMode);
 
+/// The single map heatmap shown, cycled by the Overlay button: none, terrain
+/// difficulty, or trade density. (The old crowd-density overlay was dropped.)
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum MapOverlayMode {
+    #[default]
+    None,
+    Terrain,
+    Trades,
+}
+
+impl MapOverlayMode {
+    fn next(self) -> Self {
+        match self {
+            Self::None => Self::Terrain,
+            Self::Terrain => Self::Trades,
+            Self::Trades => Self::None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "Overlay: off",
+            Self::Terrain => "Overlay: terrain",
+            Self::Trades => "Overlay: trades",
+        }
+    }
+}
+
 /// Text of the bottom panel describing the selected noot.
 #[derive(Component)]
 struct SelectionText;
@@ -241,14 +268,13 @@ struct SelectionText;
 #[derive(Component)]
 struct SelectionRing;
 
-/// Which inspection overlays are currently shown. `value` (crowd) and `terrain` are map
-/// heatmaps; `strip` is the always-on top sparkline strip (shown by default, collapsible);
-/// `graphs` is the on-demand correlation chart behind the Graphs button.
+/// Which inspection overlays are currently shown. `map` is the cycled map heatmap
+/// (none / terrain / trades); `strip` is the always-on top sparkline strip (shown by
+/// default, collapsible); `graphs`/`prices` are the on-demand chart panels.
 #[derive(Resource)]
 struct Overlays {
-    value: bool,
-    terrain: bool,
-    trades: bool,
+    /// The map heatmap currently shown (cycled by the Overlay button).
+    map: MapOverlayMode,
     strip: bool,
     graphs: bool,
     prices: bool,
@@ -257,9 +283,7 @@ struct Overlays {
 impl Default for Overlays {
     fn default() -> Self {
         Self {
-            value: false,
-            terrain: false,
-            trades: false,
+            map: MapOverlayMode::None,
             strip: true,
             graphs: false,
             prices: false,
@@ -339,12 +363,6 @@ struct GraphLabel {
     series: usize,
 }
 
-/// Per-hex heat cell for the crowd-density overlay (`tile` is `row * cols + col`).
-#[derive(Component)]
-struct ValueOverlay {
-    tile: usize,
-}
-
 /// Per-hex tint cell for the terrain-difficulty overlay (static colour).
 #[derive(Component)]
 struct TerrainOverlay;
@@ -355,10 +373,6 @@ struct TerrainOverlay;
 struct TradeOverlay {
     tile: usize,
 }
-
-/// The on-screen Trades toggle button (shows the where-commerce-happens heatmap).
-#[derive(Component)]
-struct TradesButton;
 
 /// Ring drawn around a deposit while it is claimed.
 #[derive(Component)]
@@ -431,7 +445,6 @@ fn main() {
                     update_selection_ring,
                     update_selection_panel,
                     update_noot_color,
-                    update_crowd_overlay,
                     update_trade_overlay,
                     update_deposit_outlines,
                     sample_stats,
@@ -579,23 +592,14 @@ fn setup(
             TerrainOverlay,
         ));
 
-        // Crowd-density heat overlay: recoloured each tick by `update_crowd_overlay`.
-        // Born translucent (alpha < 1) so the material is created in blend mode.
+        // Trade-density heat overlay (gold), recoloured by `update_trade_overlay` from
+        // the cumulative trade heatmap. Born translucent (alpha < 1) so the material is
+        // created in blend mode; sits just under the noot layer (z 2.0).
         let idx = (tile.row * world.cols + tile.col) as usize;
         commands.spawn((
             Mesh2d(hex_mesh.clone()),
-            MeshMaterial2d(materials.add(Color::srgba(1.0, 0.12, 0.04, 0.0))),
-            Transform::from_xyz(px, py, 1.6),
-            Visibility::Hidden,
-            ValueOverlay { tile: idx },
-        ));
-
-        // Trade-density heat overlay (gold), recoloured by `update_trade_overlay` from
-        // the cumulative trade heatmap. Sits just under the crowd layer.
-        commands.spawn((
-            Mesh2d(hex_mesh.clone()),
             MeshMaterial2d(materials.add(Color::srgba(0.98, 0.80, 0.15, 0.0))),
-            Transform::from_xyz(px, py, 1.5),
+            Transform::from_xyz(px, py, 1.6),
             Visibility::Hidden,
             TradeOverlay { tile: idx },
         ));
@@ -864,10 +868,35 @@ fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) 
             ));
         });
 
-    // Overlay toggles, stacked under the transport bar (same touch-target size).
-    spawn_overlay_button(commands, font, "Crowd", VALUE_BTN_TOP, ValueButton);
-    spawn_overlay_button(commands, font, "Terrain", TERRAIN_BTN_TOP, TerrainButton);
-    spawn_overlay_button(commands, font, "Trades", TRADES_BTN_TOP, TradesButton);
+    // Map-overlay cycle button (caption shows the active mode): off → terrain → trades.
+    commands
+        .spawn((
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(PAUSE_BTN_MARGIN),
+                top: Val::Px(OVERLAY_BTN_TOP),
+                width: Val::Px(PAUSE_BTN_W),
+                height: Val::Px(PAUSE_BTN_H),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(BTN_OFF),
+            MapOverlayButton,
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(MapOverlayMode::default().label()),
+                TextFont {
+                    font: font.clone(),
+                    font_size: 15.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+                MapOverlayLabel,
+            ));
+        });
     // Save button spawned manually (not via the helper) so its caption carries a
     // `SaveLabel` marker — `save_game` flips it to "Saved!" as save confirmation.
     commands
@@ -1710,7 +1739,7 @@ fn pick_selection(
                 && p.y <= PAUSE_BTN_MARGIN + PAUSE_BTN_H;
             let column = p.x >= right - PAUSE_BTN_W
                 && p.x <= right
-                && p.y >= VALUE_BTN_TOP
+                && p.y >= OVERLAY_BTN_TOP
                 && p.y <= BTN_COLUMN_BOTTOM;
             bar || column
         })
@@ -1851,45 +1880,23 @@ fn new_world_controls(
     }
 }
 
-/// Drive the inspection controls: V/Crowd toggles the crowd-density overlay, T/Terrain
-/// the difficulty overlay, and N/Noots cycles how noots are coloured. Keeps the
-/// hidden hex cells and the button captions/tints in sync.
+/// Drive the inspection controls: V (or the Overlay button) cycles the map heatmap
+/// none → terrain → trades, and N (or the Noots button) cycles how noots are coloured.
+/// Keeps the hidden hex cells and the button captions/tints in sync.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn overlay_controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut overlays: ResMut<Overlays>,
     mut coloring: ResMut<NootColoring>,
-    value_btn: Query<&Interaction, (Changed<Interaction>, With<ValueButton>)>,
-    terrain_btn: Query<&Interaction, (Changed<Interaction>, With<TerrainButton>)>,
-    trades_btn: Query<&Interaction, (Changed<Interaction>, With<TradesButton>)>,
+    map_btn: Query<&Interaction, (Changed<Interaction>, With<MapOverlayButton>)>,
     noot_btn: Query<&Interaction, (Changed<Interaction>, With<NootColorButton>)>,
-    mut value_cells: Query<
-        &mut Visibility,
-        (With<ValueOverlay>, Without<TerrainOverlay>, Without<TradeOverlay>),
-    >,
-    mut terrain_cells: Query<
-        &mut Visibility,
-        (With<TerrainOverlay>, Without<ValueOverlay>, Without<TradeOverlay>),
-    >,
-    mut trade_cells: Query<
-        &mut Visibility,
-        (With<TradeOverlay>, Without<ValueOverlay>, Without<TerrainOverlay>),
-    >,
-    mut value_bg: Query<
-        &mut BackgroundColor,
-        (With<ValueButton>, Without<TerrainButton>, Without<TradesButton>),
-    >,
-    mut terrain_bg: Query<
-        &mut BackgroundColor,
-        (With<TerrainButton>, Without<ValueButton>, Without<TradesButton>),
-    >,
-    mut trade_bg: Query<
-        &mut BackgroundColor,
-        (With<TradesButton>, Without<ValueButton>, Without<TerrainButton>),
-    >,
-    mut noot_label: Query<&mut Text, With<NootColorLabel>>,
+    mut terrain_cells: Query<&mut Visibility, (With<TerrainOverlay>, Without<TradeOverlay>)>,
+    mut trade_cells: Query<&mut Visibility, (With<TradeOverlay>, Without<TerrainOverlay>)>,
+    mut map_bg: Query<&mut BackgroundColor, With<MapOverlayButton>>,
+    mut map_label: Query<&mut Text, (With<MapOverlayLabel>, Without<NootColorLabel>)>,
+    mut noot_label: Query<&mut Text, (With<NootColorLabel>, Without<MapOverlayLabel>)>,
 ) {
-    // Cycling noot colouring is independent of the hex overlays.
+    // Cycling noot colouring is independent of the map overlay.
     if keys.just_pressed(KeyCode::KeyN) || noot_btn.iter().any(|i| *i == Interaction::Pressed) {
         coloring.0 = coloring.0.next();
         if let Ok(mut text) = noot_label.single_mut() {
@@ -1897,47 +1904,34 @@ fn overlay_controls(
         }
     }
 
-    let mut changed = false;
-    if keys.just_pressed(KeyCode::KeyV) || value_btn.iter().any(|i| *i == Interaction::Pressed) {
-        overlays.value = !overlays.value;
-        changed = true;
-    }
-    if keys.just_pressed(KeyCode::KeyT) || terrain_btn.iter().any(|i| *i == Interaction::Pressed) {
-        overlays.terrain = !overlays.terrain;
-        changed = true;
-    }
-    if keys.just_pressed(KeyCode::KeyX) || trades_btn.iter().any(|i| *i == Interaction::Pressed) {
-        overlays.trades = !overlays.trades;
-        changed = true;
-    }
-    if !changed {
+    if !(keys.just_pressed(KeyCode::KeyV) || map_btn.iter().any(|i| *i == Interaction::Pressed)) {
         return;
     }
-    // Only touch the (many) hex cells and button tints when a toggle flipped.
-    let to = |on: bool| {
+    overlays.map = overlays.map.next();
+    let mode = overlays.map;
+    // Only touch the (many) hex cells when the overlay actually changed.
+    let vis = |on: bool| {
         if on {
             Visibility::Visible
         } else {
             Visibility::Hidden
         }
     };
-    for mut v in &mut value_cells {
-        *v = to(overlays.value);
-    }
     for mut v in &mut terrain_cells {
-        *v = to(overlays.terrain);
+        *v = vis(mode == MapOverlayMode::Terrain);
     }
     for mut v in &mut trade_cells {
-        *v = to(overlays.trades);
+        *v = vis(mode == MapOverlayMode::Trades);
     }
-    for mut bg in &mut value_bg {
-        bg.0 = if overlays.value { VALUE_BTN_ON } else { BTN_OFF };
+    if let Ok(mut text) = map_label.single_mut() {
+        text.0 = mode.label().into();
     }
-    for mut bg in &mut terrain_bg {
-        bg.0 = if overlays.terrain { TERRAIN_BTN_ON } else { BTN_OFF };
-    }
-    for mut bg in &mut trade_bg {
-        bg.0 = if overlays.trades { TRADES_BTN_ON } else { BTN_OFF };
+    if let Ok(mut bg) = map_bg.single_mut() {
+        bg.0 = match mode {
+            MapOverlayMode::None => BTN_OFF,
+            MapOverlayMode::Terrain => TERRAIN_BTN_ON,
+            MapOverlayMode::Trades => TRADES_BTN_ON,
+        };
     }
 }
 
@@ -2005,51 +1999,10 @@ fn rank_color(t: f32) -> Color {
     Color::srgb(1.0 - 0.8 * t, 1.0 - 0.7 * t, 1.0 - 0.05 * t)
 }
 
-/// Recolour the heat cells as a **crowd-density** map: how many noots stand on each
-/// tile, normalized to the busiest tile (red = most crowded). This replaced the old
-/// critic-value surface, which went uniform once navigation moved to the engineered
-/// heading features — density actually shows the clumping/trade hot-spots. Throttled.
-fn update_crowd_overlay(
-    time: Res<Time>,
-    overlays: Res<Overlays>,
-    sim: Res<Sim>,
-    noots: Query<&TilePos, With<Noot>>,
-    mut timer: Local<f32>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-    cells: Query<(&ValueOverlay, &MeshMaterial2d<ColorMaterial>)>,
-) {
-    if !overlays.value {
-        return;
-    }
-    *timer += time.delta_secs();
-    if *timer < 0.2 {
-        return;
-    }
-    *timer = 0.0;
-
-    let cols = sim.0.cols;
-    let n = (cols * sim.0.rows) as usize;
-    let mut count = vec![0u32; n];
-    for pos in &noots {
-        let idx = (pos.row * cols + pos.col) as usize;
-        if idx < n {
-            count[idx] += 1;
-        }
-    }
-    let max = count.iter().copied().max().unwrap_or(0).max(1) as f32;
-    for (cell, mat) in &cells {
-        if let Some(m) = materials.get_mut(&mat.0) {
-            // Sub-linear ramp (sqrt) so a single noot is already faintly visible.
-            let v = (count[cell.tile] as f32 / max).sqrt();
-            m.color = Color::srgba(1.0, 0.35, 0.05, v * 0.9);
-        }
-    }
-}
-
 /// Recolour the trade-density overlay from the cumulative per-hex trade tally
 /// (`EconStats::trade_hexes`): brighter gold where more commerce has cleared, so the
-/// emergent marketplaces stand out. Sub-linear (sqrt) ramp like the crowd overlay so a
-/// lightly-traded hex is still faintly visible. Throttled — the tally drifts slowly.
+/// emergent marketplaces stand out. Sub-linear (sqrt) ramp so a lightly-traded hex is
+/// still faintly visible. Throttled — the tally drifts slowly.
 fn update_trade_overlay(
     time: Res<Time>,
     overlays: Res<Overlays>,
@@ -2058,7 +2011,7 @@ fn update_trade_overlay(
     mut materials: ResMut<Assets<ColorMaterial>>,
     cells: Query<(&TradeOverlay, &MeshMaterial2d<ColorMaterial>)>,
 ) {
-    if !overlays.trades {
+    if overlays.map != MapOverlayMode::Trades {
         return;
     }
     *timer += time.delta_secs();

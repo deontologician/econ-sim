@@ -207,6 +207,18 @@ design. Newest first within each section.
   links.
 - **STATUS**: partial
 
+### Deposit abundance by consumption role
+- **NOW**: deposits are no longer spread evenly across the four elements. Each slot's
+  number of clusters is set by what its consumable good is (`consumption_rank` →
+  `CLUSTERS_BY_CONSUMPTION_RANK = [4,3,2,1]`): the raw staple eaten directly is most
+  common, then the staple that must be refined to eat, then the raw positional luxury,
+  then the refined positional luxury (rarest). With `DEPOSITS_PER_CLUSTER = 3` that's
+  `12/9/6/3 = 30` deposits, down from a flat `48` — leaner starting resources, with food
+  abundant and luxuries scarce. Verified headless: 30 deposits, economy still regulates.
+- **INTENDED**: tune the spread against population/economy balance; perhaps scale with
+  map size; possibly vary per-deposit stock by role too.
+- **STATUS**: partial
+
 ### Renewable vs finite resources
 - **NOW**: each world draws two **replenishable** elements (deposits regrow
   logistically toward a capacity at a per-deposit rate) and two **finite** ones
@@ -251,15 +263,17 @@ design. Newest first within each section.
   trade ticks; a shared y-scale toggle so levels (not just shapes) compare across goods.
 - **STATUS**: partial
 
-### Trade-density (commerce) map overlay
-- **NOW**: `EconStats::trade_hexes` accumulates a per-hex tally of every trade that
-  clears (counted at the seller's tile), persisted in saves. A **Trades** toggle (button
-  or `X`) shows it as a gold hex heatmap (sqrt ramp, like the Crowd overlay) so the
-  emergent marketplaces stand out; the headless harness reports `trade_top5_share`
-  (~0.86–0.94: commerce pools hard into the busiest 5% of hexes) and `trade_active_hexes`.
-  *(partial — heatmap data verified headless; the overlay render is unconfirmed on device)*
-- **INTENDED**: optionally a decaying/windowed variant to show *current* hot markets
-  rather than all-time; maybe per-good breakdown; legend/scale on the overlay.
+### Map overlays (cycled): terrain difficulty + trade density
+- **NOW**: a single **Overlay** button (or `V`) cycles the map heatmap none → terrain →
+  trades, mirroring the Noots colour cycler (the old separate Crowd/Terrain/Trades
+  buttons and the crowd-density overlay were dropped — crowd wasn't useful). *Terrain*
+  tints green→red by difficulty; *Trades* shows `EconStats::trade_hexes` (a per-hex tally
+  of every cleared trade, counted at the seller's tile, persisted in saves) as a gold
+  sqrt-ramped heatmap so emergent marketplaces stand out. Headless reports
+  `trade_top5_share` (~0.86–0.94: commerce pools hard into the busiest 5% of hexes) and
+  `trade_active_hexes`. *(partial — data verified headless; overlay render unconfirmed on device)*
+- **INTENDED**: optionally a decaying/windowed trade variant to show *current* hot
+  markets rather than all-time; per-good breakdown; a legend/scale on the overlay.
 - **STATUS**: partial
 
 ### Currency glyph `₦`

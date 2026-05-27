@@ -94,11 +94,17 @@ pub struct World {
     pub goods: WorldGoods,
 }
 
-/// Each element spawns this many clusters, each packing `DEPOSITS_PER_CLUSTER`
-/// deposits within `CLUSTER_RADIUS` tiles — so resources come in related fields,
-/// not lone scattered tiles. Total deposits = elements × clusters × per-cluster.
-const CLUSTERS_PER_ELEMENT: usize = 3;
-const DEPOSITS_PER_CLUSTER: usize = 4;
+/// Deposits come in clusters (a "field" of the same element) of `DEPOSITS_PER_CLUSTER`
+/// within `CLUSTER_RADIUS` tiles, so resources read as related fields, not lone tiles.
+/// How *many* clusters a slot gets depends on what its consumable good is — see
+/// `CLUSTERS_BY_CONSUMPTION_RANK` — so the staples a noot eats are common and the
+/// luxuries are scarce.
+const DEPOSITS_PER_CLUSTER: usize = 3;
+/// Clusters per slot, indexed by `consumption_rank`: the raw staple eaten directly is
+/// most common, then the staple that must be refined to eat, then the raw positional
+/// luxury, then the refined positional luxury (rarest). Total deposits =
+/// `(sum) × DEPOSITS_PER_CLUSTER` = `(4+3+2+1) × 3 = 30`.
+const CLUSTERS_BY_CONSUMPTION_RANK: [usize; 4] = [4, 3, 2, 1];
 const CLUSTER_RADIUS: i32 = 2;
 const SMOOTHING_PASSES: usize = 5;
 /// How much a smoothing pass keeps a hex's own difficulty vs. its neighbours'
@@ -353,14 +359,28 @@ fn carve_channels(rng: &mut Rng, cols: i32, rows: i32, d: &mut [f32]) {
     }
 }
 
+/// How common a slot's deposits should be, by what its consumable good is (lower =
+/// more common): the raw staple eaten directly, then the staple that must be refined
+/// to eat, then the raw positional luxury, then the refined positional luxury (rarest).
+fn consumption_rank(good: &goods::ConsumableGood) -> usize {
+    use goods::{GoodCategory::*, GoodForm::*};
+    match (good.category, good.form) {
+        (Staple, Raw) => 0,
+        (Staple, Refined) => 1,
+        (Positional, Raw) => 2,
+        (Positional, Refined) => 3,
+    }
+}
+
 fn place_deposits(rng: &mut Rng, world: &mut World) {
     for slot in 0..world.chosen.len() {
         let role = world.chosen[slot].role;
         // Replenishables thrive on easy land; finite stocks hide in hard terrain.
         let prefer_hard = matches!(role, ResourceRole::Finite);
-        // Deposits come in clusters (a "field" of the same element): seed a cluster
-        // centre on the preferred terrain, then pack the rest nearby.
-        for _ in 0..CLUSTERS_PER_ELEMENT {
+        // Common staples get more fields than scarce luxuries (see the rank table).
+        let clusters = CLUSTERS_BY_CONSUMPTION_RANK[consumption_rank(&world.goods.goods[slot])];
+        // Seed each cluster centre on the preferred terrain, then pack the rest nearby.
+        for _ in 0..clusters {
             let Some(center) = pick_empty_tile(rng, &world.tiles, prefer_hard) else {
                 continue;
             };
