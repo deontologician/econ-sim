@@ -54,6 +54,8 @@ pub enum Action {
     /// Holding position — e.g. lingering at a market while a committed Sell plan waits
     /// for a buyer. Distinct from Move so it incurs no hauling (carry) hunger cost.
     Idle,
+    /// Build a shop (trading post) on the current tile this tick.
+    Build,
 }
 
 /// Per-noot life stats, surfaced by the noot-colouring overlays. `age` is seconds
@@ -83,16 +85,22 @@ impl Default for NootMeta {
     }
 }
 
-/// Which deposit a noot has claimed and may mine, if any. Claims are sticky: a
-/// noot keeps its first claim and ignores other unowned deposits it passes.
+/// What a noot owns: a claimed deposit it may mine, and/or a shop (trading post) it
+/// built or adopted. Claims are sticky (kept until death); on death both reset, freeing
+/// the deposit and leaving the shop standing for another noot to adopt.
 #[derive(Component, Clone, Serialize, Deserialize)]
 pub struct Claim {
     pub deposit: Option<usize>,
+    #[serde(default)]
+    pub shop: Option<usize>,
 }
 
 impl Claim {
     pub fn new(deposit: Option<usize>) -> Self {
-        Self { deposit }
+        Self {
+            deposit,
+            shop: None,
+        }
     }
 }
 

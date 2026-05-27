@@ -53,6 +53,11 @@ const LOAD_THRESHOLD: f32 = 10.0;
 /// force-terminated and the policy re-decides — bounds a plan that can't reach its goal
 /// (an unminable claimed-away deposit, a market with no buyers) so noots never get stuck.
 const OPTION_MAX_TICKS: u32 = 48;
+/// Bucks to build a shop (a permanent, owned sell waypoint).
+const SHOP_COST: f32 = 100.0;
+/// Extra bucks a noot keeps in reserve before the Build option is offered, so building
+/// can't bankrupt it out of food money.
+const SHOP_BUILD_BUFFER: f32 = 50.0;
 
 /// Experience gained per unit produced (mining + refining); experience is per
 /// individual and resets on death.
@@ -626,18 +631,26 @@ fn carried_units(world: &crate::world::World, inv: &Inventory) -> f32 {
 
 /// Which committed options the policy may choose from this state. Mine is always open
 /// (there is always a deposit to head for); Sell needs surplus to sell; Refine needs an
-/// intermediate to convert; Explore (scout/wander) is always available as a fallback.
-fn option_mask(world: &crate::world::World, inv: &Inventory) -> [bool; N_ACT] {
+/// intermediate to convert; Build needs spare cash and no shop yet; Explore (scout) is
+/// always available as a fallback.
+fn option_mask(
+    world: &crate::world::World,
+    claim: &Claim,
+    inv: &Inventory,
+    wallet: &Wallet,
+) -> [bool; N_ACT] {
     let mut mask = [false; N_ACT];
     mask[policy::A_MINE] = !world.deposits.is_empty();
     mask[policy::A_SELL] = sellable_units(world, inv) >= 1.0;
     mask[policy::A_REFINE] = has_intermediate(world, inv);
+    mask[policy::A_BUILD] = claim.shop.is_none() && wallet.bucks >= SHOP_COST + SHOP_BUILD_BUFFER;
     mask[policy::A_EXPLORE] = true;
     mask
 }
 
-/// The destination a committed option navigates toward: the deposit for Mine, the best
-/// market for the carried cargo for Sell; in-place options (Refine, Explore) have none.
+/// The destination a committed option navigates toward: its deposit (Mine); its own shop
+/// if it has one, else the best market for the cargo (Sell). In-place options (Refine,
+/// Explore, Build — built on/near the current tile) have no travel target.
 fn option_target(
     act: usize,
     world: &crate::world::World,
@@ -649,16 +662,25 @@ fn option_target(
 ) -> Option<(i32, i32)> {
     match act {
         policy::A_MINE => target_deposit_tile(world, claim, pos),
-        policy::A_SELL => best_market_tile(field, world, pos, inv, trader),
+        policy::A_SELL => match claim.shop {
+            // A shop owner hauls home to its own permanent sell post.
+            Some(s) => {
+                let t = &world.tiles[world.shops[s].tile];
+                Some((t.col, t.row))
+            }
+            None => best_market_tile(field, world, pos, inv, trader),
+        },
         _ => None,
     }
 }
 
 /// Whether the committed option has run its course and the policy should decide afresh:
-/// mined a worthwhile load, sold off the surplus, refined everything, or hit the step cap.
+/// mined a worthwhile load, sold off the surplus, refined everything, built its shop, or
+/// hit the step cap.
 fn option_done(
     act: usize,
     world: &crate::world::World,
+    claim: &Claim,
     inv: &Inventory,
     plan_ticks: u32,
 ) -> bool {
@@ -669,6 +691,7 @@ fn option_done(
         policy::A_MINE => carried_units(world, inv) >= LOAD_THRESHOLD,
         policy::A_SELL => sellable_units(world, inv) < 1.0,
         policy::A_REFINE => !has_intermediate(world, inv),
+        policy::A_BUILD => claim.shop.is_some(),
         policy::A_EXPLORE => false,
         _ => true,
     }
@@ -724,8 +747,9 @@ pub fn policy_step(
 
         // Re-decide only at option boundaries: when the committed plan is finished, was
         // never set, or the noot just died (banking one terminal transition).
-        let finished =
-            !mem.committed || mem.died || option_done(mem.last_act, world, inv, mem.plan_ticks);
+        let finished = !mem.committed
+            || mem.died
+            || option_done(mem.last_act, world, claim, inv, mem.plan_ticks);
         if finished {
             let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world.cols, world.rows);
             let (s_pos, s_o) =
@@ -757,9 +781,9 @@ pub fn policy_step(
             mem.died = false;
 
             // Pick the next option: masked softmax, or an ε-chance uniform random option
-            // (the per-noot exploration temperament). With only four options, uniform ε
-            // already samples Mine often, so no extra production bias is needed.
-            let mask = option_mask(world, inv);
+            // (the per-noot exploration temperament). Uniform ε samples each valid option
+            // often, so no extra bias is needed to discover producing or building.
+            let mask = option_mask(world, claim, inv, wallet);
             let act = if rng.0.chance(mem.explore) {
                 let valid: Vec<usize> = (0..N_ACT).filter(|&a| mask[a]).collect();
                 valid[rng.0.below(valid.len())]
@@ -806,6 +830,20 @@ pub fn policy_step(
                 None => *action = Action::Idle,
             },
             policy::A_REFINE => *action = Action::Refine,
+            policy::A_BUILD => {
+                let here = (pos.row * world.cols + pos.col) as usize;
+                if world.tile_empty(here) {
+                    // Open ground: build_shops raises the shop here this tick.
+                    *action = Action::Build;
+                } else {
+                    // Standing on a deposit/shop — hop to a neighbour to find open ground.
+                    let (nc, nr) = neighbors(pos.col, pos.row, world.cols, world.rows)
+                        [rng.0.below(policy::N_DIRS)];
+                    pos.col = nc;
+                    pos.row = nr;
+                    *action = Action::Move;
+                }
+            }
             _ => {
                 // Explore: a random hex step (scouting for deposits/markets/partners).
                 let (nc, nr) = neighbors(pos.col, pos.row, world.cols, world.rows)
@@ -846,6 +884,8 @@ pub fn add_sim_systems(schedule: &mut Schedule) {
             update_price_field,
             policy_step,
             claim_deposits,
+            build_shops,
+            claim_shops,
             extract,
             refine,
             meet_and_trade,
@@ -913,7 +953,9 @@ pub fn death_and_respawn(
         mem.plan_ticks = 0;
         *trader = Trader::new();
         *meta = NootMeta::new();
+        // Free both claims: the deposit reopens, and the shop stands for another to adopt.
         claim.deposit = None;
+        claim.shop = None;
         pos.col = rng.0.below(world.cols as usize) as i32;
         pos.row = rng.0.below(world.rows as usize) as i32;
     }
@@ -970,6 +1012,47 @@ pub fn claim_deposits(sim: Res<Sim>, mut q: Query<(&TilePos, &mut Claim)>) {
             if !taken[d] {
                 claim.deposit = Some(d);
                 taken[d] = true;
+            }
+        }
+    }
+}
+
+/// Raise a shop on the current tile for any noot whose action is `Build` — if the tile
+/// is open ground, the noot owns no shop yet, and it can afford `SHOP_COST` (deducted).
+/// The builder claims it immediately; the shop persists in the world thereafter.
+pub fn build_shops(mut sim: ResMut<Sim>, mut q: Query<(&Action, &TilePos, &mut Wallet, &mut Claim)>) {
+    for (action, pos, mut wallet, mut claim) in &mut q {
+        if *action != Action::Build || claim.shop.is_some() || wallet.bucks < SHOP_COST {
+            continue;
+        }
+        let tile = (pos.row * sim.0.cols + pos.col) as usize;
+        if !sim.0.tile_empty(tile) {
+            continue;
+        }
+        claim.shop = Some(sim.0.build_shop(tile));
+        wallet.bucks -= SHOP_COST;
+    }
+}
+
+/// A noot owning no shop that's standing on an unowned shop adopts it (mirrors
+/// `claim_deposits`). Ownership lives only in the `Claim` components, so a shop frees up
+/// when its holder dies and another noot can pick it up — the post outlives its founder.
+pub fn claim_shops(sim: Res<Sim>, mut q: Query<(&TilePos, &mut Claim)>) {
+    let mut taken = vec![false; sim.0.shops.len()];
+    for (_, claim) in &q {
+        if let Some(s) = claim.shop {
+            taken[s] = true;
+        }
+    }
+    for (pos, mut claim) in &mut q {
+        if claim.shop.is_some() {
+            continue;
+        }
+        let idx = (pos.row * sim.0.cols + pos.col) as usize;
+        if let Some(s) = sim.0.tiles[idx].shop {
+            if !taken[s] {
+                claim.shop = Some(s);
+                taken[s] = true;
             }
         }
     }

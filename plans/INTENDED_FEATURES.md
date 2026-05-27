@@ -106,12 +106,28 @@ design. Newest first within each section.
 
 ## Agents (noots)
 
+### Player-built shops (trading-post waypoints)
+- **NOW**: a noot with spare cash (≥ `SHOP_COST` 100 + a 50 buffer) and no shop yet can
+  pick the **Build** option to raise a shop on open ground (`Action::Build` →
+  `build_shops`, 100 bucks deducted). It's a permanent, owned **sell waypoint**: that
+  noot's Sell trips then head to its shop instead of the shifting price-field market, so
+  it has a stable place to haul to (trade still clears by proximity, concentrating where
+  shops sit). Ownership lives in `Claim::shop` (mirroring deposit claims): on death it
+  frees, the shop stands, and another noot can adopt it (`claim_shops`). Persisted in
+  saves; drawn as a cyan diamond. Headless: ~25 shops emerge and stabilise over 80k ticks
+  (the cash gate caps the rate), economy stays healthy, save/load round-trips.
+- **INTENDED**: a real economic edge to owning one (stocking/rent/fees), smarter build
+  siting (toward demand), abandonment/upkeep so dead shops don't accumulate, contested
+  ownership.
+- **STATUS**: partial
+
 ### Action selection (learned actor-critic over committed options)
 - **NOW**: a **shared off-policy actor-critic** (`policy.rs`, `economy::policy_step`)
   picks each noot's **committed option** (a semi-MDP macro-action) from a masked softmax
-  over its state — not a primitive step. The four options are **Mine** (go to the
-  deposit and extract a load), **Sell** (haul to the best market for the cargo and linger
-  to trade), **Refine** (convert intermediates in place), and **Explore** (scout). A
+  over its state — not a primitive step. The five options are **Mine** (go to the
+  deposit and extract a load), **Sell** (haul to its own shop if it has one, else the best
+  market, and linger to trade), **Refine** (convert intermediates in place), **Explore**
+  (scout), and **Build** (raise a shop, above). A
   deterministic executor drives the chosen option to completion (greedy hex navigation —
   no pathfinding needed on the impassable-free torus) and the policy only re-decides at
   option boundaries, where **one transition** is recorded (reward = the ΔU the option
@@ -250,6 +266,14 @@ design. Newest first within each section.
 - **STATUS**: partial
 
 ## Rendering / UI
+
+### Noot stack indicator
+- **NOW**: noots can share a hex and their sprites overlap, so a pooled set of
+  world-space labels (`update_stack_labels`) shows the **count** on any hex holding ≥2
+  noots — repositioned each refresh, unused ones parked hidden. *(partial — render
+  unconfirmed on device; font size/placement may want tuning)*
+- **INTENDED**: tune size/legibility; maybe fan out or spiral the stacked sprites too.
+- **STATUS**: partial
 
 ### Wealth-distribution graph
 - **NOW**: a **Wealth** toggle (button / `I`) opens a panel charting every noot's bucks

@@ -20,19 +20,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::rng::Rng;
 
-/// Action layout: the policy chooses among four **committed options** (semi-MDP
+/// Action layout: the policy chooses among five **committed options** (semi-MDP
 /// macro-actions), not primitive steps. Each option locks in a multi-step plan that a
 /// deterministic executor (`economy::policy_step`) drives to completion — go mine a load,
-/// haul to the best market and sell, refine in place, or scout — before the policy
-/// decides again. This is the fix for the long produce→haul→sell credit-assignment chain:
-/// the policy only has to learn *which intent is worthwhile here*, never how to navigate
-/// (deterministic), so directed behaviour replaces per-step dithering. Trading itself is
-/// automatic on proximity (not an option) — see `meet_and_trade`.
+/// haul to a market (its own shop, if it has one) and sell, refine in place, scout, or
+/// build a shop — before the policy decides again. This is the fix for the long
+/// produce→haul→sell credit-assignment chain: the policy only has to learn *which intent
+/// is worthwhile here*, never how to navigate (deterministic), so directed behaviour
+/// replaces per-step dithering. Trading itself is automatic on proximity (not an
+/// option) — see `meet_and_trade`.
 pub const A_MINE: usize = 0;
 pub const A_SELL: usize = 1;
 pub const A_REFINE: usize = 2;
 pub const A_EXPLORE: usize = 3;
-pub const N_ACT: usize = 4;
+/// Build a shop: a noot with spare cash and no shop yet pays for a trading post — a
+/// permanent, owned sell waypoint it returns to (its Sell trips then head there).
+pub const A_BUILD: usize = 4;
+pub const N_ACT: usize = 5;
 /// Hex move directions — still the width of the engineered *heading* features below
 /// (the executor navigates by these), even though they are no longer policy actions.
 pub const N_DIRS: usize = 6;

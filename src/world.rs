@@ -49,6 +49,9 @@ pub struct Tile {
     /// Continuous movement/work difficulty in `[0, 1]` (0 = easy, 1 = cliff).
     pub difficulty: f32,
     pub deposit: Option<usize>,
+    /// Index into `World::shops` of a noot-built shop on this tile, if any.
+    #[serde(default)]
+    pub shop: Option<usize>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -82,6 +85,14 @@ impl Deposit {
     }
 }
 
+/// A noot-built trading post on a tile. Persistent: it outlives its builder and, while
+/// unclaimed, can be adopted by another noot. Ownership isn't stored here — like
+/// deposits, it's derived from whichever noot holds the matching `Claim::shop`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Shop {
+    pub tile: usize,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct World {
     pub seed: u64,
@@ -92,6 +103,24 @@ pub struct World {
     pub chosen: Vec<ChosenElement>,
     pub deposits: Vec<Deposit>,
     pub goods: WorldGoods,
+    /// Noot-built shops (trading-post waypoints), created during play.
+    #[serde(default)]
+    pub shops: Vec<Shop>,
+}
+
+impl World {
+    /// Build a shop on `tile` (assumed empty), returning its index. Marks the tile.
+    pub fn build_shop(&mut self, tile: usize) -> usize {
+        let idx = self.shops.len();
+        self.shops.push(Shop { tile });
+        self.tiles[tile].shop = Some(idx);
+        idx
+    }
+
+    /// Whether `tile` has no deposit and no shop (buildable ground).
+    pub fn tile_empty(&self, tile: usize) -> bool {
+        self.tiles[tile].deposit.is_none() && self.tiles[tile].shop.is_none()
+    }
 }
 
 /// Deposits come in clusters (a "field" of the same element) of `DEPOSITS_PER_CLUSTER`
@@ -248,6 +277,7 @@ pub fn generate(seed: u64, cols: i32, rows: i32, hex_size: f32) -> World {
         chosen,
         deposits: Vec::new(),
         goods: world_goods,
+        shops: Vec::new(),
     };
     place_deposits(&mut rng, &mut world);
     world
@@ -318,6 +348,7 @@ fn generate_terrain(rng: &mut Rng, cols: i32, rows: i32) -> Vec<Tile> {
                 row: r,
                 difficulty: d[idx(c, r)],
                 deposit: None,
+                shop: None,
             });
         }
     }

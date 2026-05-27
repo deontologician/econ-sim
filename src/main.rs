@@ -394,6 +394,17 @@ struct DepositOutline {
     deposit: usize,
 }
 
+/// Map marker for a noot-built shop (a cyan diamond). Shops are created during play, so
+/// `sync_shop_markers` spawns these incrementally rather than all at setup.
+#[derive(Component)]
+struct ShopMarker;
+
+/// A world-space label (one of a reused pool) showing how many noots are stacked on a
+/// hex, repositioned each refresh by `update_stack_labels`. Noots can share a tile and
+/// their sprites overlap, so a count makes a crowded hex legible.
+#[derive(Component)]
+struct StackLabel;
+
 /// Noot body colours: green while unclaimed, amber once it owns a deposit.
 const NOOT_UNCLAIMED: Color = Color::srgb(0.40, 0.85, 0.45);
 const NOOT_OWNER: Color = Color::srgb(0.95, 0.78, 0.25);
@@ -462,6 +473,8 @@ fn main() {
                     update_noot_color,
                     update_trade_overlay,
                     update_deposit_outlines,
+                    sync_shop_markers,
+                    update_stack_labels,
                     sample_stats,
                     render_graphs,
                     render_prices,
@@ -649,6 +662,23 @@ fn setup(
             Transform::from_xyz(px, py, 1.1),
             Visibility::Hidden,
             DepositOutline { deposit: di },
+        ));
+    }
+
+    // Pool of world-space stack-count labels (one per possible 2-noot pairing), parked
+    // off-screen and hidden; `update_stack_labels` positions/fills the active ones.
+    for _ in 0..N_NOOTS {
+        commands.spawn((
+            Text2d::new(""),
+            TextFont {
+                font: ui_font.clone(),
+                font_size: 18.0,
+                ..default()
+            },
+            TextColor(Color::srgb(1.0, 0.95, 0.4)),
+            Transform::from_xyz(0.0, 0.0, 3.0),
+            Visibility::Hidden,
+            StackLabel,
         ));
     }
 
@@ -2143,6 +2173,85 @@ fn update_trade_overlay(
     }
 }
 
+/// Spawn a map marker (cyan diamond) for any shop that doesn't have one yet. Shops are
+/// built during play and never removed, so we only ever append — a `Local` high-water
+/// mark tracks how many we've already drawn. Mesh/material are created once and reused.
+#[allow(clippy::too_many_arguments)]
+fn sync_shop_markers(
+    mut commands: Commands,
+    sim: Res<Sim>,
+    view: Res<MapView>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut spawned: Local<usize>,
+    mut mesh: Local<Option<Handle<Mesh>>>,
+    mut mat: Local<Option<Handle<ColorMaterial>>>,
+) {
+    let n = sim.0.shops.len();
+    if *spawned >= n {
+        return;
+    }
+    let m = mesh
+        .get_or_insert_with(|| meshes.add(RegularPolygon::new(view.hex_size * 0.42, 4)))
+        .clone();
+    let c = mat
+        .get_or_insert_with(|| materials.add(Color::srgb(0.30, 0.80, 0.85)))
+        .clone();
+    while *spawned < n {
+        let tile = &sim.0.tiles[sim.0.shops[*spawned].tile];
+        let (x, y) = hex::hex_center(tile.col, tile.row, view.hex_size);
+        commands.spawn((
+            Mesh2d(m.clone()),
+            MeshMaterial2d(c.clone()),
+            Transform::from_xyz(x + view.offset.x, y + view.offset.y, 1.0),
+            ShopMarker,
+        ));
+        *spawned += 1;
+    }
+}
+
+/// Reposition the pooled stack labels to each hex holding ≥2 noots, captioned with the
+/// count; park the unused ones hidden. Throttled — stacks shift slowly. Noots overlap on
+/// a shared tile, so this is the only way to read how many are really there.
+#[allow(clippy::type_complexity)]
+fn update_stack_labels(
+    time: Res<Time>,
+    sim: Res<Sim>,
+    view: Res<MapView>,
+    noots: Query<&TilePos, With<Noot>>,
+    mut labels: Query<(&mut Text2d, &mut Transform, &mut Visibility), With<StackLabel>>,
+    mut timer: Local<f32>,
+) {
+    *timer += time.delta_secs();
+    if *timer < 0.15 {
+        return;
+    }
+    *timer = 0.0;
+
+    let cols = sim.0.cols;
+    let n = (cols * sim.0.rows) as usize;
+    let mut count = vec![0u32; n];
+    for pos in &noots {
+        let idx = (pos.row * cols + pos.col) as usize;
+        if idx < n {
+            count[idx] += 1;
+        }
+    }
+    let mut stacks = count.iter().enumerate().filter(|&(_, &c)| c >= 2);
+    for (mut text, mut tf, mut vis) in &mut labels {
+        if let Some((idx, &c)) = stacks.next() {
+            let (col, row) = (idx as i32 % cols, idx as i32 / cols);
+            let (x, y) = hex::hex_center(col, row, view.hex_size);
+            tf.translation.x = x + view.offset.x;
+            tf.translation.y = y + view.offset.y;
+            text.0 = c.to_string();
+            *vis = Visibility::Visible;
+        } else {
+            *vis = Visibility::Hidden;
+        }
+    }
+}
+
 /// Show a deposit's outline ring iff some noot currently claims it.
 fn update_deposit_outlines(
     sim: Res<Sim>,
@@ -2246,6 +2355,7 @@ fn update_selection_panel(
         Action::Mine => "mine",
         Action::Refine => "refine",
         Action::Idle => "idle",
+        Action::Build => "build",
     };
 
     let utility = economy::maslow_utility(hunger, inv, wallet, &world.goods);

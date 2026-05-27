@@ -253,10 +253,12 @@ fn emit_record(w: &mut World) {
     let sim_ref = w.resource::<Sim>();
     let goods = sim_ref.0.goods.clone();
     let (cols, rows) = (sim_ref.0.cols, sim_ref.0.rows);
+    let n_shops = sim_ref.0.shops.len() as u64;
     let mut q =
         w.query::<(&Action, &Hunger, &Claim, &Wallet, &NootMeta, &Trader, &Inventory, &TilePos)>();
-    let mut act = [0u64; 4];
+    let mut act = [0u64; 5];
     let (mut starving, mut claimed, mut n) = (0u64, 0u64, 0u64);
+    let mut shops_owned = 0u64;
     let (mut bucks, mut appetite, mut experience, mut age, mut discount, mut positional) =
         (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut transactions = 0.0f64;
@@ -268,12 +270,16 @@ fn emit_record(w: &mut World) {
             Action::Mine => act[1] += 1,
             Action::Refine => act[2] += 1,
             Action::Idle => act[3] += 1,
+            Action::Build => act[4] += 1,
         }
         if h.is_starving() {
             starving += 1;
         }
         if c.deposit.is_some() {
             claimed += 1;
+        }
+        if c.shop.is_some() {
+            shops_owned += 1;
         }
         bucks += wal.bucks as f64;
         wealth.push(wal.bucks);
@@ -334,6 +340,9 @@ fn emit_record(w: &mut World) {
         "act_mine": act[1],
         "act_refine": act[2],
         "act_idle": act[3],
+        "act_build": act[4],
+        "shops": n_shops,
+        "shops_owned": shops_owned,
         "mean_bucks": bucks / nf,
         "wealth_gini": econ_sim::economy::gini(&wealth),
         "mean_appetite": appetite / nf,
