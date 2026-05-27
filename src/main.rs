@@ -394,10 +394,14 @@ struct DepositOutline {
     deposit: usize,
 }
 
-/// Map marker for a noot-built shop (a cyan diamond). Shops are created during play, so
-/// `sync_shop_markers` spawns these incrementally rather than all at setup.
+/// Map marker for a noot-built structure (a diamond, cyan = shop, orange = refinery),
+/// carrying its `World::structures` index so `sync_structure_markers` can recolour it if
+/// a build-over changes the kind. Structures are created during play, so markers spawn
+/// incrementally rather than all at setup.
 #[derive(Component)]
-struct ShopMarker;
+struct StructureMarker {
+    structure: usize,
+}
 
 /// A world-space label (one of a reused pool) showing how many noots are stacked on a
 /// hex, repositioned each refresh by `update_stack_labels`. Noots can share a tile and
@@ -473,7 +477,7 @@ fn main() {
                     update_noot_color,
                     update_trade_overlay,
                     update_deposit_outlines,
-                    sync_shop_markers,
+                    sync_structure_markers,
                     update_stack_labels,
                     sample_stats,
                     render_graphs,
@@ -715,7 +719,7 @@ fn setup(
         Some(noots) => {
             for ns in noots {
                 let (col, row) = (ns.pos.col, ns.pos.row);
-                let color = if ns.claim.deposit.is_some() {
+                let color = if ns.claim.hex.is_some() {
                     NOOT_OWNER
                 } else {
                     NOOT_UNCLAIMED
@@ -1214,7 +1218,7 @@ fn spawn_graphs_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &Gra
         ))
         .with_children(|panel| {
             panel.spawn((
-                Text::new("Resource prices (₦, last sale — flat while unsold)"),
+                Text::new("Resource prices (* = staple food; ₦ last sale, flat while unsold)"),
                 TextFont {
                     font: font.clone(),
                     font_size: 11.0,
@@ -1440,7 +1444,7 @@ fn sample_stats(
         if h.is_starving() {
             starving += 1;
         }
-        if c.deposit.is_some() {
+        if c.hex.is_some() {
             claimed += 1;
         }
         tiles.push((tp.col, tp.row));
@@ -1567,27 +1571,38 @@ fn render_prices(
     }
     *timer = 0.0;
 
-    // Gold trace, matching the Trades overlay's commerce colour.
-    const PRICE_COLOR: [u8; 3] = [240, 205, 80];
+    // Trace colour cues the good's role: green = staple (food), tan = intermediate
+    // (needs refining), gold = positional luxury, grey = unused.
+    let world = &sim.0;
     for item in 0..goods::N_ITEMS {
         let col: Vec<f32> = phist.samples.iter().map(|s| s[item]).collect();
         if let Some(img) = images.get_mut(&assets.price_sparks[item]) {
-            graph::render_sparkline(img, &col, PRICE_COLOR);
+            graph::render_sparkline(img, &col, role_color(world.goods.role_of(item)));
         }
     }
-    let world = &sim.0;
     for (lbl, mut text) in &mut labels {
         let slot = lbl.item / 2;
         let name = match goods::form_of(lbl.item) {
             GoodForm::Raw => elements::element(world.chosen[slot].id).name,
             GoodForm::Refined => elements::element(world.chosen[slot].id).refined,
         };
-        let latest = phist
-            .samples
-            .back()
-            .map(|s| s[lbl.item])
-            .unwrap_or(0.0);
-        text.0 = format!("{name} ₦{latest:.1}");
+        // Tag staples (the foods) so they stand out among the luxuries.
+        let tag = match world.goods.role_of(lbl.item) {
+            goods::ItemRole::Staple(_) => "*",
+            _ => "",
+        };
+        let latest = phist.samples.back().map(|s| s[lbl.item]).unwrap_or(0.0);
+        text.0 = format!("{name}{tag} ₦{latest:.1}");
+    }
+}
+
+/// Sparkline colour for a good's role: green staple, tan intermediate, gold positional.
+fn role_color(role: goods::ItemRole) -> [u8; 3] {
+    match role {
+        goods::ItemRole::Staple(_) => [120, 210, 120],
+        goods::ItemRole::Intermediate => [210, 170, 90],
+        goods::ItemRole::Positional(_) => [240, 205, 80],
+        goods::ItemRole::Junk => [90, 90, 90],
     }
 }
 
@@ -1929,15 +1944,15 @@ fn pick_selection(
             continue;
         }
         // No noot hit: if a deposit was tapped, select (and follow) its owner.
-        let owner = sim.0.deposits.iter().enumerate().find_map(|(di, dep)| {
+        let owner_tile = sim.0.deposits.iter().find_map(|dep| {
             let t = &sim.0.tiles[dep.tile];
             let c = tile_to_pixel(t.col, t.row, view.hex_size, view.offset);
-            (c.distance_squared(world_pos) <= dep_r2).then_some(di)
+            (c.distance_squared(world_pos) <= dep_r2).then_some(dep.tile)
         });
-        selection.0 = owner.and_then(|di| {
+        selection.0 = owner_tile.and_then(|tile| {
             noots
                 .iter()
-                .find(|(_, _, claim)| claim.deposit == Some(di))
+                .find(|(_, _, claim)| claim.hex == Some(tile))
                 .map(|(e, _, _)| e)
         });
     }
@@ -2096,7 +2111,7 @@ fn update_noot_color(
     if let NootColorMode::Ownership = coloring.0 {
         for (claim, _, _, _, mat) in &noots {
             if let Some(m) = materials.get_mut(&mat.0) {
-                m.color = if claim.deposit.is_some() {
+                m.color = if claim.hex.is_some() {
                     NOOT_OWNER
                 } else {
                     NOOT_UNCLAIMED
@@ -2173,11 +2188,20 @@ fn update_trade_overlay(
     }
 }
 
-/// Spawn a map marker (cyan diamond) for any shop that doesn't have one yet. Shops are
-/// built during play and never removed, so we only ever append — a `Local` high-water
-/// mark tracks how many we've already drawn. Mesh/material are created once and reused.
+/// Colour a structure marker by its kind: cyan shop, orange refinery.
+fn structure_color(kind: econ_sim::world::StructureKind) -> Color {
+    match kind {
+        econ_sim::world::StructureKind::Shop => Color::srgb(0.30, 0.80, 0.85),
+        econ_sim::world::StructureKind::Refinery => Color::srgb(0.95, 0.55, 0.20),
+    }
+}
+
+/// Spawn a diamond marker for any newly-built structure, then recolour all markers by
+/// their structure's current kind (a build-over can change a refinery into a shop or
+/// vice-versa). Structures are append-only in `World::structures`, so a `Local`
+/// high-water mark tracks how many markers we've drawn.
 #[allow(clippy::too_many_arguments)]
-fn sync_shop_markers(
+fn sync_structure_markers(
     mut commands: Commands,
     sim: Res<Sim>,
     view: Res<MapView>,
@@ -2185,28 +2209,29 @@ fn sync_shop_markers(
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut spawned: Local<usize>,
     mut mesh: Local<Option<Handle<Mesh>>>,
-    mut mat: Local<Option<Handle<ColorMaterial>>>,
+    markers: Query<(&StructureMarker, &MeshMaterial2d<ColorMaterial>)>,
 ) {
-    let n = sim.0.shops.len();
-    if *spawned >= n {
-        return;
-    }
+    let n = sim.0.structures.len();
     let m = mesh
         .get_or_insert_with(|| meshes.add(RegularPolygon::new(view.hex_size * 0.42, 4)))
         .clone();
-    let c = mat
-        .get_or_insert_with(|| materials.add(Color::srgb(0.30, 0.80, 0.85)))
-        .clone();
     while *spawned < n {
-        let tile = &sim.0.tiles[sim.0.shops[*spawned].tile];
+        let s = &sim.0.structures[*spawned];
+        let tile = &sim.0.tiles[s.tile];
         let (x, y) = hex::hex_center(tile.col, tile.row, view.hex_size);
         commands.spawn((
             Mesh2d(m.clone()),
-            MeshMaterial2d(c.clone()),
+            MeshMaterial2d(materials.add(structure_color(s.kind))),
             Transform::from_xyz(x + view.offset.x, y + view.offset.y, 1.0),
-            ShopMarker,
+            StructureMarker { structure: *spawned },
         ));
         *spawned += 1;
+    }
+    // Keep colours in sync with kinds (cheap — few structures).
+    for (marker, mat_handle) in &markers {
+        if let Some(mat) = materials.get_mut(&mat_handle.0) {
+            mat.color = structure_color(sim.0.structures[marker.structure].kind);
+        }
     }
 }
 
@@ -2258,10 +2283,13 @@ fn update_deposit_outlines(
     claims: Query<&Claim, With<Noot>>,
     mut outlines: Query<(&DepositOutline, &mut Visibility)>,
 ) {
+    // A deposit is claimed iff some noot's owned hex is that deposit's tile.
     let mut owned = vec![false; sim.0.deposits.len()];
     for c in &claims {
-        if let Some(d) = c.deposit {
-            owned[d] = true;
+        if let Some(h) = c.hex {
+            if let Some(d) = sim.0.tiles[h].deposit {
+                owned[d] = true;
+            }
         }
     }
     for (o, mut vis) in &mut outlines {
@@ -2343,10 +2371,19 @@ fn update_selection_panel(
     };
 
     let world = &sim.0;
-    let claim_label = match claim.deposit {
-        Some(d) => {
-            let slot = world.deposits[d].element_slot;
-            format!("mining {}", elements::element(world.chosen[slot].id).name)
+    // The one hex this noot owns, classified by its improvement.
+    let claim_label = match claim.hex {
+        Some(h) => {
+            if let Some(d) = world.tiles[h].deposit {
+                let slot = world.deposits[d].element_slot;
+                format!("mining {}", elements::element(world.chosen[slot].id).name)
+            } else {
+                match world.structure_kind(h) {
+                    Some(econ_sim::world::StructureKind::Shop) => "owns shop".to_string(),
+                    Some(econ_sim::world::StructureKind::Refinery) => "owns refinery".to_string(),
+                    None => "unclaimed".to_string(),
+                }
+            }
         }
         None => "unclaimed".to_string(),
     };
@@ -2355,7 +2392,8 @@ fn update_selection_panel(
         Action::Mine => "mine",
         Action::Refine => "refine",
         Action::Idle => "idle",
-        Action::Build => "build",
+        Action::BuildShop => "build shop",
+        Action::BuildRefinery => "build refinery",
     };
 
     let utility = economy::maslow_utility(hunger, inv, wallet, &world.goods);

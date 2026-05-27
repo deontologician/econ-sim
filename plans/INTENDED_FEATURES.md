@@ -106,28 +106,33 @@ design. Newest first within each section.
 
 ## Agents (noots)
 
-### Player-built shops (trading-post waypoints)
-- **NOW**: a noot with spare cash (≥ `SHOP_COST` 100 + a 50 buffer) and no shop yet can
-  pick the **Build** option to raise a shop on open ground (`Action::Build` →
-  `build_shops`, 100 bucks deducted). It's a permanent, owned **sell waypoint**: that
-  noot's Sell trips then head to its shop instead of the shifting price-field market, so
-  it has a stable place to haul to (trade still clears by proximity, concentrating where
-  shops sit). Ownership lives in `Claim::shop` (mirroring deposit claims): on death it
-  frees, the shop stands, and another noot can adopt it (`claim_shops`). Persisted in
-  saves; drawn as a cyan diamond. Headless: ~25 shops emerge and stabilise over 80k ticks
-  (the cash gate caps the rate), economy stays healthy, save/load round-trips.
-- **INTENDED**: a real economic edge to owning one (stocking/rent/fees), smarter build
-  siting (toward demand), abandonment/upkeep so dead shops don't accumulate, contested
-  ownership.
+### Generic hex ownership: mines, shops, refineries
+- **NOW**: a single unified claim — `Claim::hex` is the **one** improved tile a noot owns
+  (at most one). Improvements are a **deposit** (a mine, claimed by working it), a
+  **shop**, or a **refinery** (`World::structures`, built for 100 bucks via the
+  `BuildShop`/`BuildRefinery` options on non-deposit ground; building over an *unclaimed*
+  structure replaces its kind, so you can take an abandoned refinery and make it a shop).
+  This forces specialization: a noot is a miner, shopkeeper, or refiner. Buildings are
+  shared infrastructure — **refining only happens while standing in a refinery** (any),
+  and Sell heads to the nearest shop (else the price-field market). A claimless noot
+  adopts the deposit/refinery it works (`claim_improvements`); on death the hex abandons
+  (deposit reopens, structure stands for another to take/rebuild). Persisted; shops draw
+  as cyan diamonds, refineries orange. Headless (100k ticks): ~30 miners + a shared
+  refinery + a shop emerge, the refined-goods chain routes through the refinery, economy
+  stays healthy (production/consumption climb, deaths regulated), save/load round-trips.
+- **INTENDED**: a real economic edge to owning a building (rent/fees/stocking); smarter
+  build siting toward demand; upkeep/decay so abandoned structures don't accumulate;
+  voluntary re-claim so a noot can switch roles without dying; contested ownership.
 - **STATUS**: partial
 
 ### Action selection (learned actor-critic over committed options)
 - **NOW**: a **shared off-policy actor-critic** (`policy.rs`, `economy::policy_step`)
   picks each noot's **committed option** (a semi-MDP macro-action) from a masked softmax
-  over its state — not a primitive step. The five options are **Mine** (go to the
-  deposit and extract a load), **Sell** (haul to its own shop if it has one, else the best
-  market, and linger to trade), **Refine** (convert intermediates in place), **Explore**
-  (scout), and **Build** (raise a shop, above). A
+  over its state — not a primitive step. The six options are **Mine** (go to its own, or
+  the nearest unclaimed, deposit and extract a load), **Sell** (haul to the nearest shop,
+  else the best market, and linger to trade), **Refine** (go to a refinery and convert
+  intermediates there), **Explore** (scout), and **BuildShop**/**BuildRefinery** (claim a
+  hex, above). A
   deterministic executor drives the chosen option to completion (greedy hex navigation —
   no pathfinding needed on the impassable-free torus) and the policy only re-decides at
   option boundaries, where **one transition** is recorded (reward = the ΔU the option
@@ -291,8 +296,9 @@ design. Newest first within each section.
   opens a panel with one auto-scaled sparkline per resource (labelled `<name> ₦<price>`),
   fed from a `PriceHistory` ring sampled alongside the stats. The series **holds the last
   sale price through no-trade spells** — a flat line, never a drop to zero — so a thinly
-  traded good still reads its true price. *(partial — data verified headless; the panel
-  render is unconfirmed on device)*
+  traded good still reads its true price. Traces are **colour-coded by role** (green
+  staple/food, tan intermediate, gold luxury) and staple labels carry a `*`, so the food
+  prices stand out. *(partial — data verified headless; panel render unconfirmed on device)*
 - **INTENDED**: optionally overlay bid/ask or the `ewma_price` band; mark the actual
   trade ticks; a shared y-scale toggle so levels (not just shapes) compare across goods.
 - **STATUS**: partial

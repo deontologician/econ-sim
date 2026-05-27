@@ -21,6 +21,9 @@
 //!     -- [seed] [ticks] [sample_every] [--load PATH] [--save PATH]
 //! ```
 
+// The JSONL record's `json!` literal has many fields; the macro recurses per field.
+#![recursion_limit = "256"]
+
 use bevy::prelude::*;
 
 use econ_sim::economy::{self, EconStats, HungerControl, IncomeControl};
@@ -253,12 +256,24 @@ fn emit_record(w: &mut World) {
     let sim_ref = w.resource::<Sim>();
     let goods = sim_ref.0.goods.clone();
     let (cols, rows) = (sim_ref.0.cols, sim_ref.0.rows);
-    let n_shops = sim_ref.0.shops.len() as u64;
+    use econ_sim::world::StructureKind;
+    let n_shops = sim_ref.0.structures.iter().filter(|s| s.kind == StructureKind::Shop).count() as u64;
+    let n_refineries = sim_ref
+        .0
+        .structures
+        .iter()
+        .filter(|s| s.kind == StructureKind::Refinery)
+        .count() as u64;
+    // Per-tile improvement lookups so we can classify each noot's claimed hex.
+    let tile_deposit: Vec<bool> = sim_ref.0.tiles.iter().map(|t| t.deposit.is_some()).collect();
+    let tile_refinery: Vec<bool> = (0..tile_deposit.len())
+        .map(|t| sim_ref.0.structure_kind(t) == Some(StructureKind::Refinery))
+        .collect();
     let mut q =
         w.query::<(&Action, &Hunger, &Claim, &Wallet, &NootMeta, &Trader, &Inventory, &TilePos)>();
-    let mut act = [0u64; 5];
+    let mut act = [0u64; 6];
     let (mut starving, mut claimed, mut n) = (0u64, 0u64, 0u64);
-    let mut shops_owned = 0u64;
+    let (mut miners, mut refiners, mut shopkeepers) = (0u64, 0u64, 0u64);
     let (mut bucks, mut appetite, mut experience, mut age, mut discount, mut positional) =
         (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut transactions = 0.0f64;
@@ -270,16 +285,22 @@ fn emit_record(w: &mut World) {
             Action::Mine => act[1] += 1,
             Action::Refine => act[2] += 1,
             Action::Idle => act[3] += 1,
-            Action::Build => act[4] += 1,
+            Action::BuildShop => act[4] += 1,
+            Action::BuildRefinery => act[5] += 1,
         }
         if h.is_starving() {
             starving += 1;
         }
-        if c.deposit.is_some() {
+        // Classify the noot by the single improvement it owns (one-hex ownership).
+        if let Some(hex) = c.hex {
             claimed += 1;
-        }
-        if c.shop.is_some() {
-            shops_owned += 1;
+            if tile_deposit[hex] {
+                miners += 1;
+            } else if tile_refinery[hex] {
+                refiners += 1;
+            } else {
+                shopkeepers += 1;
+            }
         }
         bucks += wal.bucks as f64;
         wealth.push(wal.bucks);
@@ -340,9 +361,12 @@ fn emit_record(w: &mut World) {
         "act_mine": act[1],
         "act_refine": act[2],
         "act_idle": act[3],
-        "act_build": act[4],
+        "act_build": act[4] + act[5],
         "shops": n_shops,
-        "shops_owned": shops_owned,
+        "refineries": n_refineries,
+        "miners": miners,
+        "refiners": refiners,
+        "shopkeepers": shopkeepers,
         "mean_bucks": bucks / nf,
         "wealth_gini": econ_sim::economy::gini(&wealth),
         "mean_appetite": appetite / nf,

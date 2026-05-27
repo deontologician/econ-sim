@@ -54,8 +54,10 @@ pub enum Action {
     /// Holding position — e.g. lingering at a market while a committed Sell plan waits
     /// for a buyer. Distinct from Move so it incurs no hauling (carry) hunger cost.
     Idle,
-    /// Build a shop (trading post) on the current tile this tick.
-    Build,
+    /// Build (or rebuild over) a shop on the current tile this tick.
+    BuildShop,
+    /// Build (or rebuild over) a refinery on the current tile this tick.
+    BuildRefinery,
 }
 
 /// Per-noot life stats, surfaced by the noot-colouring overlays. `age` is seconds
@@ -85,22 +87,19 @@ impl Default for NootMeta {
     }
 }
 
-/// What a noot owns: a claimed deposit it may mine, and/or a shop (trading post) it
-/// built or adopted. Claims are sticky (kept until death); on death both reset, freeing
-/// the deposit and leaving the shop standing for another noot to adopt.
-#[derive(Component, Clone, Serialize, Deserialize)]
+/// Generic hex ownership: the one improved tile a noot owns — a deposit it mines, or a
+/// shop/refinery it built or adopted. At most one per noot. Sticky until death, when it
+/// abandons (the deposit reopens; a structure stands for another noot to take or rebuild).
+#[derive(Component, Clone, Serialize, Deserialize, Default)]
 pub struct Claim {
-    pub deposit: Option<usize>,
+    /// Tile index of the owned improvement, or `None` if the noot owns nothing yet.
     #[serde(default)]
-    pub shop: Option<usize>,
+    pub hex: Option<usize>,
 }
 
 impl Claim {
-    pub fn new(deposit: Option<usize>) -> Self {
-        Self {
-            deposit,
-            shop: None,
-        }
+    pub fn new(hex: Option<usize>) -> Self {
+        Self { hex }
     }
 }
 

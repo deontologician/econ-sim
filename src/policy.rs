@@ -20,23 +20,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::rng::Rng;
 
-/// Action layout: the policy chooses among five **committed options** (semi-MDP
+/// Action layout: the policy chooses among six **committed options** (semi-MDP
 /// macro-actions), not primitive steps. Each option locks in a multi-step plan that a
-/// deterministic executor (`economy::policy_step`) drives to completion — go mine a load,
-/// haul to a market (its own shop, if it has one) and sell, refine in place, scout, or
-/// build a shop — before the policy decides again. This is the fix for the long
-/// produce→haul→sell credit-assignment chain: the policy only has to learn *which intent
-/// is worthwhile here*, never how to navigate (deterministic), so directed behaviour
-/// replaces per-step dithering. Trading itself is automatic on proximity (not an
-/// option) — see `meet_and_trade`.
+/// deterministic executor (`economy::policy_step`) drives to completion — mine a load (at
+/// the noot's owned deposit), haul to a shop and sell, go to a refinery and refine, scout,
+/// or build a shop / refinery — before the policy decides again. A noot owns at most one
+/// improved hex (its deposit, shop, or refinery), so options like Mine/Build gate on what
+/// it already owns. This keeps the long produce→haul→sell chain learnable: the policy only
+/// picks *which intent is worthwhile here*, never how to navigate (deterministic). Trading
+/// itself is automatic on proximity (not an option) — see `meet_and_trade`.
 pub const A_MINE: usize = 0;
 pub const A_SELL: usize = 1;
 pub const A_REFINE: usize = 2;
 pub const A_EXPLORE: usize = 3;
-/// Build a shop: a noot with spare cash and no shop yet pays for a trading post — a
-/// permanent, owned sell waypoint it returns to (its Sell trips then head there).
-pub const A_BUILD: usize = 4;
-pub const N_ACT: usize = 5;
+/// Build a shop (sell waypoint) — only an unowned noot with spare cash; it claims the hex.
+pub const A_BUILD_SHOP: usize = 4;
+/// Build a refinery (the only place refining happens) — likewise claims the hex.
+pub const A_BUILD_REFINERY: usize = 5;
+pub const N_ACT: usize = 6;
 /// Hex move directions — still the width of the engineered *heading* features below
 /// (the executor navigates by these), even though they are no longer policy actions.
 pub const N_DIRS: usize = 6;

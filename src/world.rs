@@ -49,9 +49,9 @@ pub struct Tile {
     /// Continuous movement/work difficulty in `[0, 1]` (0 = easy, 1 = cliff).
     pub difficulty: f32,
     pub deposit: Option<usize>,
-    /// Index into `World::shops` of a noot-built shop on this tile, if any.
+    /// Index into `World::structures` of a noot-built shop/refinery on this tile, if any.
     #[serde(default)]
-    pub shop: Option<usize>,
+    pub structure: Option<usize>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -85,12 +85,21 @@ impl Deposit {
     }
 }
 
-/// A noot-built trading post on a tile. Persistent: it outlives its builder and, while
-/// unclaimed, can be adopted by another noot. Ownership isn't stored here — like
-/// deposits, it's derived from whichever noot holds the matching `Claim::shop`.
+/// What a noot built on a hex. Both are waypoints a noot returns to; a Refinery is also
+/// the only place refining can happen (a noot must stand on one).
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StructureKind {
+    Shop,
+    Refinery,
+}
+
+/// A noot-built structure on a tile. Persistent: it outlives its builder and, while
+/// unclaimed, can be adopted or built over. Ownership isn't stored here — like deposits,
+/// it's derived from whichever noot's `Claim::hex` points at this tile.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct Shop {
+pub struct Structure {
     pub tile: usize,
+    pub kind: StructureKind,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -103,23 +112,34 @@ pub struct World {
     pub chosen: Vec<ChosenElement>,
     pub deposits: Vec<Deposit>,
     pub goods: WorldGoods,
-    /// Noot-built shops (trading-post waypoints), created during play.
+    /// Noot-built structures (shops and refineries), created during play.
     #[serde(default)]
-    pub shops: Vec<Shop>,
+    pub structures: Vec<Structure>,
 }
 
 impl World {
-    /// Build a shop on `tile` (assumed empty), returning its index. Marks the tile.
-    pub fn build_shop(&mut self, tile: usize) -> usize {
-        let idx = self.shops.len();
-        self.shops.push(Shop { tile });
-        self.tiles[tile].shop = Some(idx);
-        idx
+    /// Place a structure of `kind` on `tile`: replace an existing (unclaimed) structure's
+    /// kind in place if there is one, else append a new one. Returns the structure index.
+    pub fn build_structure(&mut self, tile: usize, kind: StructureKind) -> usize {
+        if let Some(idx) = self.tiles[tile].structure {
+            self.structures[idx].kind = kind;
+            idx
+        } else {
+            let idx = self.structures.len();
+            self.structures.push(Structure { tile, kind });
+            self.tiles[tile].structure = Some(idx);
+            idx
+        }
     }
 
-    /// Whether `tile` has no deposit and no shop (buildable ground).
+    /// Whether `tile` has no deposit and no structure (open ground for a fresh build).
     pub fn tile_empty(&self, tile: usize) -> bool {
-        self.tiles[tile].deposit.is_none() && self.tiles[tile].shop.is_none()
+        self.tiles[tile].deposit.is_none() && self.tiles[tile].structure.is_none()
+    }
+
+    /// The kind of structure on `tile`, if any.
+    pub fn structure_kind(&self, tile: usize) -> Option<StructureKind> {
+        self.tiles[tile].structure.map(|i| self.structures[i].kind)
     }
 }
 
@@ -277,7 +297,7 @@ pub fn generate(seed: u64, cols: i32, rows: i32, hex_size: f32) -> World {
         chosen,
         deposits: Vec::new(),
         goods: world_goods,
-        shops: Vec::new(),
+        structures: Vec::new(),
     };
     place_deposits(&mut rng, &mut world);
     world
@@ -348,7 +368,7 @@ fn generate_terrain(rng: &mut Rng, cols: i32, rows: i32) -> Vec<Tile> {
                 row: r,
                 difficulty: d[idx(c, r)],
                 deposit: None,
-                shop: None,
+                structure: None,
             });
         }
     }

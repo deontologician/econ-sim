@@ -53,11 +53,35 @@ const LOAD_THRESHOLD: f32 = 10.0;
 /// force-terminated and the policy re-decides — bounds a plan that can't reach its goal
 /// (an unminable claimed-away deposit, a market with no buyers) so noots never get stuck.
 const OPTION_MAX_TICKS: u32 = 48;
-/// Bucks to build a shop (a permanent, owned sell waypoint).
+/// Bucks to build a structure (shop or refinery). Both cost the same.
 const SHOP_COST: f32 = 100.0;
-/// Extra bucks a noot keeps in reserve before the Build option is offered, so building
+const REFINERY_COST: f32 = 100.0;
+/// Extra bucks a noot keeps in reserve before a Build option is offered, so building
 /// can't bankrupt it out of food money.
 const SHOP_BUILD_BUFFER: f32 = 50.0;
+
+/// The deposit a noot owns (its claimed hex carries one), if any.
+fn owned_deposit(world: &crate::world::World, claim: &Claim) -> Option<usize> {
+    claim.hex.and_then(|t| world.tiles[t].deposit)
+}
+
+/// Tile index of the nearest structure of `kind` anywhere (shops/refineries are shared —
+/// any noot may sell at a shop or refine at a refinery, regardless of who owns it).
+fn nearest_structure(
+    world: &crate::world::World,
+    pos: &TilePos,
+    kind: crate::world::StructureKind,
+) -> Option<(i32, i32)> {
+    world
+        .structures
+        .iter()
+        .filter(|s| s.kind == kind)
+        .map(|s| {
+            let t = &world.tiles[s.tile];
+            (t.col, t.row)
+        })
+        .min_by_key(|&(c, r)| torus_distance(pos.col, pos.row, c, r, world.cols, world.rows))
+}
 
 /// Experience gained per unit produced (mining + refining); experience is per
 /// individual and resets on death.
@@ -444,16 +468,22 @@ pub fn maslow_utility(hunger: &Hunger, inv: &Inventory, wallet: &Wallet, goods: 
     W_PHYS * phys + W_SAFE * gate(phys) * safety + W_ESTEEM * gate(phys) * gate(safety) * esteem
 }
 
-/// The tile a noot should head to mine: its claimed deposit if it owns one, else the
-/// nearest deposit (which it can claim on arrival). `None` only if the map has none.
-fn target_deposit_tile(world: &crate::world::World, claim: &Claim, pos: &TilePos) -> Option<(i32, i32)> {
-    if let Some(d) = claim.deposit {
+/// The tile a noot should head to mine: its own deposit if it owns one, else the nearest
+/// *unclaimed* deposit (which it can claim on arrival). `None` if there's nowhere to mine.
+fn mine_target(
+    world: &crate::world::World,
+    claim: &Claim,
+    pos: &TilePos,
+    claimed: &[bool],
+) -> Option<(i32, i32)> {
+    if let Some(d) = owned_deposit(world, claim) {
         let t = &world.tiles[world.deposits[d].tile];
         return Some((t.col, t.row));
     }
     world
         .deposits
         .iter()
+        .filter(|dep| !claimed[dep.tile])
         .map(|dep| {
             let t = &world.tiles[dep.tile];
             (t.col, t.row)
@@ -538,6 +568,7 @@ fn features(
     inv: &Inventory,
     wallet: &Wallet,
     trader: &Trader,
+    claimed: &[bool],
     nearest_noot: Option<(i32, i32)>,
 ) -> (usize, [f32; N_OTHER]) {
     let pos_idx = (pos.row * world.cols + pos.col) as usize;
@@ -546,10 +577,10 @@ fn features(
     o[1] = hunger.staple[0] / STAPLE_SATIATION;
     o[2] = hunger.staple[1] / STAPLE_SATIATION;
     o[3] = positional_utility(&world.goods, inv) / ESTEEM_NORM;
-    o[4] = if claim.deposit.is_some() { 1.0 } else { 0.0 };
+    o[4] = if owned_deposit(world, claim).is_some() { 1.0 } else { 0.0 };
     o[5] = 1.0; // bias
 
-    let dep = heading_gradient(world, pos, target_deposit_tile(world, claim, pos));
+    let dep = heading_gradient(world, pos, mine_target(world, claim, pos, claimed));
     o[policy::O_DEPOSIT_DIR..policy::O_DEPOSIT_DIR + policy::N_DIRS].copy_from_slice(&dep);
     o[policy::O_ON_MINABLE] = if can_mine_here(world, claim, pos, inv) { 1.0 } else { 0.0 };
 
@@ -584,19 +615,17 @@ fn nearest_other_noot(
         .map(|&(_, c, r)| (c, r))
 }
 
-/// True when the noot is standing on its own claimed deposit with room to extract more
-/// — the precondition for the `extract` system to actually mine, and the `on_minable`
-/// state feature. (A noot can also mine the tick *after* it lands on an unclaimed deposit
-/// it's heading for, once `claim_deposits` has assigned it; the Mine executor stays put
-/// on the target tile so that handoff happens.)
+/// True when the noot is standing on its own deposit with room to extract more — the
+/// precondition for `extract`, and the `on_minable` state feature. (A claimless noot also
+/// mines the tick *after* it lands on an unclaimed deposit, once `claim_improvements` has
+/// assigned it; the Mine executor stays put on the target tile so that handoff happens.)
 fn can_mine_here(world: &crate::world::World, claim: &Claim, pos: &TilePos, inv: &Inventory) -> bool {
-    claim.deposit.is_some_and(|d| {
-        let dep = &world.deposits[d];
-        let t = &world.tiles[dep.tile];
-        t.col == pos.col
-            && t.row == pos.row
-            && inv.items[goods::item_index(dep.element_slot, GoodForm::Raw)] < CARRY_CAP
-    })
+    let tile = (pos.row * world.cols + pos.col) as usize;
+    claim.hex == Some(tile)
+        && world.tiles[tile].deposit.is_some_and(|d| {
+            let slot = world.deposits[d].element_slot;
+            inv.items[goods::item_index(slot, GoodForm::Raw)] < CARRY_CAP
+        })
 }
 
 /// Units of held goods worth taking to market: everything non-junk, minus the food
@@ -629,28 +658,36 @@ fn carried_units(world: &crate::world::World, inv: &Inventory) -> f32 {
         .sum()
 }
 
-/// Which committed options the policy may choose from this state. Mine is always open
-/// (there is always a deposit to head for); Sell needs surplus to sell; Refine needs an
-/// intermediate to convert; Build needs spare cash and no shop yet; Explore (scout) is
-/// always available as a fallback.
+/// Which committed options the policy may choose from this state, given one-hex ownership.
+/// Mine: owns a deposit, or is unowned and an unclaimed deposit exists. Sell: has surplus.
+/// Refine: holds an intermediate and a refinery exists to use. Build shop/refinery: owns
+/// nothing yet and can afford it. Explore: always (the fallback).
+#[allow(clippy::too_many_arguments)]
 fn option_mask(
     world: &crate::world::World,
     claim: &Claim,
     inv: &Inventory,
     wallet: &Wallet,
+    free_deposit: bool,
+    any_refinery: bool,
 ) -> [bool; N_ACT] {
+    let owns_nothing = claim.hex.is_none();
     let mut mask = [false; N_ACT];
-    mask[policy::A_MINE] = !world.deposits.is_empty();
+    mask[policy::A_MINE] = owned_deposit(world, claim).is_some() || (owns_nothing && free_deposit);
     mask[policy::A_SELL] = sellable_units(world, inv) >= 1.0;
-    mask[policy::A_REFINE] = has_intermediate(world, inv);
-    mask[policy::A_BUILD] = claim.shop.is_none() && wallet.bucks >= SHOP_COST + SHOP_BUILD_BUFFER;
+    mask[policy::A_REFINE] = any_refinery && has_intermediate(world, inv);
+    mask[policy::A_BUILD_SHOP] = owns_nothing && wallet.bucks >= SHOP_COST + SHOP_BUILD_BUFFER;
+    mask[policy::A_BUILD_REFINERY] =
+        owns_nothing && wallet.bucks >= REFINERY_COST + SHOP_BUILD_BUFFER;
     mask[policy::A_EXPLORE] = true;
     mask
 }
 
-/// The destination a committed option navigates toward: its deposit (Mine); its own shop
-/// if it has one, else the best market for the cargo (Sell). In-place options (Refine,
-/// Explore, Build — built on/near the current tile) have no travel target.
+/// The destination a committed option navigates toward: its (or the nearest unclaimed)
+/// deposit for Mine; the nearest shop, else the best market, for Sell; the nearest
+/// refinery for Refine. In-place options (Explore, Build — done on the current tile)
+/// have no travel target.
+#[allow(clippy::too_many_arguments)]
 fn option_target(
     act: usize,
     world: &crate::world::World,
@@ -659,24 +696,21 @@ fn option_target(
     pos: &TilePos,
     inv: &Inventory,
     trader: &Trader,
+    claimed: &[bool],
 ) -> Option<(i32, i32)> {
+    use crate::world::StructureKind;
     match act {
-        policy::A_MINE => target_deposit_tile(world, claim, pos),
-        policy::A_SELL => match claim.shop {
-            // A shop owner hauls home to its own permanent sell post.
-            Some(s) => {
-                let t = &world.tiles[world.shops[s].tile];
-                Some((t.col, t.row))
-            }
-            None => best_market_tile(field, world, pos, inv, trader),
-        },
+        policy::A_MINE => mine_target(world, claim, pos, claimed),
+        policy::A_SELL => nearest_structure(world, pos, StructureKind::Shop)
+            .or_else(|| best_market_tile(field, world, pos, inv, trader)),
+        policy::A_REFINE => nearest_structure(world, pos, StructureKind::Refinery),
         _ => None,
     }
 }
 
 /// Whether the committed option has run its course and the policy should decide afresh:
-/// mined a worthwhile load, sold off the surplus, refined everything, built its shop, or
-/// hit the step cap.
+/// mined a worthwhile load, sold off the surplus, refined everything, claimed a hex by
+/// building, or hit the step cap.
 fn option_done(
     act: usize,
     world: &crate::world::World,
@@ -691,7 +725,7 @@ fn option_done(
         policy::A_MINE => carried_units(world, inv) >= LOAD_THRESHOLD,
         policy::A_SELL => sellable_units(world, inv) < 1.0,
         policy::A_REFINE => !has_intermediate(world, inv),
-        policy::A_BUILD => claim.shop.is_some(),
+        policy::A_BUILD_SHOP | policy::A_BUILD_REFINERY => claim.hex.is_some(),
         policy::A_EXPLORE => false,
         _ => true,
     }
@@ -739,6 +773,20 @@ pub fn policy_step(
     // we hold the query mutably (positions only shift one hex/tick, so this is fresh).
     let snapshot: Vec<(Entity, i32, i32)> =
         q.iter().map(|(e, p, ..)| (e, p.col, p.row)).collect();
+    // Which hexes are owned right now, so a noot heads only for *unclaimed* deposits and
+    // the masks know whether a free deposit / any refinery exists (one-hex ownership).
+    let n_tiles = (world.cols * world.rows) as usize;
+    let mut claimed = vec![false; n_tiles];
+    for (_, _, claim, ..) in q.iter() {
+        if let Some(h) = claim.hex {
+            claimed[h] = true;
+        }
+    }
+    let free_deposit = world.deposits.iter().any(|d| !claimed[d.tile]);
+    let any_refinery = world
+        .structures
+        .iter()
+        .any(|s| s.kind == crate::world::StructureKind::Refinery);
     for (e, mut pos, claim, inv, hunger, wallet, trader, mut action, mut mem) in &mut q {
         mem.cooldown -= TICK_DT;
         if mem.cooldown > 0.0 && !mem.died {
@@ -752,8 +800,9 @@ pub fn policy_step(
             || option_done(mem.last_act, world, claim, inv, mem.plan_ticks);
         if finished {
             let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world.cols, world.rows);
-            let (s_pos, s_o) =
-                features(world, &field, &pos, claim, hunger, inv, wallet, trader, nearest_noot);
+            let (s_pos, s_o) = features(
+                world, &field, &pos, claim, hunger, inv, wallet, trader, &claimed, nearest_noot,
+            );
             let u_now = maslow_utility(hunger, inv, wallet, &world.goods);
 
             // Close out the previous option's transition (reward = the ΔU the option
@@ -783,7 +832,7 @@ pub fn policy_step(
             // Pick the next option: masked softmax, or an ε-chance uniform random option
             // (the per-noot exploration temperament). Uniform ε samples each valid option
             // often, so no extra bias is needed to discover producing or building.
-            let mask = option_mask(world, claim, inv, wallet);
+            let mask = option_mask(world, claim, inv, wallet, free_deposit, any_refinery);
             let act = if rng.0.chance(mem.explore) {
                 let valid: Vec<usize> = (0..N_ACT).filter(|&a| mask[a]).collect();
                 valid[rng.0.below(valid.len())]
@@ -800,15 +849,15 @@ pub fn policy_step(
             mem.last_u = u_now;
             mem.has_prev = true;
             mem.committed = true;
-            mem.plan_target = option_target(act, world, &field, claim, &pos, inv, trader);
+            mem.plan_target = option_target(act, world, &field, claim, &pos, inv, trader, &claimed);
             mem.plan_ticks = OPTION_MAX_TICKS;
         }
 
         // Execute one step of the committed option, setting this tick's Action.
         match mem.last_act {
             policy::A_MINE => match mem.plan_target {
-                // On the deposit tile: mine (or hold here so claim_deposits can claim it
-                // before mining starts next tick). Otherwise step toward it.
+                // On the deposit tile: mine (or hold here so claim_improvements can claim
+                // it before mining starts next tick). Otherwise step toward it.
                 Some((tc, tr)) if pos.col == tc && pos.row == tr => *action = Action::Mine,
                 Some((tc, tr)) => {
                     let (nc, nr) = step_toward(world, pos.col, pos.row, (tc, tr));
@@ -829,14 +878,28 @@ pub fn policy_step(
                 }
                 None => *action = Action::Idle,
             },
-            policy::A_REFINE => *action = Action::Refine,
-            policy::A_BUILD => {
+            policy::A_REFINE => match mem.plan_target {
+                // Refining happens only inside a refinery — go there, then refine on it.
+                Some((tc, tr)) if pos.col == tc && pos.row == tr => *action = Action::Refine,
+                Some((tc, tr)) => {
+                    let (nc, nr) = step_toward(world, pos.col, pos.row, (tc, tr));
+                    pos.col = nc;
+                    pos.row = nr;
+                    *action = Action::Move;
+                }
+                None => *action = Action::Idle,
+            },
+            policy::A_BUILD_SHOP | policy::A_BUILD_REFINERY => {
                 let here = (pos.row * world.cols + pos.col) as usize;
-                if world.tile_empty(here) {
-                    // Open ground: build_shops raises the shop here this tick.
-                    *action = Action::Build;
+                // Buildable iff not a deposit hex (open ground, or build over a structure).
+                if world.tiles[here].deposit.is_none() {
+                    *action = if mem.last_act == policy::A_BUILD_SHOP {
+                        Action::BuildShop
+                    } else {
+                        Action::BuildRefinery
+                    };
                 } else {
-                    // Standing on a deposit/shop — hop to a neighbour to find open ground.
+                    // Standing on a deposit — hop to a neighbour to find open ground.
                     let (nc, nr) = neighbors(pos.col, pos.row, world.cols, world.rows)
                         [rng.0.below(policy::N_DIRS)];
                     pos.col = nc;
@@ -883,9 +946,8 @@ pub fn add_sim_systems(schedule: &mut Schedule) {
             age_noots,
             update_price_field,
             policy_step,
-            claim_deposits,
-            build_shops,
-            claim_shops,
+            build_structures,
+            claim_improvements,
             extract,
             refine,
             meet_and_trade,
@@ -953,9 +1015,8 @@ pub fn death_and_respawn(
         mem.plan_ticks = 0;
         *trader = Trader::new();
         *meta = NootMeta::new();
-        // Free both claims: the deposit reopens, and the shop stands for another to adopt.
-        claim.deposit = None;
-        claim.shop = None;
+        // Abandon the owned hex: a deposit reopens; a structure stands for another to take.
+        claim.hex = None;
         pos.col = rng.0.below(world.cols as usize) as i32;
         pos.row = rng.0.below(world.rows as usize) as i32;
     }
@@ -970,14 +1031,14 @@ pub fn extract(
         if *action != Action::Mine {
             continue;
         }
-        let Some(deposit) = claim.deposit else {
-            continue;
-        };
-        let dtile = sim.0.deposits[deposit].tile;
-        let (dc, dr) = (sim.0.tiles[dtile].col, sim.0.tiles[dtile].row);
-        if pos.col != dc || pos.row != dr {
+        // Must be standing on the deposit it owns (its claimed hex).
+        let tile = (pos.row * sim.0.cols + pos.col) as usize;
+        if claim.hex != Some(tile) {
             continue;
         }
+        let Some(deposit) = sim.0.tiles[tile].deposit else {
+            continue;
+        };
         let slot = sim.0.deposits[deposit].element_slot;
         let raw = goods::item_index(slot, GoodForm::Raw);
         if inv.items[raw] >= CARRY_CAP {
@@ -993,76 +1054,84 @@ pub fn extract(
     }
 }
 
-/// A noot with no claim that's standing on an unclaimed deposit claims it. Claims
-/// are sticky (first one kept) and tracked solely by the `Claim` components, so a
-/// claim frees up automatically when its holder dies and resets to `None`.
-pub fn claim_deposits(sim: Res<Sim>, mut q: Query<(&TilePos, &mut Claim)>) {
-    let mut taken = vec![false; sim.0.deposits.len()];
-    for (_, claim) in &q {
-        if let Some(d) = claim.deposit {
-            taken[d] = true;
+/// Build (or rebuild over) a structure for any noot whose action is `BuildShop`/
+/// `BuildRefinery`: it must own nothing yet, afford the cost, and stand on non-deposit
+/// ground that isn't an owned structure. The builder claims the hex (its one improvement).
+pub fn build_structures(
+    mut sim: ResMut<Sim>,
+    mut q: Query<(&Action, &TilePos, &mut Wallet, &mut Claim)>,
+) {
+    let n_tiles = (sim.0.cols * sim.0.rows) as usize;
+    let mut claimed = vec![false; n_tiles];
+    for (_, _, _, claim) in &q {
+        if let Some(h) = claim.hex {
+            claimed[h] = true;
         }
     }
-    for (pos, mut claim) in &mut q {
-        if claim.deposit.is_some() {
-            continue;
-        }
-        let idx = (pos.row * sim.0.cols + pos.col) as usize;
-        if let Some(d) = sim.0.tiles[idx].deposit {
-            if !taken[d] {
-                claim.deposit = Some(d);
-                taken[d] = true;
-            }
-        }
-    }
-}
-
-/// Raise a shop on the current tile for any noot whose action is `Build` — if the tile
-/// is open ground, the noot owns no shop yet, and it can afford `SHOP_COST` (deducted).
-/// The builder claims it immediately; the shop persists in the world thereafter.
-pub fn build_shops(mut sim: ResMut<Sim>, mut q: Query<(&Action, &TilePos, &mut Wallet, &mut Claim)>) {
     for (action, pos, mut wallet, mut claim) in &mut q {
-        if *action != Action::Build || claim.shop.is_some() || wallet.bucks < SHOP_COST {
+        let (kind, cost) = match action {
+            Action::BuildShop => (crate::world::StructureKind::Shop, SHOP_COST),
+            Action::BuildRefinery => (crate::world::StructureKind::Refinery, REFINERY_COST),
+            _ => continue,
+        };
+        if claim.hex.is_some() || wallet.bucks < cost {
             continue;
         }
         let tile = (pos.row * sim.0.cols + pos.col) as usize;
-        if !sim.0.tile_empty(tile) {
+        // Can't build on a deposit, nor over a structure someone still owns.
+        if sim.0.tiles[tile].deposit.is_some() || claimed[tile] {
             continue;
         }
-        claim.shop = Some(sim.0.build_shop(tile));
-        wallet.bucks -= SHOP_COST;
+        sim.0.build_structure(tile, kind);
+        claim.hex = Some(tile);
+        claimed[tile] = true;
+        wallet.bucks -= cost;
     }
 }
 
-/// A noot owning no shop that's standing on an unowned shop adopts it (mirrors
-/// `claim_deposits`). Ownership lives only in the `Claim` components, so a shop frees up
-/// when its holder dies and another noot can pick it up — the post outlives its founder.
-pub fn claim_shops(sim: Res<Sim>, mut q: Query<(&TilePos, &mut Claim)>) {
-    let mut taken = vec![false; sim.0.shops.len()];
-    for (_, claim) in &q {
-        if let Some(s) = claim.shop {
-            taken[s] = true;
+/// Assign ownership of the hex a noot is actively working but no one owns: a claimless
+/// noot mining (`Mine`) an unclaimed deposit, or refining (`Refine`) at an unclaimed
+/// refinery, adopts that hex. Claims live only in `Claim`, so a hex frees on its holder's
+/// death and the deposit/structure can be taken up again.
+pub fn claim_improvements(sim: Res<Sim>, mut q: Query<(&Action, &TilePos, &mut Claim)>) {
+    let n_tiles = (sim.0.cols * sim.0.rows) as usize;
+    let mut claimed = vec![false; n_tiles];
+    for (_, _, claim) in &q {
+        if let Some(h) = claim.hex {
+            claimed[h] = true;
         }
     }
-    for (pos, mut claim) in &mut q {
-        if claim.shop.is_some() {
+    for (action, pos, mut claim) in &mut q {
+        if claim.hex.is_some() {
             continue;
         }
-        let idx = (pos.row * sim.0.cols + pos.col) as usize;
-        if let Some(s) = sim.0.tiles[idx].shop {
-            if !taken[s] {
-                claim.shop = Some(s);
-                taken[s] = true;
+        let tile = (pos.row * sim.0.cols + pos.col) as usize;
+        if claimed[tile] {
+            continue;
+        }
+        let adopt = match action {
+            Action::Mine => sim.0.tiles[tile].deposit.is_some(),
+            Action::Refine => {
+                sim.0.structure_kind(tile) == Some(crate::world::StructureKind::Refinery)
             }
+            _ => false,
+        };
+        if adopt {
+            claim.hex = Some(tile);
+            claimed[tile] = true;
         }
     }
 }
 
-/// Refine held intermediates — but only for noots whose chosen action this tick is
-/// `Refine` (set by `policy_step`), faster the more refining experience accrued.
-pub fn refine(sim: Res<Sim>, mut q: Query<(&Action, &mut Inventory, &mut NootMeta)>) {
-    for (action, mut inv, mut meta) in &mut q {
+/// Refine held intermediates — only for a noot whose action is `Refine` *and* that is
+/// standing inside a refinery (any refinery; refining is shared). Faster with experience.
+pub fn refine(sim: Res<Sim>, mut q: Query<(&Action, &TilePos, &mut Inventory, &mut NootMeta)>) {
+    for (action, pos, mut inv, mut meta) in &mut q {
         if *action != Action::Refine {
+            continue;
+        }
+        let tile = (pos.row * sim.0.cols + pos.col) as usize;
+        if sim.0.structure_kind(tile) != Some(crate::world::StructureKind::Refinery) {
             continue;
         }
         let rate = REFINE_RATE * skill_factor(meta.experience);
