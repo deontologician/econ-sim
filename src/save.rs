@@ -82,7 +82,20 @@ fn snapshot_from_value(mut value: serde_json::Value) -> Option<Snapshot> {
         version += 1;
         value["version"] = serde_json::json!(version);
     }
-    serde_json::from_value(value).ok()
+    match serde_json::from_value::<Snapshot>(value.clone()) {
+        Ok(snap) => Some(snap),
+        Err(_) => {
+            // Recovery: the shared `policy` is a large float blob, and if any weight
+            // ever went non-finite, `serde_json` wrote it as `null` (which won't parse
+            // back as f32), failing the whole load. Drop the policy and retry — the
+            // world, noots and stats still resume; the brain (`#[serde(default)]`) just
+            // resets to fresh. Better a lost brain than a lost world.
+            if let Some(obj) = value.as_object_mut() {
+                obj.remove("policy");
+            }
+            serde_json::from_value(value).ok()
+        }
+    }
 }
 
 // --- Browser backend (localStorage) -----------------------------------------

@@ -75,6 +75,14 @@ const TAU: f32 = 0.01; // Polyak averaging for the target critic
 const ENTROPY_BETA: f32 = 0.01;
 const VALUE_COEF: f32 = 0.5;
 const ADV_CLIP: f32 = 5.0;
+/// Bound on the critic's TD target, so a value estimate can't inflate without limit
+/// (the deadly-triad failure mode of off-policy bootstrapping). Returns here are small
+/// (per-option ΔU, γ=0.95), so this is generous headroom, not a routine constraint.
+const VALUE_CLIP: f32 = 100.0;
+/// Hard ceiling on any weight magnitude. A safety net, well above the natural scale, so
+/// weights can never run away to a non-finite value — which `serde_json` would write as
+/// `null` and then fail to parse back, silently destroying the save on reload.
+const WEIGHT_CLIP: f32 = 1.0e3;
 const BATCH: usize = 32;
 const WARMUP: usize = 256;
 const BUFFER_CAP: usize = 16_384;
@@ -251,11 +259,20 @@ impl ActorCritic {
     /// SGD-with-momentum step: `online -= LR · velocity`, `velocity = MOMENTUM·velocity
     /// + grad/BATCH`. `vel` mirrors the weight layout.
     fn apply(&mut self, grad: &ActorCritic, vel: &mut ActorCritic, inv_batch: f32) {
+        // Guard every update: a non-finite step resets that weight (and its velocity);
+        // otherwise the weight is clamped to `WEIGHT_CLIP`. This keeps the net finite and
+        // bounded no matter how training behaves, so the policy always serializes back.
         macro_rules! step {
             ($field:ident) => {
                 for i in 0..self.$field.len() {
                     vel.$field[i] = MOMENTUM * vel.$field[i] + grad.$field[i] * inv_batch;
-                    self.$field[i] -= LR * vel.$field[i];
+                    let w = self.$field[i] - LR * vel.$field[i];
+                    if w.is_finite() {
+                        self.$field[i] = w.clamp(-WEIGHT_CLIP, WEIGHT_CLIP);
+                    } else {
+                        self.$field[i] = 0.0;
+                        vel.$field[i] = 0.0;
+                    }
                 }
             };
         }
@@ -266,7 +283,13 @@ impl ActorCritic {
         step!(ba);
         step!(wv);
         vel.bv = MOMENTUM * vel.bv + grad.bv * inv_batch;
-        self.bv -= LR * vel.bv;
+        let bv = self.bv - LR * vel.bv;
+        if bv.is_finite() {
+            self.bv = bv.clamp(-WEIGHT_CLIP, WEIGHT_CLIP);
+        } else {
+            self.bv = 0.0;
+            vel.bv = 0.0;
+        }
     }
 
     /// Polyak-average `self` toward `online` (used to drift the target critic).
@@ -399,7 +422,7 @@ impl Trainer {
             } else {
                 self.target.value(t.pos2, &t.o2)
             };
-            let y = t.r + GAMMA * v2;
+            let y = (t.r + GAMMA * v2).clamp(-VALUE_CLIP, VALUE_CLIP);
             let adv = (y - v).clamp(-ADV_CLIP, ADV_CLIP);
             online.backward_accumulate(&mut grad, t.pos, &t.o, &t.mask, t.act, y, adv);
         }
