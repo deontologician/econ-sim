@@ -150,6 +150,11 @@ pub struct EconStats {
     pub ticks: u64,
     /// Exponentially weighted moving average of actual sale prices, per item.
     pub ewma_price: [f32; N_ITEMS],
+    /// The most recent actual clearing price, per item — held until the next sale of that
+    /// item (so a no-trade spell shows a flat line at the last price, never a drop to 0).
+    /// Drives the per-resource price graphs. 0 only before an item has ever traded.
+    #[serde(default)]
+    pub last_sale_price: [f32; N_ITEMS],
     /// Cumulative raw units extracted from deposits (the economy's supply).
     pub produced_total: f64,
     /// Cumulative units consumed (staples eaten + positional goods used up).
@@ -1354,6 +1359,8 @@ pub fn meet_and_trade(
                     stats.trade_hexes = vec![0; n_tiles];
                 }
                 stats.trade_hexes[snaps[si].tile] += 1;
+                // Last clearing price for this item — held until its next sale.
+                stats.last_sale_price[item] = price;
                 income.this_window += price as f64;
                 // EWMA of realized sale prices (lazy-init to the first sample).
                 stats.ewma_price[item] = if stats.ewma_price[item] <= 0.0 {

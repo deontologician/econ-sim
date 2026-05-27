@@ -239,6 +239,18 @@ design. Newest first within each section.
 
 ## Rendering / UI
 
+### Per-resource price graphs
+- **NOW**: `EconStats::last_sale_price[item]` holds each resource's most recent clearing
+  price (set in `meet_and_trade`, persisted in saves). A **Prices** toggle (button / `P`)
+  opens a panel with one auto-scaled sparkline per resource (labelled `<name> ₦<price>`),
+  fed from a `PriceHistory` ring sampled alongside the stats. The series **holds the last
+  sale price through no-trade spells** — a flat line, never a drop to zero — so a thinly
+  traded good still reads its true price. *(partial — data verified headless; the panel
+  render is unconfirmed on device)*
+- **INTENDED**: optionally overlay bid/ask or the `ewma_price` band; mark the actual
+  trade ticks; a shared y-scale toggle so levels (not just shapes) compare across goods.
+- **STATUS**: partial
+
 ### Trade-density (commerce) map overlay
 - **NOW**: `EconStats::trade_hexes` accumulates a per-hex tally of every trade that
   clears (counted at the seller's tile), persisted in saves. A **Trades** toggle (button

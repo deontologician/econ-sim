@@ -319,6 +319,7 @@ fn emit_record(w: &mut World) {
         "merchant_profit_total": stats.merchant_profit_total,
         "utility_total": stats.utility_total,
         "ewma_price": stats.ewma_price,
+        "last_sale_price": stats.last_sale_price,
         "hunger_rate": hunger.rate,
         "deaths_per_tick": hunger.measured_per_tick,
         "deaths_per_tick_target": hunger.target_per_tick,

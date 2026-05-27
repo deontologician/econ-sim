@@ -63,8 +63,9 @@ const NOOT_BTN_TOP: f32 = TRADES_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const SAVE_BTN_TOP: f32 = NOOT_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const NEW_BTN_TOP: f32 = SAVE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const GRAPHS_BTN_TOP: f32 = NEW_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
+const PRICES_BTN_TOP: f32 = GRAPHS_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 /// Bottom edge of the toggle column (taps above this in the column are UI, not map).
-const BTN_COLUMN_BOTTOM: f32 = GRAPHS_BTN_TOP + PAUSE_BTN_H;
+const BTN_COLUMN_BOTTOM: f32 = PRICES_BTN_TOP + PAUSE_BTN_H;
 
 // --- Graphs overlay ---------------------------------------------------------
 /// Size of the big correlation (overlay) chart texture, and of each per-stat sparkline.
@@ -250,6 +251,7 @@ struct Overlays {
     trades: bool,
     strip: bool,
     graphs: bool,
+    prices: bool,
 }
 
 impl Default for Overlays {
@@ -260,6 +262,7 @@ impl Default for Overlays {
             trades: false,
             strip: true,
             graphs: false,
+            prices: false,
         }
     }
 }
@@ -268,6 +271,13 @@ impl Default for Overlays {
 #[derive(Resource, Default)]
 struct StatHistory {
     samples: std::collections::VecDeque<[f32; graph::N_SERIES]>,
+}
+
+/// Rolling history of each resource's last sale price (held through no-trade spells),
+/// oldest → newest, capped at `HISTORY_CAP` — feeds the per-resource price graphs.
+#[derive(Resource, Default)]
+struct PriceHistory {
+    samples: std::collections::VecDeque<[f32; goods::N_ITEMS]>,
 }
 
 /// Which stats are currently drawn together on the correlation (overlay) chart.
@@ -289,6 +299,8 @@ impl Default for GraphSelection {
 struct GraphAssets {
     overlay: Handle<Image>,
     sparks: Vec<Handle<Image>>,
+    /// One price sparkline texture per resource item (the Prices panel).
+    price_sparks: Vec<Handle<Image>>,
 }
 
 /// Root of the correlation-chart panel (shown/hidden by the Graphs toggle).
@@ -297,6 +309,17 @@ struct GraphsPanel;
 /// The on-screen Graphs toggle button (opens the correlation chart).
 #[derive(Component)]
 struct GraphsButton;
+/// Root of the per-resource price-chart panel (shown/hidden by the Prices toggle).
+#[derive(Component)]
+struct PricesPanel;
+/// The on-screen Prices toggle button (opens the per-resource price graphs).
+#[derive(Component)]
+struct PricesButton;
+/// The caption above a resource's price sparkline (`"<name> ₦<price>"`).
+#[derive(Component)]
+struct PriceLabel {
+    item: usize,
+}
 /// The collapsible body of the top sparkline strip (the row of stat cells).
 #[derive(Component)]
 struct StatStripBody;
@@ -368,6 +391,7 @@ fn main() {
         .init_resource::<Overlays>()
         .init_resource::<NootColoring>()
         .init_resource::<StatHistory>()
+        .init_resource::<PriceHistory>()
         .init_resource::<GraphSelection>()
         .init_resource::<economy::IncomeControl>()
         .init_resource::<economy::PriceField>()
@@ -401,6 +425,7 @@ fn main() {
                     speed_controls,
                     graphs_controls,
                     fit_camera_to_screen,
+                    prices_controls,
                 ),
                 (
                     update_selection_ring,
@@ -411,6 +436,7 @@ fn main() {
                     update_deposit_outlines,
                     sample_stats,
                     render_graphs,
+                    render_prices,
                     graph_select,
                     strip_controls,
                     hide_loading_screen,
@@ -501,6 +527,9 @@ fn setup(
     let graph_assets = GraphAssets {
         overlay: images.add(graph::blank_image(OVERLAY_W, OVERLAY_H)),
         sparks: (0..graph::N_SERIES)
+            .map(|_| images.add(graph::blank_image(SPARK_W, SPARK_H)))
+            .collect(),
+        price_sparks: (0..goods::N_ITEMS)
             .map(|_| images.add(graph::blank_image(SPARK_W, SPARK_H)))
             .collect(),
     };
@@ -871,6 +900,7 @@ fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) 
         });
     spawn_overlay_button(commands, font, "New", NEW_BTN_TOP, NewWorldButton);
     spawn_overlay_button(commands, font, "Graphs", GRAPHS_BTN_TOP, GraphsButton);
+    spawn_overlay_button(commands, font, "Prices", PRICES_BTN_TOP, PricesButton);
 
     // Noot-colouring cycle button (caption shows the active mode).
     commands
@@ -1087,6 +1117,87 @@ fn spawn_graphs_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &Gra
                 },
             ));
         });
+
+    // --- Per-resource price panel (on-demand, behind the Prices button) ------
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(8.0),
+                bottom: Val::Px(70.0),
+                display: Display::None,
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::FlexStart,
+                row_gap: Val::Px(3.0),
+                padding: UiRect::all(Val::Px(6.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.85)),
+            PricesPanel,
+        ))
+        .with_children(|panel| {
+            panel.spawn((
+                Text::new("Resource prices (₦, last sale — flat while unsold)"),
+                TextFont {
+                    font: font.clone(),
+                    font_size: 11.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.8, 0.8, 0.85)),
+            ));
+            panel
+                .spawn((Node {
+                    width: Val::Px(OVERLAY_W as f32),
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    align_items: AlignItems::FlexStart,
+                    column_gap: Val::Px(5.0),
+                    row_gap: Val::Px(5.0),
+                    ..default()
+                },))
+                .with_children(|grid| {
+                    for item in 0..goods::N_ITEMS {
+                        spawn_price_cell(grid, font, graphs, item);
+                    }
+                });
+        });
+}
+
+/// One per-resource price cell (caption + sparkline) in the Prices panel. Unlike the
+/// stat cells these aren't tappable — each resource just gets its own standalone graph.
+fn spawn_price_cell(
+    grid: &mut bevy::ecs::hierarchy::ChildSpawnerCommands,
+    font: &Handle<Font>,
+    graphs: &GraphAssets,
+    item: usize,
+) {
+    grid.spawn(Node {
+        flex_direction: FlexDirection::Column,
+        align_items: AlignItems::Center,
+        padding: UiRect::all(Val::Px(3.0)),
+        row_gap: Val::Px(1.0),
+        ..default()
+    })
+    .with_children(|cell| {
+        cell.spawn((
+            Text::new("…"),
+            TextFont {
+                font: font.clone(),
+                font_size: 10.0,
+                ..default()
+            },
+            TextColor(Color::WHITE),
+            PriceLabel { item },
+        ));
+        cell.spawn((
+            ImageNode::new(graphs.price_sparks[item].clone()),
+            Node {
+                width: Val::Px(SPARK_W as f32),
+                height: Val::Px(SPARK_H as f32),
+                ..default()
+            },
+        ));
+    });
 }
 
 /// One tappable stat cell (caption + sparkline) in the top strip.
@@ -1189,6 +1300,7 @@ fn sample_stats(
     income: Res<economy::IncomeControl>,
     noots: Query<(&Wallet, &Hunger, &Claim, &NootMeta, &TilePos)>,
     mut hist: ResMut<StatHistory>,
+    mut phist: ResMut<PriceHistory>,
     mut timer: Local<f32>,
     mut prev_trades: Local<u64>,
 ) {
@@ -1247,6 +1359,11 @@ fn sample_stats(
     hist.samples.push_back(s);
     while hist.samples.len() > HISTORY_CAP {
         hist.samples.pop_front();
+    }
+
+    phist.samples.push_back(stats.last_sale_price);
+    while phist.samples.len() > HISTORY_CAP {
+        phist.samples.pop_front();
     }
 }
 
@@ -1308,6 +1425,77 @@ fn render_graphs(
                 .map(|i| (cols[i].as_slice(), graph::SERIES[i].1))
                 .collect();
             graph::render_overlay(img, &sel);
+        }
+    }
+}
+
+/// Re-rasterize the per-resource price sparklines and refresh their captions while the
+/// Prices panel is open (throttled). Each resource gets its own auto-scaled graph; the
+/// series holds the last sale price through no-trade spells, so it never drops to zero.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn render_prices(
+    time: Res<Time>,
+    overlays: Res<Overlays>,
+    sim: Res<Sim>,
+    phist: Res<PriceHistory>,
+    assets: Res<GraphAssets>,
+    mut images: ResMut<Assets<Image>>,
+    mut labels: Query<(&PriceLabel, &mut Text)>,
+    mut timer: Local<f32>,
+) {
+    if !overlays.prices {
+        return;
+    }
+    *timer += time.delta_secs();
+    if *timer < 0.2 {
+        return;
+    }
+    *timer = 0.0;
+
+    // Gold trace, matching the Trades overlay's commerce colour.
+    const PRICE_COLOR: [u8; 3] = [240, 205, 80];
+    for item in 0..goods::N_ITEMS {
+        let col: Vec<f32> = phist.samples.iter().map(|s| s[item]).collect();
+        if let Some(img) = images.get_mut(&assets.price_sparks[item]) {
+            graph::render_sparkline(img, &col, PRICE_COLOR);
+        }
+    }
+    let world = &sim.0;
+    for (lbl, mut text) in &mut labels {
+        let slot = lbl.item / 2;
+        let name = match goods::form_of(lbl.item) {
+            GoodForm::Raw => elements::element(world.chosen[slot].id).name,
+            GoodForm::Refined => elements::element(world.chosen[slot].id).refined,
+        };
+        let latest = phist
+            .samples
+            .back()
+            .map(|s| s[lbl.item])
+            .unwrap_or(0.0);
+        text.0 = format!("{name} ₦{latest:.1}");
+    }
+}
+
+/// Toggle the per-resource price panel from the Prices button or the `P` key, keeping the
+/// button tint and the panel visibility in sync.
+fn prices_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    button: Query<&Interaction, (Changed<Interaction>, With<PricesButton>)>,
+    mut overlays: ResMut<Overlays>,
+    mut panel: Query<&mut Node, With<PricesPanel>>,
+    mut bg: Query<&mut BackgroundColor, With<PricesButton>>,
+) {
+    if keys.just_pressed(KeyCode::KeyP) || button.iter().any(|i| *i == Interaction::Pressed) {
+        overlays.prices = !overlays.prices;
+        if let Ok(mut node) = panel.single_mut() {
+            node.display = if overlays.prices {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+        if let Ok(mut bg) = bg.single_mut() {
+            bg.0 = if overlays.prices { TRADES_BTN_ON } else { BTN_OFF };
         }
     }
 }
