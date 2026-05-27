@@ -62,8 +62,9 @@ const SAVE_BTN_TOP: f32 = NOOT_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const NEW_BTN_TOP: f32 = SAVE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const GRAPHS_BTN_TOP: f32 = NEW_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 const PRICES_BTN_TOP: f32 = GRAPHS_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
+const WEALTH_BTN_TOP: f32 = PRICES_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
 /// Bottom edge of the toggle column (taps above this in the column are UI, not map).
-const BTN_COLUMN_BOTTOM: f32 = PRICES_BTN_TOP + PAUSE_BTN_H;
+const BTN_COLUMN_BOTTOM: f32 = WEALTH_BTN_TOP + PAUSE_BTN_H;
 
 // --- Graphs overlay ---------------------------------------------------------
 /// Size of the big correlation (overlay) chart texture, and of each per-stat sparkline.
@@ -278,6 +279,7 @@ struct Overlays {
     strip: bool,
     graphs: bool,
     prices: bool,
+    wealth: bool,
 }
 
 impl Default for Overlays {
@@ -287,6 +289,7 @@ impl Default for Overlays {
             strip: true,
             graphs: false,
             prices: false,
+            wealth: false,
         }
     }
 }
@@ -325,6 +328,8 @@ struct GraphAssets {
     sparks: Vec<Handle<Image>>,
     /// One price sparkline texture per resource item (the Prices panel).
     price_sparks: Vec<Handle<Image>>,
+    /// The sorted money-per-noot distribution chart (the Wealth panel).
+    wealth: Handle<Image>,
 }
 
 /// Root of the correlation-chart panel (shown/hidden by the Graphs toggle).
@@ -344,6 +349,15 @@ struct PricesButton;
 struct PriceLabel {
     item: usize,
 }
+/// Root of the wealth-distribution panel (shown/hidden by the Wealth toggle).
+#[derive(Component)]
+struct WealthPanel;
+/// The on-screen Wealth toggle button (opens the sorted money-per-noot chart).
+#[derive(Component)]
+struct WealthButton;
+/// Caption above the wealth chart, showing the current Gini coefficient.
+#[derive(Component)]
+struct WealthLabel;
 /// The collapsible body of the top sparkline strip (the row of stat cells).
 #[derive(Component)]
 struct StatStripBody;
@@ -440,6 +454,7 @@ fn main() {
                     graphs_controls,
                     fit_camera_to_screen,
                     prices_controls,
+                    wealth_controls,
                 ),
                 (
                     update_selection_ring,
@@ -450,6 +465,7 @@ fn main() {
                     sample_stats,
                     render_graphs,
                     render_prices,
+                    render_wealth,
                     graph_select,
                     strip_controls,
                     hide_loading_screen,
@@ -545,6 +561,7 @@ fn setup(
         price_sparks: (0..goods::N_ITEMS)
             .map(|_| images.add(graph::blank_image(SPARK_W, SPARK_H)))
             .collect(),
+        wealth: images.add(graph::blank_image(OVERLAY_W, OVERLAY_H)),
     };
     commands.insert_resource(graph_assets.clone());
 
@@ -930,6 +947,7 @@ fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) 
     spawn_overlay_button(commands, font, "New", NEW_BTN_TOP, NewWorldButton);
     spawn_overlay_button(commands, font, "Graphs", GRAPHS_BTN_TOP, GraphsButton);
     spawn_overlay_button(commands, font, "Prices", PRICES_BTN_TOP, PricesButton);
+    spawn_overlay_button(commands, font, "Wealth", WEALTH_BTN_TOP, WealthButton);
 
     // Noot-colouring cycle button (caption shows the active mode).
     commands
@@ -1189,6 +1207,44 @@ fn spawn_graphs_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &Gra
                         spawn_price_cell(grid, font, graphs, item);
                     }
                 });
+        });
+
+    // --- Wealth-distribution panel (on-demand, behind the Wealth button) -----
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(8.0),
+                bottom: Val::Px(70.0),
+                display: Display::None,
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::FlexStart,
+                row_gap: Val::Px(3.0),
+                padding: UiRect::all(Val::Px(6.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.85)),
+            WealthPanel,
+        ))
+        .with_children(|panel| {
+            panel.spawn((
+                Text::new("Money per noot (richest → poorest)"),
+                TextFont {
+                    font: font.clone(),
+                    font_size: 11.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.8, 0.8, 0.85)),
+                WealthLabel,
+            ));
+            panel.spawn((
+                ImageNode::new(graphs.wealth.clone()),
+                Node {
+                    width: Val::Px(OVERLAY_W as f32),
+                    height: Val::Px(OVERLAY_H as f32),
+                    ..default()
+                },
+            ));
         });
 }
 
@@ -1525,6 +1581,63 @@ fn prices_controls(
         }
         if let Ok(mut bg) = bg.single_mut() {
             bg.0 = if overlays.prices { TRADES_BTN_ON } else { BTN_OFF };
+        }
+    }
+}
+
+/// Redraw the wealth-distribution chart while the Wealth panel is open (throttled):
+/// every noot's bucks sorted richest → poorest as a zero-based bar chart, plus the Gini
+/// coefficient in the caption. A steep convex drop / high Gini = lots of inequality.
+#[allow(clippy::type_complexity)]
+fn render_wealth(
+    time: Res<Time>,
+    overlays: Res<Overlays>,
+    assets: Res<GraphAssets>,
+    noots: Query<&Wallet, With<Noot>>,
+    mut images: ResMut<Assets<Image>>,
+    mut label: Query<&mut Text, With<WealthLabel>>,
+    mut timer: Local<f32>,
+) {
+    if !overlays.wealth {
+        return;
+    }
+    *timer += time.delta_secs();
+    if *timer < 0.3 {
+        return;
+    }
+    *timer = 0.0;
+
+    let mut wealth: Vec<f32> = noots.iter().map(|w| w.bucks).collect();
+    let gini = economy::gini(&wealth);
+    wealth.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some(img) = images.get_mut(&assets.wealth) {
+        graph::render_bars(img, &wealth, [120, 230, 180]);
+    }
+    if let Ok(mut text) = label.single_mut() {
+        text.0 = format!("Money per noot (richest → poorest) — Gini {gini:.2}");
+    }
+}
+
+/// Toggle the wealth-distribution panel from the Wealth button or the `I` key, keeping
+/// the button tint and the panel visibility in sync.
+fn wealth_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    button: Query<&Interaction, (Changed<Interaction>, With<WealthButton>)>,
+    mut overlays: ResMut<Overlays>,
+    mut panel: Query<&mut Node, With<WealthPanel>>,
+    mut bg: Query<&mut BackgroundColor, With<WealthButton>>,
+) {
+    if keys.just_pressed(KeyCode::KeyI) || button.iter().any(|i| *i == Interaction::Pressed) {
+        overlays.wealth = !overlays.wealth;
+        if let Ok(mut node) = panel.single_mut() {
+            node.display = if overlays.wealth {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+        if let Ok(mut bg) = bg.single_mut() {
+            bg.0 = if overlays.wealth { TERRAIN_BTN_ON } else { BTN_OFF };
         }
     }
 }

@@ -251,6 +251,16 @@ design. Newest first within each section.
 
 ## Rendering / UI
 
+### Wealth-distribution graph
+- **NOW**: a **Wealth** toggle (button / `I`) opens a panel charting every noot's bucks
+  sorted richest → poorest as a zero-based bar chart (`graph::render_bars`), with the
+  **Gini coefficient** (`economy::gini`) in the caption. A steep convex drop / high Gini
+  = lots of inequality. Headless emits `wealth_gini` per sample (verified: it climbs
+  ~0 → ~0.72 over 60k ticks as the economy concentrates wealth).
+- **INTENDED**: maybe a Lorenz-curve variant; track Gini over time as a strip series;
+  break wealth down by claim status or region.
+- **STATUS**: partial
+
 ### Per-resource price graphs
 - **NOW**: `EconStats::last_sale_price[item]` holds each resource's most recent clearing
   price (set in `meet_and_trade`, persisted in saves). A **Prices** toggle (button / `P`)

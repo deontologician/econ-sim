@@ -208,6 +208,32 @@ pub fn render_sparkline(img: &mut Image, samples: &[f32], color: [u8; 3]) {
     }
 }
 
+/// Rasterize a distribution as filled bars rising from a zero baseline, in the order
+/// given (the caller sorts). Heights are value / max, so the y-axis is anchored at 0 —
+/// for the wealth-by-noot chart a steep convex drop reads as high inequality, a flat top
+/// as everyone similar.
+pub fn render_bars(img: &mut Image, values: &[f32], color: [u8; 3]) {
+    let (w, h) = dims(img);
+    let Some(d) = img.data.as_mut() else {
+        return;
+    };
+    fill(d, BG);
+    if values.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    let max = values.iter().copied().fold(0.0f32, f32::max).max(1e-9);
+    let n = values.len();
+    let c = [color[0], color[1], color[2], 255];
+    for x in 0..w {
+        let i = x * n / w; // which ranked noot this column belongs to
+        let frac = (values[i].max(0.0) / max).clamp(0.0, 1.0);
+        let bar = (frac * (h as f32 - 2.0)) as usize;
+        for y in 0..bar {
+            put(d, w, h, x as i32, (h - 1 - y) as i32, c);
+        }
+    }
+}
+
 /// Rasterize several series together, each independently normalized to fill the height,
 /// so their shapes can be compared for correlation. Draws quarter grid-lines behind.
 pub fn render_overlay(img: &mut Image, series: &[(&[f32], [u8; 3])]) {

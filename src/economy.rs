@@ -394,6 +394,29 @@ pub fn hunger_tick(
     }
 }
 
+/// Gini coefficient of a set of values (negatives floored to 0): 0 = perfect equality,
+/// approaching 1 = one holder has everything. Uses the sorted-rank formula
+/// `G = (2·Σ i·x_i)/(n·Σx) − (n+1)/n` over `x` sorted ascending (i 1-indexed). For the
+/// wealth distribution this is the single number behind the "how exponential" curve.
+pub fn gini(values: &[f32]) -> f32 {
+    let n = values.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mut v: Vec<f32> = values.iter().map(|&x| x.max(0.0)).collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let sum: f32 = v.iter().sum();
+    if sum <= 0.0 {
+        return 0.0;
+    }
+    let weighted: f32 = v
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| (i as f32 + 1.0) * x)
+        .sum();
+    ((2.0 * weighted) / (n as f32 * sum) - (n as f32 + 1.0) / n as f32).clamp(0.0, 1.0)
+}
+
 /// Maslow-tiered utility over the game's concepts: physiological (fed) ≫ safety
 /// (food buffer + savings) ≫ esteem (positional wealth). Higher tiers only count
 /// once lower ones are satisfied, so the policy learns the hierarchy. Reward = ΔU.

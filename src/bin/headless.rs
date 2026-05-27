@@ -261,6 +261,7 @@ fn emit_record(w: &mut World) {
         (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut transactions = 0.0f64;
     let mut tiles: Vec<(i32, i32)> = Vec::new();
+    let mut wealth: Vec<f32> = Vec::new();
     for (a, h, c, wal, m, tr, inv, tp) in q.iter(w) {
         match a {
             Action::Move => act[0] += 1,
@@ -275,6 +276,7 @@ fn emit_record(w: &mut World) {
             claimed += 1;
         }
         bucks += wal.bucks as f64;
+        wealth.push(wal.bucks);
         appetite += (h.staple.iter().sum::<f32>() / h.staple.len() as f32) as f64;
         experience += m.experience as f64;
         transactions += m.transactions as f64;
@@ -333,6 +335,7 @@ fn emit_record(w: &mut World) {
         "act_refine": act[2],
         "act_idle": act[3],
         "mean_bucks": bucks / nf,
+        "wealth_gini": econ_sim::economy::gini(&wealth),
         "mean_appetite": appetite / nf,
         "mean_experience": experience / nf,
         "mean_transactions": transactions / nf,
