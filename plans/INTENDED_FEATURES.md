@@ -145,7 +145,10 @@ design. Newest first within each section.
   learned value plus a large `ROUTE_OPTIMISM` bonus for the greedy route to the committed
   target, and takes the best — so a noot reliably reaches the destination it remembers
   choosing (it doesn't wander off and get lost) while the learned value shapes the path and
-  can veer it toward a clearly better tile. The state mixes an
+  can veer it toward a clearly better tile. The step also adds a **road** pull and a
+  terrain push (`ROAD_PULL`/`TERRAIN_PUSH`): noots prefer worn, easy tiles among
+  equally-progressing hexes, which (with the decaying `World::road` field, below) funnels
+  parallel paths onto shared lanes. The state mixes an
   absolute position embedding with position-invariant cues: bucks/hunger/positional/
   ownership, an *on-minable* flag, the local **terrain difficulty**, and six-way
   *direction gradients* toward the target deposit, the nearest other noot, and the best
@@ -163,6 +166,26 @@ design. Newest first within each section.
   ignoring option length in the discount); richer relative/local state (observed
   prices/inventories, who's nearby); reward/entropy/lr tuning; tune `ROUTE_OPTIMISM`
   (lower = more deviation/flexibility, higher = stricter routing) on-device.
+- **STATUS**: partial
+
+### Roads (decaying desire-paths) & multi-centre trade
+- **NOW**: a per-tile **`World::road`** field in `[0,1]` (serialized): every noot step
+  deposits a little on the entered tile, the whole field decays exponentially each tick
+  (`accumulate_traffic`), roads cut the movement-cost surcharge by up to `ROAD_RELIEF`
+  (`hunger_tick`), and the value-guided step is pulled toward them. The deposit→relief→pull
+  loop is positive feedback, so traffic self-reinforces into worn corridors that fade if
+  abandoned — rendered live by the **Roads** map overlay (distinct from the cumulative
+  **Routes** overlay). To stop all trade bunching on one hub, travel was made costlier
+  (`CARRY_HUNGER_K` 0.6→1.6, `MARKET_DIST_PENALTY` 3→8) and a **`SHOP_RANGE`** gate added so
+  a noot sells at a *local* market rather than trekking to a far shop — bounding each shop's
+  catchment so several centres coexist. Headless (80k, 3 seeds): the busiest trade tile
+  drops from ~82% to ~44-57% of trades (2-3 centres), consumption holds/improves, roads form
+  (~27% of tiles, peaks ~0.4). *(partial)*
+- **INTENDED**: roads vs. multiple centres are in tension (roads are winner-take-all);
+  landed ~2-3 centres, not a clean 4-5. `SHOP_RANGE` is the dial (lower = more/smaller
+  centres + softer roads). Wants on-device tuning of the road constants
+  (`ROAD_DEPOSIT`/`ROAD_DECAY`/`ROAD_PULL`/`ROAD_RELIEF`) and the catchment, and ideally a
+  cost-to-go (not greedy) router so roads can justify real detours, not just tie-breaks.
 - **STATUS**: partial
 
 ### Production reward-shaping & guided exploration *(retired)*

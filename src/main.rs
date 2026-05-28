@@ -86,6 +86,7 @@ const VALUE_BTN_ON: Color = Color::srgba(0.62, 0.22, 0.16, 0.9);
 const TERRAIN_BTN_ON: Color = Color::srgba(0.20, 0.45, 0.30, 0.9);
 const TRADES_BTN_ON: Color = Color::srgba(0.70, 0.55, 0.12, 0.9);
 const ROUTES_BTN_ON: Color = Color::srgba(0.18, 0.42, 0.62, 0.9);
+const ROADS_BTN_ON: Color = Color::srgba(0.55, 0.40, 0.20, 0.9);
 /// Confirmation tint + how long (real seconds) the Save button flashes after a save.
 const SAVE_FLASH_COLOR: Color = Color::srgba(0.20, 0.55, 0.30, 0.95);
 const SAVE_FLASH_SECS: f32 = 1.0;
@@ -250,6 +251,7 @@ enum MapOverlayMode {
     Terrain,
     Trades,
     Routes,
+    Roads,
 }
 
 impl MapOverlayMode {
@@ -258,7 +260,8 @@ impl MapOverlayMode {
             Self::None => Self::Terrain,
             Self::Terrain => Self::Trades,
             Self::Trades => Self::Routes,
-            Self::Routes => Self::None,
+            Self::Routes => Self::Roads,
+            Self::Roads => Self::None,
         }
     }
 
@@ -268,6 +271,7 @@ impl MapOverlayMode {
             Self::Terrain => "Overlay: terrain",
             Self::Trades => "Overlay: trades",
             Self::Routes => "Overlay: routes",
+            Self::Roads => "Overlay: roads",
         }
     }
 }
@@ -407,6 +411,14 @@ struct RouteOverlay {
     tile: usize,
 }
 
+/// Per-hex heat cell for the live **road** overlay (`tile` is `row * cols + col`);
+/// recoloured from the decaying `World::road` field — the current desire-path network,
+/// as distinct from `RouteOverlay`'s all-time cumulative traffic.
+#[derive(Component)]
+struct RoadOverlay {
+    tile: usize,
+}
+
 /// Ring drawn around a deposit while it is claimed.
 #[derive(Component)]
 struct DepositOutline {
@@ -507,6 +519,7 @@ fn main() {
                     update_noot_color,
                     update_trade_overlay,
                     update_route_overlay,
+                    update_road_overlay,
                     update_deposit_outlines,
                     sync_structure_markers,
                     update_stack_labels,
@@ -680,6 +693,16 @@ fn setup(
             Transform::from_xyz(px, py, 1.5),
             Visibility::Hidden,
             RouteOverlay { tile: idx },
+        ));
+
+        // Live road overlay (tan), recoloured by `update_road_overlay` from the decaying
+        // `World::road` field — the current desire-path network.
+        commands.spawn((
+            Mesh2d(hex_mesh.clone()),
+            MeshMaterial2d(materials.add(Color::srgba(0.80, 0.62, 0.32, 0.0))),
+            Transform::from_xyz(px, py, 1.45),
+            Visibility::Hidden,
+            RoadOverlay { tile: idx },
         ));
     }
 
@@ -2114,15 +2137,39 @@ fn overlay_controls(
     noot_btn: Query<&Interaction, (Changed<Interaction>, With<NootColorButton>)>,
     mut terrain_cells: Query<
         &mut Visibility,
-        (With<TerrainOverlay>, Without<TradeOverlay>, Without<RouteOverlay>),
+        (
+            With<TerrainOverlay>,
+            Without<TradeOverlay>,
+            Without<RouteOverlay>,
+            Without<RoadOverlay>,
+        ),
     >,
     mut trade_cells: Query<
         &mut Visibility,
-        (With<TradeOverlay>, Without<TerrainOverlay>, Without<RouteOverlay>),
+        (
+            With<TradeOverlay>,
+            Without<TerrainOverlay>,
+            Without<RouteOverlay>,
+            Without<RoadOverlay>,
+        ),
     >,
     mut route_cells: Query<
         &mut Visibility,
-        (With<RouteOverlay>, Without<TerrainOverlay>, Without<TradeOverlay>),
+        (
+            With<RouteOverlay>,
+            Without<TerrainOverlay>,
+            Without<TradeOverlay>,
+            Without<RoadOverlay>,
+        ),
+    >,
+    mut road_cells: Query<
+        &mut Visibility,
+        (
+            With<RoadOverlay>,
+            Without<TerrainOverlay>,
+            Without<TradeOverlay>,
+            Without<RouteOverlay>,
+        ),
     >,
     mut map_bg: Query<&mut BackgroundColor, With<MapOverlayButton>>,
     mut map_label: Query<&mut Text, (With<MapOverlayLabel>, Without<NootColorLabel>)>,
@@ -2158,6 +2205,9 @@ fn overlay_controls(
     for mut v in &mut route_cells {
         *v = vis(mode == MapOverlayMode::Routes);
     }
+    for mut v in &mut road_cells {
+        *v = vis(mode == MapOverlayMode::Roads);
+    }
     if let Ok(mut text) = map_label.single_mut() {
         text.0 = mode.label().into();
     }
@@ -2167,6 +2217,7 @@ fn overlay_controls(
             MapOverlayMode::Terrain => TERRAIN_BTN_ON,
             MapOverlayMode::Trades => TRADES_BTN_ON,
             MapOverlayMode::Routes => ROUTES_BTN_ON,
+            MapOverlayMode::Roads => ROADS_BTN_ON,
         };
     }
 }
@@ -2293,6 +2344,35 @@ fn update_route_overlay(
             let c = stats.traffic_hexes.get(cell.tile).copied().unwrap_or(0) as f32;
             let v = (c / max).sqrt();
             m.color = Color::srgba(0.25, 0.70, 0.95, v * 0.9);
+        }
+    }
+}
+
+/// Recolour the live road heat cells from the decaying `World::road` field (already in
+/// `[0, 1]`). Throttled and gated on the Roads overlay, like the others. The `sqrt` gamma
+/// lifts faint paths so a forming basin shows before it saturates.
+fn update_road_overlay(
+    time: Res<Time>,
+    overlays: Res<Overlays>,
+    sim: Res<Sim>,
+    mut timer: Local<f32>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    cells: Query<(&RoadOverlay, &MeshMaterial2d<ColorMaterial>)>,
+) {
+    if overlays.map != MapOverlayMode::Roads {
+        return;
+    }
+    *timer += time.delta_secs();
+    if *timer < 0.4 {
+        return;
+    }
+    *timer = 0.0;
+
+    let road = &sim.0.road;
+    for (cell, mat) in &cells {
+        if let Some(m) = materials.get_mut(&mat.0) {
+            let level = road.get(cell.tile).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            m.color = Color::srgba(0.80, 0.62, 0.32, level.sqrt() * 0.9);
         }
     }
 }
