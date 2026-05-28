@@ -438,9 +438,10 @@ const CARRY_HUNGER_K: f32 = 1.6;
 // few corridors carry most movement and unused ground fades back to wilderness.
 /// Saturation cap for a tile's raw accumulated **wear** (`World::road ∈ [0, ROAD_MAX]`).
 const ROAD_MAX: f32 = 1.0;
-/// Wear laid down on a tile each time a noot steps into it. Small on purpose: a single
-/// pass barely registers, so a road only emerges where noots travel the same ground over
-/// and over — and given how thinly noot traffic spreads, even a busy lane builds up slowly.
+/// Wear laid down on a tile each time a *qualifying* step lands on it (see the distinct-
+/// traverser gate below). Selectivity comes from that gate — a lone noot's shuttle never
+/// qualifies — so the deposit itself can be brisk enough that a genuinely shared corridor
+/// builds up past [`ROAD_WEAR_FULL`] into a full-strength road rather than a faint smear.
 const ROAD_DEPOSIT: f32 = 0.05;
 /// Per-tick exponential decay of every tile's wear (~690-tick half-life). Slow, so a road
 /// reflects sustained travel over a long window and lingers once earned — but still fades
