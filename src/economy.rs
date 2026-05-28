@@ -173,8 +173,16 @@ const PRICE_FIELD_REBUILD_TICKS: u32 = 600;
 /// Per-hex penalty (in buck-equivalent margin) when choosing which market to head for,
 /// so a noot prefers a near market and only bothers hauling a load far when the expected
 /// markup justifies the trek. This gates the market heading — a tiny load won't pull a
-/// noot off its deposit; a full one will.
-const MARKET_DIST_PENALTY: f32 = 3.0;
+/// noot off its deposit; a full one will. Raised alongside `CARRY_HUNGER_K` so noots favour
+/// a nearby market over trekking to the single best one, spreading trade across centres.
+const MARKET_DIST_PENALTY: f32 = 8.0;
+
+/// Farthest a noot will head to an existing shop to sell. Beyond this it ignores the shop
+/// and sells at the best *local* market instead (clustering with other nearby sellers, and
+/// making it worthwhile to build a shop of its own). Without this gate every noot treks to
+/// whichever single shop is "nearest", so one hub swallows all trade; bounding each shop's
+/// catchment lets several regional centres coexist.
+const SHOP_RANGE: i32 = 6;
 
 /// Ticks each production/consumption rate sample covers.
 const RATE_WINDOW_TICKS: u32 = 30;
@@ -410,8 +418,36 @@ const HUNGER_TERRAIN_K: f32 = 1.0;
 /// Transport cost: a noot moving with a full load burns `1 + this`× the hunger of an
 /// empty one. Carried goods have weight, so hauling them across the map costs energy —
 /// which gives distance a real price, rewards efficient routes over wandering, and makes
-/// it cheaper to settle near where you trade (agglomeration) than to roam loaded.
-const CARRY_HUNGER_K: f32 = 0.6;
+/// it cheaper to settle near where you trade (agglomeration) than to roam loaded. Raised
+/// so long hauls genuinely hurt: the hunger PID re-centres the *absolute* death rate, so
+/// this lands as a stronger *relative* penalty on roaming loaded vs. trading locally —
+/// which (with roads) pushes trade to localise into several centres instead of one hub.
+const CARRY_HUNGER_K: f32 = 1.6;
+
+// --- Roads (decaying "desire-path" field) -----------------------------------
+// Every noot step deposits a little road on the tile it enters (`World::road`), the whole
+// field decays exponentially each tick, and roads both cut the movement cost on their tile
+// and pull the value-guided step toward them. The deposit→relief→pull loop is positive
+// feedback: a lightly-used shortcut attracts more traffic, which strengthens it, until a
+// few corridors carry most movement and unused ground fades back to wilderness.
+/// Saturation cap / normaliser for a tile's road strength (so `road ∈ [0, 1]`).
+const ROAD_MAX: f32 = 1.0;
+/// Road laid down on a tile each time a noot steps into it.
+const ROAD_DEPOSIT: f32 = 0.10;
+/// Per-tick exponential decay of every tile's road (≈230-tick half-life), so a corridor
+/// must keep earning its traffic or it reverts to wilderness.
+const ROAD_DECAY: f32 = 0.997;
+/// Fraction of the movement surcharge (terrain + carry) a fully-formed road removes — the
+/// "dramatically cheaper on roads" payoff that makes basins worth forming.
+const ROAD_RELIEF: f32 = 0.85;
+/// How hard a neighbouring tile's road pulls the value-guided step toward it. Kept below
+/// [`ROUTE_OPTIMISM`] so a noot never sacrifices forward progress for a road, but high
+/// enough to decide *which* of several equally-progressing hexes it takes — that
+/// tie-breaking is what funnels parallel paths onto a shared lane.
+const ROAD_PULL: f32 = 12.0;
+/// How hard rough terrain pushes the value-guided step away from a neighbouring tile, so
+/// noots prefer easy ground (where roads also form) when it costs no progress.
+const TERRAIN_PUSH: f32 = 6.0;
 
 pub fn hunger_tick(
     ctrl: Res<HungerControl>,
@@ -430,7 +466,11 @@ pub fn hunger_tick(
         } else {
             0.0
         };
-        let d = base * (1.0 + HUNGER_TERRAIN_K * difficulty + carry);
+        // A road on this tile dramatically cheapens the movement surcharge (terrain + carry)
+        // — the payoff that makes worn corridors worth following over raw ground.
+        let road = world.road.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        let surcharge = (HUNGER_TERRAIN_K * difficulty + carry) * (1.0 - ROAD_RELIEF * road);
+        let d = base * (1.0 + surcharge);
         for a in &mut h.staple {
             *a = (*a + d).min(STAPLE_SATIATION);
         }
@@ -716,6 +756,9 @@ fn option_target(
     match act {
         policy::A_MINE => mine_target(world, claim, pos, claimed),
         policy::A_SELL => nearest_structure(world, pos, StructureKind::Shop)
+            .filter(|&(c, r)| {
+                torus_distance(pos.col, pos.row, c, r, world.cols, world.rows) <= SHOP_RANGE
+            })
             .or_else(|| best_market_tile(field, world, pos, inv, trader)),
         policy::A_REFINE => nearest_structure(world, pos, StructureKind::Refinery),
         _ => None,
@@ -770,7 +813,10 @@ fn value_guided_step(
         let d = torus_distance(nc, nr, target.0, target.1, cols, rows);
         let on_route = (here - d) as f32; // +1 closer, 0 sideways, −1 farther
         let tile = (nr * cols + nc) as usize;
-        let score = ROUTE_OPTIMISM * on_route + ac.value(tile, o);
+        let road = world.road.get(tile).copied().unwrap_or(0.0);
+        let diff = world.tiles[tile].difficulty.clamp(0.0, 1.0);
+        let score = ROUTE_OPTIMISM * on_route + ROAD_PULL * road - TERRAIN_PUSH * diff
+            + ac.value(tile, o);
         if score > best_score {
             best_score = score;
             best = (nc, nr);
@@ -779,25 +825,38 @@ fn value_guided_step(
     best
 }
 
-/// Paint the movement heatmap: every noot that stepped into a new hex this tick bumps that
-/// tile's counter. Runs right after `policy_step` (the only writer of `TilePos` during a
-/// move), so Bevy's `Changed` filter yields exactly this tick's steps — lingering at a
-/// deposit or market (no `TilePos` write) doesn't accumulate, so the picture favours the
-/// travelled corridors over the endpoints. See `EconStats::traffic_hexes`.
+/// Paint the movement heatmap and lay/decay roads. Runs right after `policy_step` (the only
+/// writer of `TilePos` during a move), so Bevy's `Changed` filter yields exactly this tick's
+/// steps — lingering at a deposit or market (no `TilePos` write) doesn't accumulate, so the
+/// picture favours the travelled corridors over the endpoints. Each tick the whole road
+/// field decays exponentially; each step both bumps the all-time `traffic_hexes` counter and
+/// deposits fresh road on the entered tile (capped at [`ROAD_MAX`]). See
+/// `EconStats::traffic_hexes` (cumulative, for the overlay) and `World::road` (decaying, the
+/// gameplay field that cheapens travel and pulls the value-guided step).
 pub fn accumulate_traffic(
-    sim: Res<Sim>,
+    mut sim: ResMut<Sim>,
     moved: Query<&TilePos, Changed<TilePos>>,
     mut stats: ResMut<EconStats>,
 ) {
-    let world = &sim.0;
+    let world = &mut sim.0;
     let n_tiles = (world.cols * world.rows) as usize;
     if stats.traffic_hexes.len() != n_tiles {
         stats.traffic_hexes = vec![0; n_tiles];
     }
+    if world.road.len() != n_tiles {
+        world.road = vec![0.0; n_tiles];
+    }
+    for r in world.road.iter_mut() {
+        *r *= ROAD_DECAY;
+    }
+    let cols = world.cols;
     for pos in &moved {
-        let tile = (pos.row * world.cols + pos.col) as usize;
+        let tile = (pos.row * cols + pos.col) as usize;
         if let Some(c) = stats.traffic_hexes.get_mut(tile) {
             *c += 1;
+        }
+        if let Some(r) = world.road.get_mut(tile) {
+            *r = (*r + ROAD_DEPOSIT).min(ROAD_MAX);
         }
     }
 }
