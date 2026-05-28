@@ -219,6 +219,13 @@ pub struct EconStats {
     /// the map on first trade; persists across saves so the picture survives a reload.
     #[serde(default)]
     pub trade_hexes: Vec<u32>,
+    /// Cumulative noot steps *into* each tile (`row * cols + col`) — a spatial heatmap of
+    /// where noots actually travel, for the Routes map overlay. Unlike `trade_hexes` (only
+    /// the endpoints where deals close) this paints the connecting corridors: the
+    /// deposit→market hauling lanes the policy settles into. Sized lazily to the map;
+    /// persists across saves.
+    #[serde(default)]
+    pub traffic_hexes: Vec<u32>,
     // Accumulators for the in-progress rate window.
     produced_window: f32,
     consumed_window: f32,
@@ -772,6 +779,29 @@ fn value_guided_step(
     best
 }
 
+/// Paint the movement heatmap: every noot that stepped into a new hex this tick bumps that
+/// tile's counter. Runs right after `policy_step` (the only writer of `TilePos` during a
+/// move), so Bevy's `Changed` filter yields exactly this tick's steps — lingering at a
+/// deposit or market (no `TilePos` write) doesn't accumulate, so the picture favours the
+/// travelled corridors over the endpoints. See `EconStats::traffic_hexes`.
+pub fn accumulate_traffic(
+    sim: Res<Sim>,
+    moved: Query<&TilePos, Changed<TilePos>>,
+    mut stats: ResMut<EconStats>,
+) {
+    let world = &sim.0;
+    let n_tiles = (world.cols * world.rows) as usize;
+    if stats.traffic_hexes.len() != n_tiles {
+        stats.traffic_hexes = vec![0; n_tiles];
+    }
+    for pos in &moved {
+        let tile = (pos.row * world.cols + pos.col) as usize;
+        if let Some(c) = stats.traffic_hexes.get_mut(tile) {
+            *c += 1;
+        }
+    }
+}
+
 /// The learned decision step, over **committed options** rather than primitive steps.
 /// Once per noot per cadence: if a committed option is still in progress, the executor
 /// drives its next step (navigate toward the goal, mine, refine, or scout) and the policy
@@ -980,6 +1010,7 @@ pub fn add_sim_systems(schedule: &mut Schedule) {
             age_noots,
             update_price_field,
             policy_step,
+            accumulate_traffic,
             build_structures,
             claim_improvements,
             extract,

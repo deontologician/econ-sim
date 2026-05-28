@@ -85,6 +85,7 @@ const BTN_OFF: Color = Color::srgba(0.12, 0.12, 0.12, 0.85);
 const VALUE_BTN_ON: Color = Color::srgba(0.62, 0.22, 0.16, 0.9);
 const TERRAIN_BTN_ON: Color = Color::srgba(0.20, 0.45, 0.30, 0.9);
 const TRADES_BTN_ON: Color = Color::srgba(0.70, 0.55, 0.12, 0.9);
+const ROUTES_BTN_ON: Color = Color::srgba(0.18, 0.42, 0.62, 0.9);
 /// Confirmation tint + how long (real seconds) the Save button flashes after a save.
 const SAVE_FLASH_COLOR: Color = Color::srgba(0.20, 0.55, 0.30, 0.95);
 const SAVE_FLASH_SECS: f32 = 1.0;
@@ -240,13 +241,15 @@ impl NootColorMode {
 struct NootColoring(NootColorMode);
 
 /// The single map heatmap shown, cycled by the Overlay button: none, terrain
-/// difficulty, or trade density. (The old crowd-density overlay was dropped.)
+/// difficulty, trade density, or movement (route) density. (The old crowd-density
+/// overlay was dropped.)
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum MapOverlayMode {
     #[default]
     None,
     Terrain,
     Trades,
+    Routes,
 }
 
 impl MapOverlayMode {
@@ -254,7 +257,8 @@ impl MapOverlayMode {
         match self {
             Self::None => Self::Terrain,
             Self::Terrain => Self::Trades,
-            Self::Trades => Self::None,
+            Self::Trades => Self::Routes,
+            Self::Routes => Self::None,
         }
     }
 
@@ -263,6 +267,7 @@ impl MapOverlayMode {
             Self::None => "Overlay: off",
             Self::Terrain => "Overlay: terrain",
             Self::Trades => "Overlay: trades",
+            Self::Routes => "Overlay: routes",
         }
     }
 }
@@ -280,8 +285,8 @@ struct SelectionRing;
 struct HexHighlight;
 
 /// Which inspection overlays are currently shown. `map` is the cycled map heatmap
-/// (none / terrain / trades); `strip` is the always-on top sparkline strip (shown by
-/// default, collapsible); `graphs`/`prices` are the on-demand chart panels.
+/// (none / terrain / trades / routes); `strip` is the always-on top sparkline strip (shown
+/// by default, collapsible); `graphs`/`prices` are the on-demand chart panels.
 #[derive(Resource)]
 struct Overlays {
     /// The map heatmap currently shown (cycled by the Overlay button).
@@ -395,6 +400,13 @@ struct TradeOverlay {
     tile: usize,
 }
 
+/// Per-hex heat cell for the movement (route) overlay (`tile` is `row * cols + col`);
+/// recoloured from the cumulative `EconStats::traffic_hexes` heatmap.
+#[derive(Component)]
+struct RouteOverlay {
+    tile: usize,
+}
+
 /// Ring drawn around a deposit while it is claimed.
 #[derive(Component)]
 struct DepositOutline {
@@ -485,6 +497,7 @@ fn main() {
                     update_selection_panel,
                     update_noot_color,
                     update_trade_overlay,
+                    update_route_overlay,
                     update_deposit_outlines,
                     sync_structure_markers,
                     update_stack_labels,
@@ -611,10 +624,10 @@ fn setup(
 
     commands.spawn((Camera2d, Transform::from_scale(Vec3::splat(init_zoom))));
 
-    // Tiles share one neutral material — difficulty is shown *only* via the
-    // toggleable terrain overlay, so it never fights the crowd-density overlay. Each
-    // tile also gets two hidden overlay cells stacked above it (z 0.4 terrain,
-    // z 1.6 crowd) — the crowd heat sits just under the noot layer (z 2.0).
+    // Tiles share one neutral material — difficulty is shown *only* via the toggleable
+    // terrain overlay. Each tile also gets three hidden heat cells stacked above it
+    // (z 0.4 terrain, z 1.5 routes, z 1.6 trades) — only one shows at a time, and they sit
+    // just under the noot layer (z 2.0).
     let hex_mesh = meshes.add(RegularPolygon::new(hex_size * 0.96, 6));
     let tile_mat = materials.add(Color::srgb(0.18, 0.20, 0.22));
     for tile in &world.tiles {
@@ -648,6 +661,16 @@ fn setup(
             Transform::from_xyz(px, py, 1.6),
             Visibility::Hidden,
             TradeOverlay { tile: idx },
+        ));
+
+        // Movement (route) heat overlay (cyan), recoloured by `update_route_overlay` from
+        // the cumulative traffic heatmap. Same translucent-birth trick as the trade cell.
+        commands.spawn((
+            Mesh2d(hex_mesh.clone()),
+            MeshMaterial2d(materials.add(Color::srgba(0.25, 0.70, 0.95, 0.0))),
+            Transform::from_xyz(px, py, 1.5),
+            Visibility::Hidden,
+            RouteOverlay { tile: idx },
         ));
     }
 
@@ -2080,8 +2103,18 @@ fn overlay_controls(
     mut coloring: ResMut<NootColoring>,
     map_btn: Query<&Interaction, (Changed<Interaction>, With<MapOverlayButton>)>,
     noot_btn: Query<&Interaction, (Changed<Interaction>, With<NootColorButton>)>,
-    mut terrain_cells: Query<&mut Visibility, (With<TerrainOverlay>, Without<TradeOverlay>)>,
-    mut trade_cells: Query<&mut Visibility, (With<TradeOverlay>, Without<TerrainOverlay>)>,
+    mut terrain_cells: Query<
+        &mut Visibility,
+        (With<TerrainOverlay>, Without<TradeOverlay>, Without<RouteOverlay>),
+    >,
+    mut trade_cells: Query<
+        &mut Visibility,
+        (With<TradeOverlay>, Without<TerrainOverlay>, Without<RouteOverlay>),
+    >,
+    mut route_cells: Query<
+        &mut Visibility,
+        (With<RouteOverlay>, Without<TerrainOverlay>, Without<TradeOverlay>),
+    >,
     mut map_bg: Query<&mut BackgroundColor, With<MapOverlayButton>>,
     mut map_label: Query<&mut Text, (With<MapOverlayLabel>, Without<NootColorLabel>)>,
     mut noot_label: Query<&mut Text, (With<NootColorLabel>, Without<MapOverlayLabel>)>,
@@ -2113,6 +2146,9 @@ fn overlay_controls(
     for mut v in &mut trade_cells {
         *v = vis(mode == MapOverlayMode::Trades);
     }
+    for mut v in &mut route_cells {
+        *v = vis(mode == MapOverlayMode::Routes);
+    }
     if let Ok(mut text) = map_label.single_mut() {
         text.0 = mode.label().into();
     }
@@ -2121,6 +2157,7 @@ fn overlay_controls(
             MapOverlayMode::None => BTN_OFF,
             MapOverlayMode::Terrain => TERRAIN_BTN_ON,
             MapOverlayMode::Trades => TRADES_BTN_ON,
+            MapOverlayMode::Routes => ROUTES_BTN_ON,
         };
     }
 }
@@ -2216,6 +2253,37 @@ fn update_trade_overlay(
             let c = stats.trade_hexes.get(cell.tile).copied().unwrap_or(0) as f32;
             let v = (c / max).sqrt();
             m.color = Color::srgba(0.98, 0.80, 0.15, v * 0.9);
+        }
+    }
+}
+
+/// Recolour the movement (route) heat cells from `EconStats::traffic_hexes`, normalised to
+/// the busiest hex. Throttled and gated on the Routes overlay being active, like
+/// `update_trade_overlay`. The `sqrt` gamma lifts the lightly-travelled corridors so the
+/// hauling lanes between deposits and markets read, not just the busiest junction.
+fn update_route_overlay(
+    time: Res<Time>,
+    overlays: Res<Overlays>,
+    stats: Res<EconStats>,
+    mut timer: Local<f32>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    cells: Query<(&RouteOverlay, &MeshMaterial2d<ColorMaterial>)>,
+) {
+    if overlays.map != MapOverlayMode::Routes {
+        return;
+    }
+    *timer += time.delta_secs();
+    if *timer < 0.4 {
+        return;
+    }
+    *timer = 0.0;
+
+    let max = stats.traffic_hexes.iter().copied().max().unwrap_or(0).max(1) as f32;
+    for (cell, mat) in &cells {
+        if let Some(m) = materials.get_mut(&mat.0) {
+            let c = stats.traffic_hexes.get(cell.tile).copied().unwrap_or(0) as f32;
+            let v = (c / max).sqrt();
+            m.color = Color::srgba(0.25, 0.70, 0.95, v * 0.9);
         }
     }
 }
