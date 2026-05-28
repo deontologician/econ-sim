@@ -9,6 +9,7 @@ pub mod economy;
 pub mod elements;
 pub mod goods;
 pub mod hex;
+pub mod history;
 pub mod noot;
 pub mod policy;
 pub mod rng;

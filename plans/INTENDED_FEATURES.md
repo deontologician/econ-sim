@@ -320,13 +320,29 @@ design. Newest first within each section.
 - **NOW**: `EconStats::last_sale_price[item]` holds each resource's most recent clearing
   price (set in `meet_and_trade`, persisted in saves). A **Prices** toggle (button / `P`)
   opens a panel with one auto-scaled sparkline per resource (labelled `<name> ₦<price>`),
-  fed from a `PriceHistory` ring sampled alongside the stats. The series **holds the last
+  fed from a `PriceHistory` rollup sampled alongside the stats (whole-run, persisted — see
+  *Whole-run graph history*). The series **holds the last
   sale price through no-trade spells** — a flat line, never a drop to zero — so a thinly
   traded good still reads its true price. Traces are **colour-coded by role** (green
   staple/food, tan intermediate, gold luxury) and staple labels carry a `*`, so the food
   prices stand out. *(partial — data verified headless; panel render unconfirmed on device)*
 - **INTENDED**: optionally overlay bid/ask or the `ewma_price` band; mark the actual
   trade ticks; a shared y-scale toggle so levels (not just shapes) compare across goods.
+- **STATUS**: partial
+
+### Whole-run graph history (rolled up, persisted)
+- **NOW**: the stat-strip and price graphs are backed by `history::RollupHistory<N>` (a
+  core, gui-free type) instead of a fixed rolling ring. It retains the **entire run** at a
+  bounded bucket count (`HISTORY_CAP`): recent samples stay full-resolution while older
+  ones are progressively averaged into wider buckets (the oldest equal-resolution pair is
+  merged on overflow, weighted by span — roughly power-of-two tiers). Persisted in the
+  save (`Snapshot.stat_history`/`price_history`, `#[serde(default)]`), so reloading brings
+  the graphs back populated with the whole history. Sparklines plot buckets index-spaced,
+  so the rolled-up old end is time-compressed (overview). Verified: serde round-trip +
+  cap/mean rollup tests; old pre-history saves load (empty series); headless writes empty
+  history (it doesn't sample graphs). *(partial — panel render unconfirmed on device)*
+- **INTENDED**: show per-bucket span/time on the axis; a "recent vs whole-run" zoom toggle;
+  keep min/max envelopes (not just the mean) when rolling up.
 - **STATUS**: partial
 
 ### Map overlays (cycled): terrain difficulty + trade density

@@ -16,6 +16,7 @@ use econ_sim::noot::{
 };
 use econ_sim::policy::{ActorCritic, PolicyMemory, Trainer};
 use econ_sim::world::{generate, World};
+use econ_sim::history::RollupHistory;
 use econ_sim::{elements, graph, hex, icon, rng::Rng, save, MapView, Sim, SimRng};
 
 // --- World generation knobs -------------------------------------------------
@@ -72,8 +73,8 @@ const OVERLAY_W: u32 = 380;
 const OVERLAY_H: u32 = 170;
 const SPARK_W: u32 = 104;
 const SPARK_H: u32 = 34;
-/// Rolling history length (samples) and how often (real seconds) a sample is taken.
-const HISTORY_CAP: usize = 480;
+/// How often (real seconds) a graph sample is taken. Retention is whole-run (rolled up
+/// to a bounded size; see `econ_sim::history`).
 const GRAPH_SAMPLE_SECS: f32 = 0.25;
 /// Cell background in the graphs grid: dim when a stat is off the overlay, bright when
 /// it's been tapped into the correlation chart.
@@ -303,18 +304,15 @@ impl Default for Overlays {
     }
 }
 
-/// Rolling history of every graphed stat, oldest → newest, capped at `HISTORY_CAP`.
+/// Whole-run history of every graphed stat (rolled up: recent full-res, older
+/// downsampled), oldest → newest. Persisted across save/reload.
 #[derive(Resource, Default)]
-struct StatHistory {
-    samples: std::collections::VecDeque<[f32; graph::N_SERIES]>,
-}
+struct StatHistory(RollupHistory<{ graph::N_SERIES }>);
 
-/// Rolling history of each resource's last sale price (held through no-trade spells),
-/// oldest → newest, capped at `HISTORY_CAP` — feeds the per-resource price graphs.
+/// Whole-run history of each resource's last sale price (held through no-trade spells),
+/// rolled up like `StatHistory` — feeds the per-resource price graphs.
 #[derive(Resource, Default)]
-struct PriceHistory {
-    samples: std::collections::VecDeque<[f32; goods::N_ITEMS]>,
-}
+struct PriceHistory(RollupHistory<{ goods::N_ITEMS }>);
 
 /// Which stats are currently drawn together on the correlation (overlay) chart.
 #[derive(Resource)]
@@ -556,6 +554,9 @@ fn setup(
             commands.insert_resource(snap.hunger);
             commands.insert_resource(snap.income);
             commands.insert_resource(snap.stats);
+            // Restore the whole-run graph history so the charts come back populated.
+            commands.insert_resource(StatHistory(snap.stat_history));
+            commands.insert_resource(PriceHistory(snap.price_history));
             (snap.world, Some(snap.noots), Some(snap.policy))
         }
         None => {
@@ -1506,15 +1507,8 @@ fn sample_stats(
     s[14] = nn;
     s[15] = stats.gdp_rate;
 
-    hist.samples.push_back(s);
-    while hist.samples.len() > HISTORY_CAP {
-        hist.samples.pop_front();
-    }
-
-    phist.samples.push_back(stats.last_sale_price);
-    while phist.samples.len() > HISTORY_CAP {
-        phist.samples.pop_front();
-    }
+    hist.0.push(s);
+    phist.0.push(stats.last_sale_price);
 }
 
 /// Re-rasterize the chart textures and refresh the per-stat captions / selection tints
@@ -1543,7 +1537,7 @@ fn render_graphs(
 
     // Pull each series into a chronological f32 vector once.
     let cols: Vec<Vec<f32>> = (0..graph::N_SERIES)
-        .map(|i| hist.samples.iter().map(|s| s[i]).collect())
+        .map(|i| hist.0.iter().map(|s| s[i]).collect())
         .collect();
 
     // Strip: redraw each sparkline, refresh its caption (SI-prefixed value) and tint.
@@ -1606,7 +1600,7 @@ fn render_prices(
     // (needs refining), gold = positional luxury, grey = unused.
     let world = &sim.0;
     for item in 0..goods::N_ITEMS {
-        let col: Vec<f32> = phist.samples.iter().map(|s| s[item]).collect();
+        let col: Vec<f32> = phist.0.iter().map(|s| s[item]).collect();
         if let Some(img) = images.get_mut(&assets.price_sparks[item]) {
             graph::render_sparkline(img, &col, role_color(world.goods.role_of(item)));
         }
@@ -1622,7 +1616,7 @@ fn render_prices(
             goods::ItemRole::Staple(_) => "*",
             _ => "",
         };
-        let latest = phist.samples.back().map(|s| s[lbl.item]).unwrap_or(0.0);
+        let latest = phist.0.back().map(|s| s[lbl.item]).unwrap_or(0.0);
         text.0 = format!("{name}{tag} ₦{latest:.1}");
     }
 }
@@ -2002,6 +1996,8 @@ fn save_game(
     income: Res<economy::IncomeControl>,
     stats: Res<EconStats>,
     policy: Res<ActorCritic>,
+    stat_history: Res<StatHistory>,
+    price_history: Res<PriceHistory>,
     noots: Query<(
         &TilePos,
         &Inventory,
@@ -2040,6 +2036,8 @@ fn save_game(
             stats: stats.clone(),
             policy: policy.clone(),
             noots: noot_saves,
+            stat_history: stat_history.0.clone(),
+            price_history: price_history.0.clone(),
         });
         *flash = SAVE_FLASH_SECS;
     }

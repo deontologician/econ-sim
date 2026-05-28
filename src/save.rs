@@ -15,6 +15,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::economy::{EconStats, HungerControl, IncomeControl};
+use crate::goods::N_ITEMS;
+use crate::history::{RollupHistory, N_STAT_SERIES};
 use crate::noot::{Claim, Hunger, Inventory, NootMeta, NootName, TilePos, Trader, Wallet};
 use crate::policy::ActorCritic;
 use crate::world::World;
@@ -55,6 +57,12 @@ pub struct Snapshot {
     #[serde(default)]
     pub policy: ActorCritic,
     pub noots: Vec<NootSave>,
+    /// Whole-run HUD graph history (rolled up). `#[serde(default)]` so pre-history saves
+    /// (and the headless harness, which doesn't sample graphs) load with empty series.
+    #[serde(default)]
+    pub stat_history: RollupHistory<N_STAT_SERIES>,
+    #[serde(default)]
+    pub price_history: RollupHistory<N_ITEMS>,
 }
 
 /// Upgrade a parsed save in place from `from_version` to `from_version + 1`. Called for

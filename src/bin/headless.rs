@@ -252,6 +252,10 @@ fn snapshot(w: &mut World) -> save::Snapshot {
         stats: w.resource::<EconStats>().clone(),
         policy: w.resource::<ActorCritic>().clone(),
         noots,
+        // The headless harness doesn't sample HUD graphs; persist empty history. A GUI
+        // resume of this save simply starts its charts fresh.
+        stat_history: Default::default(),
+        price_history: Default::default(),
     }
 }
 

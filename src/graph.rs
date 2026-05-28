@@ -14,7 +14,9 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 /// The time series tracked, in sample order. Index into a `[f32; N_SERIES]` sample and
 /// into `SERIES` (label, plot colour, unit). "Plus average age" lives at index 13.
-pub const N_SERIES: usize = 16;
+/// Defined in the core `history` module so the (gui-free) save layer can size the
+/// persisted history to match; `SERIES` below is declared with exactly this many entries.
+pub use crate::history::N_STAT_SERIES as N_SERIES;
 
 /// How a series' latest value is rendered as text.
 #[derive(Clone, Copy, PartialEq, Eq)]
