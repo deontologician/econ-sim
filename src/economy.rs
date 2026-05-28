@@ -58,7 +58,7 @@ const OPTION_MAX_TICKS: u32 = 48;
 /// lengthens it). Large versus the critic's natural value scale, so a noot follows the
 /// suggested route by default but can still deviate when an adjacent tile's *learned*
 /// value beats the route by more than this — the GPS suggests, it doesn't command.
-const ROUTE_OPTIMISM: f32 = 8.0;
+const ROUTE_OPTIMISM: f32 = 1.0e6;
 /// Bucks to build a structure (shop or refinery). Both cost the same.
 const SHOP_COST: f32 = 100.0;
 const REFINERY_COST: f32 = 100.0;
