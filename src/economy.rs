@@ -53,6 +53,13 @@ const LOAD_THRESHOLD: f32 = 10.0;
 /// force-terminated and the policy re-decides — bounds a plan that can't reach its goal
 /// (an unminable claimed-away deposit, a market with no buyers) so noots never get stuck.
 const OPTION_MAX_TICKS: u32 = 48;
+/// "GPS optimism": the artificial value bonus added each step to a neighbour that lies on
+/// the greedy route to the committed target (×+1 if it shortens the path, ×−1 if it
+/// lengthens it). Large versus the critic's natural value scale so a noot follows the
+/// route it chose and reliably arrives — it teaches them to move toward a remembered
+/// destination without getting lost — while a much higher-valued neighbour can still pull
+/// it off-route. The route is suggested, not commanded.
+const ROUTE_OPTIMISM: f32 = 20.0;
 /// Bucks to build a structure (shop or refinery). Both cost the same.
 const SHOP_COST: f32 = 100.0;
 const REFINERY_COST: f32 = 100.0;
@@ -731,14 +738,38 @@ fn option_done(
     }
 }
 
-/// One greedy hex step from `(col,row)` toward `target`: the neighbour that most reduces
-/// toroidal hex distance. The map has no impassable tiles, so greedy stepping always
-/// makes progress — no pathfinding needed.
-fn step_toward(world: &crate::world::World, col: i32, row: i32, target: (i32, i32)) -> (i32, i32) {
-    neighbors(col, row, world.cols, world.rows)
-        .into_iter()
-        .min_by_key(|&(c, r)| torus_distance(c, r, target.0, target.1, world.cols, world.rows))
-        .unwrap_or((col, row))
+/// One **GPS-guided** hex step from `(col,row)` toward `target`. The noot scores each
+/// neighbour by the critic's learned value of standing there plus a large
+/// [`ROUTE_OPTIMISM`] bonus for staying on the greedy route (the step that shortens the
+/// toroidal distance), and takes the best. The big route bonus means a noot reliably
+/// heads to the destination it committed to — it doesn't wander off and get lost — while
+/// the learned value still shapes *which* equally-good path it walks and lets it veer when
+/// a neighbouring tile is genuinely much better. It's a GPS that proposes the route and
+/// updates as the noot learns, rather than a rail it's locked onto. The map has no
+/// impassable tiles, so a distance-reducing neighbour always exists.
+fn value_guided_step(
+    world: &crate::world::World,
+    ac: &ActorCritic,
+    o: &[f32; policy::N_OTHER],
+    col: i32,
+    row: i32,
+    target: (i32, i32),
+) -> (i32, i32) {
+    let (cols, rows) = (world.cols, world.rows);
+    let here = torus_distance(col, row, target.0, target.1, cols, rows);
+    let mut best = (col, row);
+    let mut best_score = f32::MIN;
+    for (nc, nr) in neighbors(col, row, cols, rows) {
+        let d = torus_distance(nc, nr, target.0, target.1, cols, rows);
+        let on_route = (here - d) as f32; // +1 closer, 0 sideways, −1 farther
+        let tile = (nr * cols + nc) as usize;
+        let score = ROUTE_OPTIMISM * on_route + ac.value(tile, o);
+        if score > best_score {
+            best_score = score;
+            best = (nc, nr);
+        }
+    }
+    best
 }
 
 /// The learned decision step, over **committed options** rather than primitive steps.
@@ -793,16 +824,19 @@ pub fn policy_step(
             continue;
         }
 
+        // Features at the current tile, recomputed each acting step: they feed both the
+        // option decision (when re-deciding) and the value-guided "GPS" movement below.
+        let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world.cols, world.rows);
+        let (s_pos, s_o) = features(
+            world, &field, &pos, claim, hunger, inv, wallet, trader, &claimed, nearest_noot,
+        );
+
         // Re-decide only at option boundaries: when the committed plan is finished, was
         // never set, or the noot just died (banking one terminal transition).
         let finished = !mem.committed
             || mem.died
             || option_done(mem.last_act, world, claim, inv, mem.plan_ticks);
         if finished {
-            let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world.cols, world.rows);
-            let (s_pos, s_o) = features(
-                world, &field, &pos, claim, hunger, inv, wallet, trader, &claimed, nearest_noot,
-            );
             let u_now = maslow_utility(hunger, inv, wallet, &world.goods);
 
             // Close out the previous option's transition (reward = the ΔU the option
@@ -860,7 +894,7 @@ pub fn policy_step(
                 // it before mining starts next tick). Otherwise step toward it.
                 Some((tc, tr)) if pos.col == tc && pos.row == tr => *action = Action::Mine,
                 Some((tc, tr)) => {
-                    let (nc, nr) = step_toward(world, pos.col, pos.row, (tc, tr));
+                    let (nc, nr) = value_guided_step(world, &ac, &s_o, pos.col, pos.row, (tc, tr));
                     pos.col = nc;
                     pos.row = nr;
                     *action = Action::Move;
@@ -871,7 +905,7 @@ pub fn policy_step(
                 // At the market: linger (Idle, no haul cost) so a passing buyer can trade.
                 Some((tc, tr)) if pos.col == tc && pos.row == tr => *action = Action::Idle,
                 Some((tc, tr)) => {
-                    let (nc, nr) = step_toward(world, pos.col, pos.row, (tc, tr));
+                    let (nc, nr) = value_guided_step(world, &ac, &s_o, pos.col, pos.row, (tc, tr));
                     pos.col = nc;
                     pos.row = nr;
                     *action = Action::Move;
@@ -882,7 +916,7 @@ pub fn policy_step(
                 // Refining happens only inside a refinery — go there, then refine on it.
                 Some((tc, tr)) if pos.col == tc && pos.row == tr => *action = Action::Refine,
                 Some((tc, tr)) => {
-                    let (nc, nr) = step_toward(world, pos.col, pos.row, (tc, tr));
+                    let (nc, nr) = value_guided_step(world, &ac, &s_o, pos.col, pos.row, (tc, tr));
                     pos.col = nc;
                     pos.row = nr;
                     *action = Action::Move;
