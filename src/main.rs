@@ -413,12 +413,21 @@ struct DepositOutline {
     deposit: usize,
 }
 
-/// Map marker for a noot-built structure (a diamond, cyan = shop, orange = refinery),
-/// carrying its `World::structures` index so `sync_structure_markers` can recolour it if
-/// a build-over changes the kind. Structures are created during play, so markers spawn
-/// incrementally rather than all at setup.
+/// The kind-coloured **body** hex of a noot-built structure (cyan = shop, orange =
+/// refinery), carrying its `World::structures` index so `sync_structure_markers` can
+/// recolour it if a build-over changes the kind. Each structure also gets a dark frame hex
+/// (untagged) and a white [`StructureEmblem`] on top. Structures are created during play,
+/// so markers spawn incrementally rather than all at setup.
 #[derive(Component)]
 struct StructureMarker {
+    structure: usize,
+}
+
+/// The white emblem on top of a structure that signals its kind by *shape* — an upward
+/// triangle (shop) or a diamond (refinery) — so the two read apart at a glance, not by
+/// colour alone. `sync_structure_markers` swaps the mesh if a build-over flips the kind.
+#[derive(Component)]
+struct StructureEmblem {
     structure: usize,
 }
 
@@ -2296,10 +2305,31 @@ fn structure_color(kind: econ_sim::world::StructureKind) -> Color {
     }
 }
 
-/// Spawn a diamond marker for any newly-built structure, then recolour all markers by
-/// their structure's current kind (a build-over can change a refinery into a shop or
-/// vice-versa). Structures are append-only in `World::structures`, so a `Local`
-/// high-water mark tracks how many markers we've drawn.
+/// The emblem mesh for a kind: an upward triangle (shop) or a diamond (refinery).
+fn emblem_mesh(kind: econ_sim::world::StructureKind, a: &StructAssets) -> Handle<Mesh> {
+    match kind {
+        econ_sim::world::StructureKind::Shop => a.shop_emblem.clone(),
+        econ_sim::world::StructureKind::Refinery => a.refinery_emblem.clone(),
+    }
+}
+
+/// Shared meshes/materials for structure markers, built once on first run (sizes depend on
+/// `MapView::hex_size`, only known after setup).
+struct StructAssets {
+    frame: Handle<Mesh>,
+    body: Handle<Mesh>,
+    shop_emblem: Handle<Mesh>,
+    refinery_emblem: Handle<Mesh>,
+    frame_mat: Handle<ColorMaterial>,
+    emblem_mat: Handle<ColorMaterial>,
+}
+
+/// Spawn a chonky full-hex marker for any newly-built structure — a dark frame hex, a
+/// kind-coloured body hex filling the tile, and a white kind-shaped emblem — so structures
+/// read clearly apart from the small round noots and the disc-and-icon deposits. Then keep
+/// every marker in sync with its kind (a build-over can flip a refinery into a shop or
+/// vice-versa): recolour the body and swap the emblem shape. Structures are append-only in
+/// `World::structures`, so a `Local` high-water mark tracks how many we've drawn.
 #[allow(clippy::too_many_arguments)]
 fn sync_structure_markers(
     mut commands: Commands,
@@ -2308,29 +2338,56 @@ fn sync_structure_markers(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut spawned: Local<usize>,
-    mut mesh: Local<Option<Handle<Mesh>>>,
-    markers: Query<(&StructureMarker, &MeshMaterial2d<ColorMaterial>)>,
+    mut assets: Local<Option<StructAssets>>,
+    bodies: Query<(&StructureMarker, &MeshMaterial2d<ColorMaterial>)>,
+    mut emblems: Query<(&StructureEmblem, &mut Mesh2d)>,
 ) {
+    let hs = view.hex_size;
+    let a = assets.get_or_insert_with(|| StructAssets {
+        frame: meshes.add(RegularPolygon::new(hs * 0.97, 6)),
+        body: meshes.add(RegularPolygon::new(hs * 0.86, 6)),
+        shop_emblem: meshes.add(RegularPolygon::new(hs * 0.36, 3)),
+        refinery_emblem: meshes.add(RegularPolygon::new(hs * 0.32, 4)),
+        frame_mat: materials.add(Color::srgb(0.06, 0.07, 0.09)),
+        emblem_mat: materials.add(Color::srgba(0.97, 0.98, 1.0, 0.95)),
+    });
     let n = sim.0.structures.len();
-    let m = mesh
-        .get_or_insert_with(|| meshes.add(RegularPolygon::new(view.hex_size * 0.42, 4)))
-        .clone();
     while *spawned < n {
         let s = &sim.0.structures[*spawned];
         let tile = &sim.0.tiles[s.tile];
         let (x, y) = hex::hex_center(tile.col, tile.row, view.hex_size);
+        let (px, py) = (x + view.offset.x, y + view.offset.y);
+        // Frame (z 0.98) → body (z 1.0) → emblem (z 1.06); all under the noot layer (2.0)
+        // so a noot visiting the shop still draws on top.
         commands.spawn((
-            Mesh2d(m.clone()),
+            Mesh2d(a.frame.clone()),
+            MeshMaterial2d(a.frame_mat.clone()),
+            Transform::from_xyz(px, py, 0.98),
+        ));
+        commands.spawn((
+            Mesh2d(a.body.clone()),
             MeshMaterial2d(materials.add(structure_color(s.kind))),
-            Transform::from_xyz(x + view.offset.x, y + view.offset.y, 1.0),
+            Transform::from_xyz(px, py, 1.0),
             StructureMarker { structure: *spawned },
+        ));
+        commands.spawn((
+            Mesh2d(emblem_mesh(s.kind, a)),
+            MeshMaterial2d(a.emblem_mat.clone()),
+            Transform::from_xyz(px, py, 1.06),
+            StructureEmblem { structure: *spawned },
         ));
         *spawned += 1;
     }
-    // Keep colours in sync with kinds (cheap — few structures).
-    for (marker, mat_handle) in &markers {
+    // Keep bodies/emblems in sync with kinds (cheap — few structures).
+    for (marker, mat_handle) in &bodies {
         if let Some(mat) = materials.get_mut(&mat_handle.0) {
             mat.color = structure_color(sim.0.structures[marker.structure].kind);
+        }
+    }
+    for (emblem, mut mesh2d) in &mut emblems {
+        let want = emblem_mesh(sim.0.structures[emblem.structure].kind, a);
+        if mesh2d.0 != want {
+            mesh2d.0 = want;
         }
     }
 }
