@@ -59,7 +59,7 @@ const OPTION_MAX_TICKS: u32 = 48;
 /// better by more than this — its load sold, hunger spiking, a deposit freed up. Large
 /// enough that routine logit noise never triggers a switch; an option still runs to its
 /// natural end (`option_done`) when nothing better appears.
-const COMMITMENT_BONUS: f32 = 1.0e6;
+const COMMITMENT_BONUS: f32 = 3.0;
 /// Bucks to build a structure (shop or refinery). Both cost the same.
 const SHOP_COST: f32 = 100.0;
 const REFINERY_COST: f32 = 100.0;
