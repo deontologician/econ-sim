@@ -134,29 +134,35 @@ design. Newest first within each section.
   the nearest unclaimed, deposit and extract a load), **Sell** (haul to the nearest shop,
   else the best market, and linger to trade), **Refine** (go to a refinery and convert
   intermediates there), **Explore** (scout), and **BuildShop**/**BuildRefinery** (claim a
-  hex, above). A
-  deterministic executor drives the chosen option to completion (greedy hex navigation —
-  no pathfinding needed on the impassable-free torus) and the policy only re-decides at
-  option boundaries, where **one transition** is recorded (reward = the ΔU the option
-  accrued). This is what makes the long produce→haul→sell chain learnable: the policy
-  never has to crack navigation as a sparse-reward subtask, so directed behaviour
-  replaces per-step dithering, and the Mine option's value bootstraps from the later
-  Sell/eat reward — **no production-shaping bonus needed** (see below). The state mixes an
+  hex, above). An
+  executor drives the chosen option to completion and the policy only re-decides at option
+  boundaries, where **one transition** is recorded (reward = the ΔU the option accrued).
+  This is what makes the long produce→haul→sell chain learnable: the policy never has to
+  crack navigation as a sparse-reward subtask, so directed behaviour replaces per-step
+  dithering, and the Mine option's value bootstraps from the later Sell/eat reward — **no
+  production-shaping bonus needed** (see below). **Movement is value-guided ("GPS",
+  `value_guided_step`)**: each step the executor scores the six neighbours by the critic's
+  learned value plus a large `ROUTE_OPTIMISM` bonus for the greedy route to the committed
+  target, and takes the best — so a noot reliably reaches the destination it remembers
+  choosing (it doesn't wander off and get lost) while the learned value shapes the path and
+  can veer it toward a clearly better tile. The state mixes an
   absolute position embedding with position-invariant cues: bucks/hunger/positional/
   ownership, an *on-minable* flag, the local **terrain difficulty**, and six-way
   *direction gradients* toward the target deposit, the nearest other noot, and the best
-  market for the carried cargo (these still inform option *value*; the executor navigates
-  by them). **Trading is automatic** — any nearby pair clears a mutually-beneficial trade,
+  market for the carried cargo (these inform option *value*; movement is value-guided as
+  above). **Trading is automatic** — any nearby pair clears a mutually-beneficial trade,
   gated by each noot's learned `discount`/reservation thresholds (no explicit Trade
   action). Reward = Δ of a Maslow-tiered utility (physiological ≫ safety ≫ esteem, with a
   softened tier gate). Trained A2C-style (several minibatches/frame) from a shared replay
   buffer with a slow target critic; one brain persists across deaths and saves. Headless
-  (60k ticks): structured mine/haul/sell/refine behaviour, consumption ~3.1k, ~86–94% of
-  trades pooling into the busiest 5% of hexes (emergent marketplaces), deaths regulated.
+  (180k ticks, GPS movement): production and consumption climb monotonically
+  (prod ~4.6k→12.8k, cons ~2.7k→7.5k), trade flows, all deposits worked, deaths regulated —
+  on par with the old deterministic router's growth while movement is now learned/flexible.
   *(partial)*
 - **INTENDED**: the option set is approximate (one-step TD on variable-length options,
   ignoring option length in the discount); richer relative/local state (observed
-  prices/inventories, who's nearby); reward/entropy/lr tuning; on-device validation.
+  prices/inventories, who's nearby); reward/entropy/lr tuning; tune `ROUTE_OPTIMISM`
+  (lower = more deviation/flexibility, higher = stricter routing) on-device.
 - **STATUS**: partial
 
 ### Production reward-shaping & guided exploration *(retired)*

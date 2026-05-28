@@ -26,9 +26,12 @@ use crate::rng::Rng;
 /// the noot's owned deposit), haul to a shop and sell, go to a refinery and refine, scout,
 /// or build a shop / refinery — before the policy decides again. A noot owns at most one
 /// improved hex (its deposit, shop, or refinery), so options like Mine/Build gate on what
-/// it already owns. This keeps the long produce→haul→sell chain learnable: the policy only
-/// picks *which intent is worthwhile here*, never how to navigate (deterministic). Trading
-/// itself is automatic on proximity (not an option) — see `meet_and_trade`.
+/// it already owns. This keeps the long produce→haul→sell chain learnable: the policy
+/// picks *which intent is worthwhile here*; the executor then walks there with a
+/// value-guided "GPS" step (a large route-optimism bonus plus the critic's learned value —
+/// `economy::value_guided_step`), so a noot reliably reaches the goal it remembers
+/// choosing while the learned value still shapes the path. Trading itself is automatic on
+/// proximity (not an option) — see `meet_and_trade`.
 pub const A_MINE: usize = 0;
 pub const A_SELL: usize = 1;
 pub const A_REFINE: usize = 2;
@@ -38,8 +41,9 @@ pub const A_BUILD_SHOP: usize = 4;
 /// Build a refinery (the only place refining happens) — likewise claims the hex.
 pub const A_BUILD_REFINERY: usize = 5;
 pub const N_ACT: usize = 6;
-/// Hex move directions — still the width of the engineered *heading* features below
-/// (the executor navigates by these), even though they are no longer policy actions.
+/// Hex move directions — the width of the engineered *heading* features below and of the
+/// neighbour set the value-guided executor scores each step, even though a single
+/// direction is not itself a policy action.
 pub const N_DIRS: usize = 6;
 
 /// Non-positional state features (position is a separate embedding lookup). Layout:
