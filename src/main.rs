@@ -2371,8 +2371,10 @@ fn update_road_overlay(
     let road = &sim.0.road;
     for (cell, mat) in &cells {
         if let Some(m) = materials.get_mut(&mat.0) {
-            let level = road.get(cell.tile).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            m.color = Color::srgba(0.80, 0.62, 0.32, level.sqrt() * 0.9);
+            // Show the *effective* road (the quadratic strength gameplay uses), so the
+            // overlay reads as bright corridors over bare ground, not a uniform wash.
+            let s = econ_sim::economy::road_strength(road.get(cell.tile).copied().unwrap_or(0.0));
+            m.color = Color::srgba(0.80, 0.62, 0.32, s * 0.9);
         }
     }
 }

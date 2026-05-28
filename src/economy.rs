@@ -234,6 +234,12 @@ pub struct EconStats {
     /// persists across saves.
     #[serde(default)]
     pub traffic_hexes: Vec<u32>,
+    /// Per-tile recency cache of the last few **distinct** noots to traverse it (entity
+    /// index + tick), used to gate road-laying on `> 2` distinct recent traversers so a
+    /// lone noot pacing its own route never wears a road — only genuinely shared corridors
+    /// do. Transient (`serde(skip)`): rebuilds within `ROAD_DISTINCT_WINDOW` ticks of a load.
+    #[serde(skip)]
+    road_seen: Vec<[(u64, u64); 3]>,
     // Accumulators for the in-progress rate window.
     produced_window: f32,
     consumed_window: f32,
@@ -430,27 +436,73 @@ const CARRY_HUNGER_K: f32 = 1.6;
 // and pull the value-guided step toward them. The deposit→relief→pull loop is positive
 // feedback: a lightly-used shortcut attracts more traffic, which strengthens it, until a
 // few corridors carry most movement and unused ground fades back to wilderness.
-/// Saturation cap / normaliser for a tile's road strength (so `road ∈ [0, 1]`).
+/// Saturation cap for a tile's raw accumulated **wear** (`World::road ∈ [0, ROAD_MAX]`).
 const ROAD_MAX: f32 = 1.0;
-/// Road laid down on a tile each time a noot steps into it. Small on purpose: a single
+/// Wear laid down on a tile each time a noot steps into it. Small on purpose: a single
 /// pass barely registers, so a road only emerges where noots travel the same ground over
 /// and over — and given how thinly noot traffic spreads, even a busy lane builds up slowly.
-const ROAD_DEPOSIT: f32 = 0.025;
-/// Per-tick exponential decay of every tile's road (~690-tick half-life). Slow, so a road
+const ROAD_DEPOSIT: f32 = 0.05;
+/// Per-tick exponential decay of every tile's wear (~690-tick half-life). Slow, so a road
 /// reflects sustained travel over a long window and lingers once earned — but still fades
 /// if a corridor is abandoned, keeping the network honest.
 const ROAD_DECAY: f32 = 0.999;
+/// Wear below which a tile is bare ground (no road at all) and above which it is a fully
+/// formed road. Between them, [`road_strength`] ramps **quadratically** — slow at first,
+/// then shooting up — so casual criss-crossing leaves no road while a lane that earns
+/// sustained traffic tips over into a real, full-strength road. Tuned near the wear the
+/// busiest lanes actually reach so they do tip over.
+const ROAD_WEAR_LO: f32 = 0.04;
+const ROAD_WEAR_FULL: f32 = 0.22;
+
+/// A tile's **effective road strength** in `[0, 1]` from its raw accumulated `wear`: a
+/// quadratic ramp between [`ROAD_WEAR_LO`] and [`ROAD_WEAR_FULL`]. Quadratic so the curve
+/// is flat near the threshold (a little traffic does almost nothing) and steep near the
+/// top (a well-used lane shoots up to a full road) — and so the diffuse low-wear wash is
+/// squashed toward zero, leaving a few bright corridors rather than a uniform smear. This
+/// is what the travel-cost relief, the movement pull, and the overlay all read.
+pub fn road_strength(wear: f32) -> f32 {
+    let t = ((wear - ROAD_WEAR_LO) / (ROAD_WEAR_FULL - ROAD_WEAR_LO)).clamp(0.0, 1.0);
+    t * t
+}
+
 /// Fraction of the movement surcharge (terrain + carry) a fully-formed road removes — the
 /// "dramatically cheaper on roads" payoff that makes basins worth forming.
 const ROAD_RELIEF: f32 = 0.85;
-/// How hard a neighbouring tile's road pulls the value-guided step toward it. Kept below
-/// [`ROUTE_OPTIMISM`] so a noot never sacrifices forward progress for a road, but high
-/// enough to decide *which* of several equally-progressing hexes it takes — that
+/// How hard a fully-formed neighbouring road pulls the value-guided step toward it. Kept
+/// below [`ROUTE_OPTIMISM`] so a noot never sacrifices forward progress for a road, but
+/// high enough to decide *which* of several equally-progressing hexes it takes — that
 /// tie-breaking is what funnels parallel paths onto a shared lane.
 const ROAD_PULL: f32 = 12.0;
 /// How hard rough terrain pushes the value-guided step away from a neighbouring tile, so
 /// noots prefer easy ground (where roads also form) when it costs no progress.
 const TERRAIN_PUSH: f32 = 6.0;
+/// Only lay road on a tile that **> 2 distinct** noots have crossed within this many ticks.
+/// A single noot shuttling its own deposit→market route never wears a road by itself; it
+/// takes several noots converging on the same ground — which is what makes a road a *shared*
+/// corridor and stops every individual path from smearing the map.
+const ROAD_DISTINCT_WINDOW: u64 = 600;
+const ROAD_MIN_DISTINCT: usize = 3;
+/// Empty-slot sentinel in the per-tile recency cache (`u32::MAX` is never a live entity).
+const ROAD_SEEN_EMPTY: u64 = u64::MAX;
+
+/// Record that noot `id` crossed a tile at tick `now`, keeping up to three distinct recent
+/// traversers (evicting the stalest), and report whether the tile currently has more than
+/// two distinct recent traversers — i.e. whether it should accrue road this step.
+fn note_traverser(slots: &mut [(u64, u64); 3], id: u64, now: u64) -> bool {
+    for s in slots.iter_mut() {
+        if s.0 != ROAD_SEEN_EMPTY && now.saturating_sub(s.1) > ROAD_DISTINCT_WINDOW {
+            *s = (ROAD_SEEN_EMPTY, 0);
+        }
+    }
+    if let Some(s) = slots.iter_mut().find(|s| s.0 == id) {
+        s.1 = now;
+    } else if let Some(s) = slots.iter_mut().find(|s| s.0 == ROAD_SEEN_EMPTY) {
+        *s = (id, now);
+    } else if let Some(s) = slots.iter_mut().min_by_key(|s| s.1) {
+        *s = (id, now); // all three full & recent → a fourth distinct noot, replace stalest
+    }
+    slots.iter().filter(|s| s.0 != ROAD_SEEN_EMPTY).count() >= ROAD_MIN_DISTINCT
+}
 
 pub fn hunger_tick(
     ctrl: Res<HungerControl>,
@@ -471,7 +523,7 @@ pub fn hunger_tick(
         };
         // A road on this tile dramatically cheapens the movement surcharge (terrain + carry)
         // — the payoff that makes worn corridors worth following over raw ground.
-        let road = world.road.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        let road = road_strength(world.road.get(idx).copied().unwrap_or(0.0));
         let surcharge = (HUNGER_TERRAIN_K * difficulty + carry) * (1.0 - ROAD_RELIEF * road);
         let d = base * (1.0 + surcharge);
         for a in &mut h.staple {
@@ -816,7 +868,7 @@ fn value_guided_step(
         let d = torus_distance(nc, nr, target.0, target.1, cols, rows);
         let on_route = (here - d) as f32; // +1 closer, 0 sideways, −1 farther
         let tile = (nr * cols + nc) as usize;
-        let road = world.road.get(tile).copied().unwrap_or(0.0);
+        let road = road_strength(world.road.get(tile).copied().unwrap_or(0.0));
         let diff = world.tiles[tile].difficulty.clamp(0.0, 1.0);
         let score = ROUTE_OPTIMISM * on_route + ROAD_PULL * road - TERRAIN_PUSH * diff
             + ac.value(tile, o);
@@ -832,19 +884,25 @@ fn value_guided_step(
 /// writer of `TilePos` during a move), so Bevy's `Changed` filter yields exactly this tick's
 /// steps — lingering at a deposit or market (no `TilePos` write) doesn't accumulate, so the
 /// picture favours the travelled corridors over the endpoints. Each tick the whole road
-/// field decays exponentially; each step both bumps the all-time `traffic_hexes` counter and
-/// deposits fresh road on the entered tile (capped at [`ROAD_MAX`]). See
-/// `EconStats::traffic_hexes` (cumulative, for the overlay) and `World::road` (decaying, the
-/// gameplay field that cheapens travel and pulls the value-guided step).
+/// field decays exponentially; each step bumps the all-time `traffic_hexes` counter, and —
+/// only when **more than two distinct** noots have crossed the tile within
+/// `ROAD_DISTINCT_WINDOW` (so one noot's own shuttle never wears a road) — deposits fresh
+/// road on it. See `EconStats::traffic_hexes` (cumulative, for the Routes overlay) and
+/// `World::road` (decaying wear, fed through `road_strength` for the gameplay field).
 pub fn accumulate_traffic(
     mut sim: ResMut<Sim>,
-    moved: Query<&TilePos, Changed<TilePos>>,
+    moved: Query<(Entity, &TilePos), Changed<TilePos>>,
     mut stats: ResMut<EconStats>,
 ) {
     let world = &mut sim.0;
     let n_tiles = (world.cols * world.rows) as usize;
+    let now = stats.ticks;
+    let stats = &mut *stats;
     if stats.traffic_hexes.len() != n_tiles {
         stats.traffic_hexes = vec![0; n_tiles];
+    }
+    if stats.road_seen.len() != n_tiles {
+        stats.road_seen = vec![[(ROAD_SEEN_EMPTY, 0); 3]; n_tiles];
     }
     if world.road.len() != n_tiles {
         world.road = vec![0.0; n_tiles];
@@ -853,13 +911,17 @@ pub fn accumulate_traffic(
         *r *= ROAD_DECAY;
     }
     let cols = world.cols;
-    for pos in &moved {
+    for (e, pos) in &moved {
         let tile = (pos.row * cols + pos.col) as usize;
         if let Some(c) = stats.traffic_hexes.get_mut(tile) {
             *c += 1;
         }
-        if let Some(r) = world.road.get_mut(tile) {
-            *r = (*r + ROAD_DEPOSIT).min(ROAD_MAX);
+        // Lay road only on shared corridors: a tile must see > 2 distinct recent traversers.
+        if let (Some(slots), Some(r)) = (stats.road_seen.get_mut(tile), world.road.get_mut(tile))
+        {
+            if note_traverser(slots, e.to_bits(), now) {
+                *r = (*r + ROAD_DEPOSIT).min(ROAD_MAX);
+            }
         }
     }
 }
