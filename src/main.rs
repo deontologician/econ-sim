@@ -11,8 +11,8 @@ use econ_sim::economy::{self, EconStats, HungerControl};
 use econ_sim::goods::{self, GoodForm};
 use econ_sim::movement::{self, tile_to_pixel};
 use econ_sim::noot::{
-    Action, Claim, Hunger, Inventory, Noot, NootMeta, TilePos, Trader, Wallet, EXPLORE_MAX,
-    EXPLORE_MIN, STARTING_BUCKS,
+    Action, Claim, Hunger, Inventory, Noot, NootMeta, NootName, TilePos, Trader, Wallet,
+    EXPLORE_MAX, EXPLORE_MIN, STARTING_BUCKS,
 };
 use econ_sim::policy::{ActorCritic, PolicyMemory, Trainer};
 use econ_sim::world::{generate, World};
@@ -747,6 +747,7 @@ fn setup(
                 };
                 spawn_restored_noot(
                     &mut commands,
+                    &mut sim_rng,
                     noot_mesh.clone(),
                     materials.add(color),
                     ns,
@@ -783,11 +784,18 @@ fn setup(
 /// (transient RL cache) carrying the saved exploration ε.
 fn spawn_restored_noot(
     commands: &mut Commands,
+    rng: &mut Rng,
     mesh: Handle<Mesh>,
     material: Handle<ColorMaterial>,
     ns: save::NootSave,
     pixel: Vec2,
 ) {
+    // A pre-names save loads unnamed; give those a fresh name on resume.
+    let name = if ns.name.is_unnamed() {
+        NootName::random(rng)
+    } else {
+        ns.name
+    };
     commands.spawn((
         Mesh2d(mesh),
         MeshMaterial2d(material),
@@ -797,6 +805,7 @@ fn spawn_restored_noot(
         ns.claim,
         ns.trader,
         ns.meta,
+        name,
         ns.pos,
         ns.inv,
         ns.wallet,
@@ -832,6 +841,7 @@ fn spawn_noot(
         Claim::new(claim),
         Trader::new(),
         NootMeta::new(),
+        NootName::random(rng),
         TilePos { col, row },
         Inventory::new(),
         Wallet {
@@ -2000,6 +2010,7 @@ fn save_game(
         &Claim,
         &Trader,
         &NootMeta,
+        &NootName,
         &PolicyMemory,
     )>,
     mut flash: Local<f32>,
@@ -2009,7 +2020,7 @@ fn save_game(
     if keys.just_pressed(KeyCode::KeyS) || button.iter().any(|i| *i == Interaction::Pressed) {
         let noot_saves = noots
             .iter()
-            .map(|(pos, inv, wal, hun, claim, trader, meta, mem)| save::NootSave {
+            .map(|(pos, inv, wal, hun, claim, trader, meta, name, mem)| save::NootSave {
                 pos: *pos,
                 inv: inv.clone(),
                 wallet: wal.clone(),
@@ -2017,6 +2028,7 @@ fn save_game(
                 claim: claim.clone(),
                 trader: trader.clone(),
                 meta: meta.clone(),
+                name: name.clone(),
                 explore: mem.explore,
             })
             .collect();
@@ -2461,6 +2473,7 @@ fn update_selection_panel(
         &PolicyMemory,
         &NootMeta,
         &Action,
+        &NootName,
     )>,
     mut panel: Query<&mut Text, With<SelectionText>>,
 ) {
@@ -2479,7 +2492,7 @@ fn update_selection_panel(
         };
         return;
     };
-    let Ok((claim, trader, wallet, hunger, inv, mem, meta, action)) = noots.get(entity) else {
+    let Ok((claim, trader, wallet, hunger, inv, mem, meta, action, name)) = noots.get(entity) else {
         text.0 = hint.into();
         return;
     };
@@ -2512,7 +2525,8 @@ fn update_selection_panel(
 
     let utility = economy::maslow_utility(hunger, inv, wallet, &world.goods);
     let mut out = format!(
-        "[selected] noot — {}   action {}   skill {:.2}×   discount {:.2}   explore {:.2}   ₦{:.0}   hunger {:.1}   utility {:.2}\n",
+        "[selected] {} — {}   action {}   skill {:.2}×   discount {:.2}   explore {:.2}   ₦{:.0}   hunger {:.1}   utility {:.2}\n",
+        name.display(),
         claim_label,
         act,
         economy::skill_factor(meta.experience),

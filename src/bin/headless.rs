@@ -29,8 +29,8 @@ use bevy::prelude::*;
 use econ_sim::economy::{self, EconStats, HungerControl, IncomeControl};
 use econ_sim::goods::ItemRole;
 use econ_sim::noot::{
-    Action, Claim, Hunger, Inventory, NootMeta, Noot, TilePos, Trader, Wallet, EXPLORE_MAX,
-    EXPLORE_MIN, STARTING_BUCKS,
+    Action, Claim, Hunger, Inventory, NootMeta, NootName, Noot, TilePos, Trader, Wallet,
+    EXPLORE_MAX, EXPLORE_MIN, STARTING_BUCKS,
 };
 use econ_sim::policy::{ActorCritic, PolicyMemory, Trainer};
 use econ_sim::rng::Rng;
@@ -138,12 +138,18 @@ fn main() {
     match restore_noots {
         Some(noots) => {
             for ns in noots {
+                let name = if ns.name.is_unnamed() {
+                    NootName::random(&mut rng)
+                } else {
+                    ns.name
+                };
                 w.spawn((
                     Noot,
                     Action::default(),
                     ns.claim,
                     ns.trader,
                     ns.meta,
+                    name,
                     ns.pos,
                     ns.inv,
                     ns.wallet,
@@ -162,6 +168,7 @@ fn main() {
                     Claim::new(None),
                     Trader::new(),
                     NootMeta::new(),
+                    NootName::random(&mut rng),
                     TilePos { col, row },
                     Inventory::new(),
                     Wallet {
@@ -220,11 +227,12 @@ fn snapshot(w: &mut World) -> save::Snapshot {
         &Claim,
         &Trader,
         &NootMeta,
+        &NootName,
         &PolicyMemory,
     )>();
     let noots = q
         .iter(w)
-        .map(|(pos, inv, wal, hun, claim, trader, meta, mem)| save::NootSave {
+        .map(|(pos, inv, wal, hun, claim, trader, meta, name, mem)| save::NootSave {
             pos: *pos,
             inv: inv.clone(),
             wallet: wal.clone(),
@@ -232,6 +240,7 @@ fn snapshot(w: &mut World) -> save::Snapshot {
             claim: claim.clone(),
             trader: trader.clone(),
             meta: meta.clone(),
+            name: name.clone(),
             explore: mem.explore,
         })
         .collect();

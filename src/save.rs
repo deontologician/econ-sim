@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::economy::{EconStats, HungerControl, IncomeControl};
-use crate::noot::{Claim, Hunger, Inventory, NootMeta, TilePos, Trader, Wallet};
+use crate::noot::{Claim, Hunger, Inventory, NootMeta, NootName, TilePos, Trader, Wallet};
 use crate::policy::ActorCritic;
 use crate::world::World;
 
@@ -35,6 +35,10 @@ pub struct NootSave {
     pub trader: Trader,
     pub meta: NootMeta,
     pub explore: f32,
+    /// Persistent name + incarnation. `#[serde(default)]` so a pre-names save loads with
+    /// an unnamed placeholder, which the spawner then replaces with a fresh random name.
+    #[serde(default)]
+    pub name: NootName,
 }
 
 /// A complete simulation snapshot: the world, the controllers/stats, the shared

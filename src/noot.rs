@@ -87,6 +87,103 @@ impl Default for NootMeta {
     }
 }
 
+/// A noot's persistent identity: a randomly generated first + last name (like
+/// "Tim Dorphindel") kept for the life of the entity, plus an incarnation counter bumped
+/// each rebirth. Unlike the rest of a noot's state, the name **survives death** — only
+/// `incarnation` advances, so the same noot returns as "Tim Dorphindel the 2nd", "the
+/// 3rd", and so on.
+#[derive(Component, Clone, Serialize, Deserialize, Default)]
+pub struct NootName {
+    pub first: String,
+    pub last: String,
+    /// 1 on the first life; +1 on each reincarnation. 0 marks a not-yet-named noot
+    /// (e.g. a pre-names save), which the spawner replaces with a fresh random name.
+    #[serde(default)]
+    pub incarnation: u32,
+}
+
+impl NootName {
+    pub fn random(rng: &mut Rng) -> Self {
+        Self {
+            first: random_first(rng),
+            last: random_last(rng),
+            incarnation: 1,
+        }
+    }
+
+    /// True for the `Default` placeholder (no name assigned yet).
+    pub fn is_unnamed(&self) -> bool {
+        self.incarnation == 0 || self.first.is_empty()
+    }
+
+    /// Note a rebirth: the same name returns one incarnation later.
+    pub fn reincarnate(&mut self) {
+        self.incarnation += 1;
+    }
+
+    /// "First Last" on the first life, "First Last the Nth" after reincarnating.
+    pub fn display(&self) -> String {
+        if self.incarnation > 1 {
+            format!("{} {} the {}", self.first, self.last, ordinal(self.incarnation))
+        } else {
+            format!("{} {}", self.first, self.last)
+        }
+    }
+}
+
+/// English ordinal: 1→"1st", 2→"2nd", 3→"3rd", 11→"11th", 22→"22nd", ...
+fn ordinal(n: u32) -> String {
+    let suffix = if (11..=13).contains(&(n % 100)) {
+        "th"
+    } else {
+        match n % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        }
+    };
+    format!("{n}{suffix}")
+}
+
+/// A short, mostly-human first name.
+const FIRST_NAMES: &[&str] = &[
+    "Tim", "Bex", "Otho", "Mara", "Pim", "Gus", "Edda", "Ren", "Vera", "Cob", "Nim", "Sable",
+    "Hal", "Juno", "Wim", "Tilda", "Bram", "Lux", "Odette", "Finn", "Greta", "Moss", "Pippa",
+    "Quill", "Roan", "Sten", "Una", "Vance", "Wren", "Yara", "Zeb", "Ada", "Bo", "Clem", "Doro",
+];
+
+/// Last-name syllables assembled into fantasy surnames like "Dorphindel".
+const LAST_STARTS: &[&str] = &[
+    "Dor", "Bran", "Thal", "Mor", "Fen", "Gal", "Wyn", "Cor", "Drav", "El", "Hal", "Kor", "Lor",
+    "Mal", "Nor", "Quil", "Ran", "Syl", "Tor", "Vel", "Wren", "Zor", "Brim", "Cael", "Grim",
+];
+const LAST_MIDS: &[&str] = &[
+    "phin", "an", "or", "il", "wyn", "ad", "en", "oth", "ar", "el", "und", "ish", "av", "om", "in",
+];
+const LAST_ENDS: &[&str] = &[
+    "del", "dor", "wyn", "ar", "ius", "eth", "ow", "fell", "gard", "more", "ven", "wick", "rim",
+    "den", "vale", "ric", "burn", "field", "thorn", "mere",
+];
+
+fn pick<'a>(rng: &mut Rng, xs: &[&'a str]) -> &'a str {
+    xs[rng.below(xs.len())]
+}
+
+fn random_first(rng: &mut Rng) -> String {
+    pick(rng, FIRST_NAMES).to_string()
+}
+
+fn random_last(rng: &mut Rng) -> String {
+    let mut s = String::from(pick(rng, LAST_STARTS));
+    // Roughly half the surnames carry a middle syllable, for length variety.
+    if rng.chance(0.5) {
+        s.push_str(pick(rng, LAST_MIDS));
+    }
+    s.push_str(pick(rng, LAST_ENDS));
+    s
+}
+
 /// Generic hex ownership: the one improved tile a noot owns — a deposit it mines, or a
 /// shop/refinery it built or adopted. At most one per noot. Sticky until death, when it
 /// abandons (the deposit reopens; a structure stands for another noot to take or rebuild).

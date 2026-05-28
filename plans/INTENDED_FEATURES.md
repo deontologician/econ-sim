@@ -210,6 +210,18 @@ design. Newest first within each section.
   a fixed roster.
 - **STATUS**: partial
 
+### Noot names & reincarnation
+- **NOW**: every noot carries a persistent `NootName` — a randomly generated first +
+  last name (short first like "Tim"/"Lux"; fantasy surname assembled from syllables like
+  "Dorphindel"/"Korgard") assigned at spawn. The name **survives death**: on rebirth only
+  the `incarnation` counter advances, so the followed-noot panel reads "Lux Korgard the
+  5th". Persisted in saves (`#[serde(default)]` so pre-names saves load and get fresh
+  names). Verified headless: incarnations climb (seen 1→6 over 60k ticks), save/load
+  round-trips names + counts. *(partial — panel render unconfirmed on device)*
+- **INTENDED**: surface names elsewhere (map labels, trade/death log); family/lineage
+  names on inheritance; richer/seeded name pools.
+- **STATUS**: partial
+
 ### Movement learning (RL)
 - **NOW**: folded into the shared actor-critic (see *Action selection*). The old
   per-hex TD(λ) field (`RouteMemory`) is gone; the actor **directly emits one of the six

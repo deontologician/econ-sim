@@ -986,12 +986,13 @@ pub fn death_and_respawn(
         &mut PolicyMemory,
         &mut Trader,
         &mut NootMeta,
+        &mut NootName,
         &mut Claim,
         &mut TilePos,
     )>,
 ) {
     let world = &sim.0;
-    for (mut hunger, mut inv, mut wallet, mut mem, mut trader, mut meta, mut claim, mut pos) in
+    for (mut hunger, mut inv, mut wallet, mut mem, mut trader, mut meta, mut name, mut claim, mut pos) in
         &mut q
     {
         if hunger.fully_starving() {
@@ -1015,6 +1016,8 @@ pub fn death_and_respawn(
         mem.plan_ticks = 0;
         *trader = Trader::new();
         *meta = NootMeta::new();
+        // The name persists across death; only the incarnation advances ("the 2nd", ...).
+        name.reincarnate();
         // Abandon the owned hex: a deposit reopens; a structure stands for another to take.
         claim.hex = None;
         pos.col = rng.0.below(world.cols as usize) as i32;
