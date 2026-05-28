@@ -53,13 +53,6 @@ const LOAD_THRESHOLD: f32 = 10.0;
 /// force-terminated and the policy re-decides — bounds a plan that can't reach its goal
 /// (an unminable claimed-away deposit, a market with no buyers) so noots never get stuck.
 const OPTION_MAX_TICKS: u32 = 48;
-/// "GPS optimism": the bonus added to the *currently committed* option's logit when the
-/// policy re-evaluates each step. It keeps a noot following its chosen route (so it
-/// doesn't dither hex-to-hex) yet lets it switch the moment a different option is clearly
-/// better by more than this — its load sold, hunger spiking, a deposit freed up. Large
-/// enough that routine logit noise never triggers a switch; an option still runs to its
-/// natural end (`option_done`) when nothing better appears.
-const COMMITMENT_BONUS: f32 = 3.0;
 /// Bucks to build a structure (shop or refinery). Both cost the same.
 const SHOP_COST: f32 = 100.0;
 const REFINERY_COST: f32 = 100.0;
@@ -800,47 +793,23 @@ pub fn policy_step(
             continue;
         }
 
-        // Re-evaluate the goal EVERY acting step, GPS-style. The committed option is a
-        // "live route" while it remains valid and unfinished; a noot keeps following it by
-        // default (a `COMMITMENT_BONUS` on its logit), but re-checks each step whether a
-        // different option has become clearly better — recalculating its destination.
-        let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world.cols, world.rows);
-        let (s_pos, s_o) = features(
-            world, &field, &pos, claim, hunger, inv, wallet, trader, &claimed, nearest_noot,
-        );
-        let mask = option_mask(world, claim, inv, wallet, free_deposit, any_refinery);
-        let committed_live = mem.committed
-            && !mem.died
-            && mask[mem.last_act]
-            && !option_done(mem.last_act, world, claim, inv, mem.plan_ticks);
-
-        let act = if committed_live {
-            // Mid-route: greedily keep the (optimism-boosted) committed option unless
-            // another decisively outscores it. Deterministic, so no hex-to-hex dithering.
-            let mut logits = ac.logits(s_pos, &s_o);
-            logits[mem.last_act] += COMMITMENT_BONUS;
-            (0..N_ACT)
-                .filter(|&a| mask[a])
-                .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
-                .unwrap_or(mem.last_act)
-        } else if rng.0.chance(mem.explore) {
-            // No live route (fresh, just died, or the option ran its course): explore...
-            let valid: Vec<usize> = (0..N_ACT).filter(|&a| mask[a]).collect();
-            valid[rng.0.below(valid.len())]
-        } else {
-            // ...or sample the policy. (ε-exploration only fires at these real boundaries,
-            // not every step, so the decision cadence matches the committed-option design.)
-            let logits = ac.logits(s_pos, &s_o);
-            let probs = policy::masked_softmax(&logits, &mask);
-            policy::sample(&probs, &mut rng.0)
-        };
-
-        // A fresh commitment forms when the route ended/was invalid, or we chose to switch.
-        if !committed_live || act != mem.last_act {
+        // Re-decide only at option boundaries: when the committed plan is finished, was
+        // never set, or the noot just died (banking one terminal transition).
+        let finished = !mem.committed
+            || mem.died
+            || option_done(mem.last_act, world, claim, inv, mem.plan_ticks);
+        if finished {
+            let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world.cols, world.rows);
+            let (s_pos, s_o) = features(
+                world, &field, &pos, claim, hunger, inv, wallet, trader, &claimed, nearest_noot,
+            );
             let u_now = maslow_utility(hunger, inv, wallet, &world.goods);
-            // Close out the option that just ended (reward = the ΔU it accrued over its
-            // run, or a death penalty). Variable-length options keep the long
-            // produce→haul→sell chain learnable from this bare ΔU alone.
+
+            // Close out the previous option's transition (reward = the ΔU the option
+            // accrued, or a death penalty). Committed options make the long
+            // produce→haul→sell chain learnable from this bare ΔU alone — the Mine
+            // option's value bootstraps from the later Sell/eat reward — so no
+            // production shaping bonus is needed.
             if mem.has_prev {
                 let (r, done) = if mem.died {
                     (-DEATH_PENALTY, true)
@@ -859,6 +828,20 @@ pub fn policy_step(
                 });
             }
             mem.died = false;
+
+            // Pick the next option: masked softmax, or an ε-chance uniform random option
+            // (the per-noot exploration temperament). Uniform ε samples each valid option
+            // often, so no extra bias is needed to discover producing or building.
+            let mask = option_mask(world, claim, inv, wallet, free_deposit, any_refinery);
+            let act = if rng.0.chance(mem.explore) {
+                let valid: Vec<usize> = (0..N_ACT).filter(|&a| mask[a]).collect();
+                valid[rng.0.below(valid.len())]
+            } else {
+                let logits = ac.logits(s_pos, &s_o);
+                let probs = policy::masked_softmax(&logits, &mask);
+                policy::sample(&probs, &mut rng.0)
+            };
+
             mem.last_pos = s_pos;
             mem.last_o = s_o;
             mem.last_mask = mask;
