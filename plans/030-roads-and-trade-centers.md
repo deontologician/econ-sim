@@ -17,8 +17,12 @@ everyone funnels to it. Travel was nearly free, so distance didn't gate it.
 ### Roads (`World::road`, a decaying field)
 - A per-tile `road ∈ [0,1]`, serialized with the world (`#[serde(default)]`, lazily resized).
 - `accumulate_traffic` (right after `policy_step`): decays the whole field each tick
-  (`ROAD_DECAY = 0.997`, ~230-tick half-life) and deposits `ROAD_DEPOSIT = 0.10` on every
-  tile a noot steps into (capped at 1).
+  (`ROAD_DECAY = 0.999`, ~690-tick half-life) and deposits `ROAD_DEPOSIT = 0.025` on every
+  tile a noot steps into (capped at 1). The small deposit + slow decay mean a road only
+  forms from sustained, repeated travel (and then lingers) — not from one noot passing
+  through. Trade-off: since noot traffic is thinly spread, hard-earned roads are also faint
+  (busiest lanes peak ~0.2); making them few-but-bright needs a stronger `ROAD_PULL` to
+  concentrate traffic, which risks detours/instability — deferred for on-device tuning.
 - `hunger_tick`: a tile's road cuts the movement surcharge (terrain + carry) by up to
   `ROAD_RELIEF = 0.85` — the "dramatically cheaper on roads" payoff.
 - `value_guided_step`: each step adds `ROAD_PULL · road − TERRAIN_PUSH · difficulty` to the

@@ -432,11 +432,14 @@ const CARRY_HUNGER_K: f32 = 1.6;
 // few corridors carry most movement and unused ground fades back to wilderness.
 /// Saturation cap / normaliser for a tile's road strength (so `road ∈ [0, 1]`).
 const ROAD_MAX: f32 = 1.0;
-/// Road laid down on a tile each time a noot steps into it.
-const ROAD_DEPOSIT: f32 = 0.10;
-/// Per-tick exponential decay of every tile's road (≈230-tick half-life), so a corridor
-/// must keep earning its traffic or it reverts to wilderness.
-const ROAD_DECAY: f32 = 0.997;
+/// Road laid down on a tile each time a noot steps into it. Small on purpose: a single
+/// pass barely registers, so a road only emerges where noots travel the same ground over
+/// and over — and given how thinly noot traffic spreads, even a busy lane builds up slowly.
+const ROAD_DEPOSIT: f32 = 0.025;
+/// Per-tick exponential decay of every tile's road (~690-tick half-life). Slow, so a road
+/// reflects sustained travel over a long window and lingers once earned — but still fades
+/// if a corridor is abandoned, keeping the network honest.
+const ROAD_DECAY: f32 = 0.999;
 /// Fraction of the movement surcharge (terrain + carry) a fully-formed road removes — the
 /// "dramatically cheaper on roads" payoff that makes basins worth forming.
 const ROAD_RELIEF: f32 = 0.85;
