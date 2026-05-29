@@ -86,7 +86,6 @@ const VALUE_BTN_ON: Color = Color::srgba(0.62, 0.22, 0.16, 0.9);
 const TERRAIN_BTN_ON: Color = Color::srgba(0.20, 0.45, 0.30, 0.9);
 const TRADES_BTN_ON: Color = Color::srgba(0.70, 0.55, 0.12, 0.9);
 const ROUTES_BTN_ON: Color = Color::srgba(0.18, 0.42, 0.62, 0.9);
-const ROADS_BTN_ON: Color = Color::srgba(0.55, 0.40, 0.20, 0.9);
 /// Confirmation tint + how long (real seconds) the Save button flashes after a save.
 const SAVE_FLASH_COLOR: Color = Color::srgba(0.20, 0.55, 0.30, 0.95);
 const SAVE_FLASH_SECS: f32 = 1.0;
@@ -251,7 +250,6 @@ enum MapOverlayMode {
     Terrain,
     Trades,
     Routes,
-    Roads,
 }
 
 impl MapOverlayMode {
@@ -260,8 +258,7 @@ impl MapOverlayMode {
             Self::None => Self::Terrain,
             Self::Terrain => Self::Trades,
             Self::Trades => Self::Routes,
-            Self::Routes => Self::Roads,
-            Self::Roads => Self::None,
+            Self::Routes => Self::None,
         }
     }
 
@@ -271,7 +268,6 @@ impl MapOverlayMode {
             Self::Terrain => "Overlay: terrain",
             Self::Trades => "Overlay: trades",
             Self::Routes => "Overlay: routes",
-            Self::Roads => "Overlay: roads",
         }
     }
 }
@@ -411,12 +407,12 @@ struct RouteOverlay {
     tile: usize,
 }
 
-/// Per-hex heat cell for the live **road** overlay (`tile` is `row * cols + col`);
-/// recoloured from the decaying `World::road` field — the current desire-path network,
-/// as distinct from `RouteOverlay`'s all-time cumulative traffic.
+/// One drawn road segment (a thin quad between two adjacent hex centres), recoloured from
+/// the canonical `World::road_edges[edge]` wear. Drawn permanently on the map (not a
+/// toggle), under the noot layer — a literal road network rather than a tinted-cell overlay.
 #[derive(Component)]
-struct RoadOverlay {
-    tile: usize,
+struct RoadEdge {
+    edge: usize,
 }
 
 /// Ring drawn around a deposit while it is claimed.
@@ -519,7 +515,7 @@ fn main() {
                     update_noot_color,
                     update_trade_overlay,
                     update_route_overlay,
-                    update_road_overlay,
+                    update_roads,
                     update_deposit_outlines,
                     sync_structure_markers,
                     update_stack_labels,
@@ -695,15 +691,42 @@ fn setup(
             RouteOverlay { tile: idx },
         ));
 
-        // Live road overlay (tan), recoloured by `update_road_overlay` from the decaying
-        // `World::road` field — the current desire-path network.
-        commands.spawn((
-            Mesh2d(hex_mesh.clone()),
-            MeshMaterial2d(materials.add(Color::srgba(0.80, 0.62, 0.32, 0.0))),
-            Transform::from_xyz(px, py, 1.45),
-            Visibility::Hidden,
-            RoadOverlay { tile: idx },
-        ));
+    }
+
+    // Permanent road network: one thin quad per drawable edge, between the two hex centres,
+    // recoloured by `update_roads` from the canonical `World::road_edges` wear. All six
+    // neighbours are equidistant, so the segments share one mesh and differ only by
+    // transform. Drawn under the noot layer (z 0.5); seam-wrapping edges are skipped (their
+    // endpoints are on opposite sides of the map, so a straight segment would be wrong).
+    let edge_len = hex::SQRT3 * hex_size;
+    let seg_mesh = meshes.add(Rectangle::new(edge_len, hex_size * 0.22));
+    for tile in &world.tiles {
+        let a = (tile.row * world.cols + tile.col) as usize;
+        let (ax, ay) = hex::hex_center(tile.col, tile.row, hex_size);
+        for (dir, (nc, nr)) in hex::neighbors(tile.col, tile.row, world.cols, world.rows)
+            .into_iter()
+            .enumerate()
+        {
+            let edge = econ_sim::economy::edge_id(tile.col, tile.row, dir, world.cols, world.rows);
+            // Draw each undirected edge once, from its canonical side.
+            if a * 6 + dir != edge {
+                continue;
+            }
+            let (bx, by) = hex::hex_center(nc, nr, hex_size);
+            // Skip seam wraps: real neighbours are exactly `edge_len` apart.
+            if ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt() > edge_len * 1.5 {
+                continue;
+            }
+            let (mx, my) = ((ax + bx) * 0.5 + offset.x, (ay + by) * 0.5 + offset.y);
+            let angle = (by - ay).atan2(bx - ax);
+            commands.spawn((
+                Mesh2d(seg_mesh.clone()),
+                MeshMaterial2d(materials.add(Color::srgba(0.78, 0.60, 0.30, 0.0))),
+                Transform::from_xyz(mx, my, 0.5).with_rotation(Quat::from_rotation_z(angle)),
+                Visibility::Hidden,
+                RoadEdge { edge },
+            ));
+        }
     }
 
     // Deposit markers: a dark backing disc carrying the element's thematic icon,
@@ -2137,39 +2160,15 @@ fn overlay_controls(
     noot_btn: Query<&Interaction, (Changed<Interaction>, With<NootColorButton>)>,
     mut terrain_cells: Query<
         &mut Visibility,
-        (
-            With<TerrainOverlay>,
-            Without<TradeOverlay>,
-            Without<RouteOverlay>,
-            Without<RoadOverlay>,
-        ),
+        (With<TerrainOverlay>, Without<TradeOverlay>, Without<RouteOverlay>),
     >,
     mut trade_cells: Query<
         &mut Visibility,
-        (
-            With<TradeOverlay>,
-            Without<TerrainOverlay>,
-            Without<RouteOverlay>,
-            Without<RoadOverlay>,
-        ),
+        (With<TradeOverlay>, Without<TerrainOverlay>, Without<RouteOverlay>),
     >,
     mut route_cells: Query<
         &mut Visibility,
-        (
-            With<RouteOverlay>,
-            Without<TerrainOverlay>,
-            Without<TradeOverlay>,
-            Without<RoadOverlay>,
-        ),
-    >,
-    mut road_cells: Query<
-        &mut Visibility,
-        (
-            With<RoadOverlay>,
-            Without<TerrainOverlay>,
-            Without<TradeOverlay>,
-            Without<RouteOverlay>,
-        ),
+        (With<RouteOverlay>, Without<TerrainOverlay>, Without<TradeOverlay>),
     >,
     mut map_bg: Query<&mut BackgroundColor, With<MapOverlayButton>>,
     mut map_label: Query<&mut Text, (With<MapOverlayLabel>, Without<NootColorLabel>)>,
@@ -2205,9 +2204,6 @@ fn overlay_controls(
     for mut v in &mut route_cells {
         *v = vis(mode == MapOverlayMode::Routes);
     }
-    for mut v in &mut road_cells {
-        *v = vis(mode == MapOverlayMode::Roads);
-    }
     if let Ok(mut text) = map_label.single_mut() {
         text.0 = mode.label().into();
     }
@@ -2217,7 +2213,6 @@ fn overlay_controls(
             MapOverlayMode::Terrain => TERRAIN_BTN_ON,
             MapOverlayMode::Trades => TRADES_BTN_ON,
             MapOverlayMode::Routes => ROUTES_BTN_ON,
-            MapOverlayMode::Roads => ROADS_BTN_ON,
         };
     }
 }
@@ -2348,33 +2343,33 @@ fn update_route_overlay(
     }
 }
 
-/// Recolour the live road heat cells from the decaying `World::road` field (already in
-/// `[0, 1]`). Throttled and gated on the Roads overlay, like the others. The `sqrt` gamma
-/// lifts faint paths so a forming basin shows before it saturates.
-fn update_road_overlay(
+/// Recolour the permanent road segments from `World::road_edges` (via the quadratic
+/// `road_strength`, so faint trails stay invisible and full roads read solid). Always on —
+/// roads are a real map feature, not a toggle — and throttled; a segment hides entirely
+/// below a small strength so bare ground shows no line.
+fn update_roads(
     time: Res<Time>,
-    overlays: Res<Overlays>,
     sim: Res<Sim>,
     mut timer: Local<f32>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    cells: Query<(&RoadOverlay, &MeshMaterial2d<ColorMaterial>)>,
+    mut segments: Query<(&RoadEdge, &MeshMaterial2d<ColorMaterial>, &mut Visibility)>,
 ) {
-    if overlays.map != MapOverlayMode::Roads {
-        return;
-    }
     *timer += time.delta_secs();
     if *timer < 0.4 {
         return;
     }
     *timer = 0.0;
 
-    let road = &sim.0.road;
-    for (cell, mat) in &cells {
+    let edges = &sim.0.road_edges;
+    for (seg, mat, mut vis) in &mut segments {
+        let s = econ_sim::economy::road_strength(edges.get(seg.edge).copied().unwrap_or(0.0));
+        *vis = if s > 0.02 {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
         if let Some(m) = materials.get_mut(&mat.0) {
-            // Show the *effective* road (the quadratic strength gameplay uses), so the
-            // overlay reads as bright corridors over bare ground, not a uniform wash.
-            let s = econ_sim::economy::road_strength(road.get(cell.tile).copied().unwrap_or(0.0));
-            m.color = Color::srgba(0.80, 0.62, 0.32, s * 0.9);
+            m.color = Color::srgba(0.78, 0.60, 0.30, 0.25 + 0.7 * s);
         }
     }
 }

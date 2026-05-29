@@ -115,15 +115,14 @@ pub struct World {
     /// Noot-built structures (shops and refineries), created during play.
     #[serde(default)]
     pub structures: Vec<Structure>,
-    /// Per-tile **road strength** in `[0, 1]` (indexed `row * cols + col`), a decaying
-    /// "desire-path" field: every noot step deposits a little on the tile it enters and the
-    /// whole field decays exponentially each tick, so well-trodden corridors stay bright and
-    /// abandoned ones fade. Roads cut the movement cost on their tile and pull the
-    /// value-guided step toward them, so traffic self-reinforces into basins. Sized to the
-    /// map; `#[serde(default)]` + lazy resizing in `accumulate_traffic` keeps pre-road saves
-    /// loading (empty → rebuilt on first tick).
+    /// Decaying **road wear per edge** (a road is the link between two cells, not a cell):
+    /// flat-indexed `tile * 6 + dir` where `dir` indexes [`crate::hex::neighbors`]; the two
+    /// half-edges of a link share one **canonical** slot (see `economy::edge_id`). Crossing
+    /// an edge wears it in, the field decays each tick, and roads cheapen travel along that
+    /// edge and pull the value-guided step across it. Sized `tiles*6`; `#[serde(default)]` +
+    /// lazy resizing in `accumulate_traffic` keep pre-edge saves loading (empty → rebuilt).
     #[serde(default)]
-    pub road: Vec<f32>,
+    pub road_edges: Vec<f32>,
 }
 
 impl World {
@@ -297,7 +296,7 @@ pub fn generate(seed: u64, cols: i32, rows: i32, hex_size: f32) -> World {
     let world_goods = goods::assign(&mut rng);
 
     let tiles = generate_terrain(&mut rng, cols, rows);
-    let road = vec![0.0; tiles.len()];
+    let road_edges = vec![0.0; tiles.len() * 6];
     let mut world = World {
         seed,
         cols,
@@ -308,7 +307,7 @@ pub fn generate(seed: u64, cols: i32, rows: i32, hex_size: f32) -> World {
         deposits: Vec::new(),
         goods: world_goods,
         structures: Vec::new(),
-        road,
+        road_edges,
     };
     place_deposits(&mut rng, &mut world);
     world

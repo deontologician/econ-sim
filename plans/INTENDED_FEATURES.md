@@ -169,22 +169,25 @@ design. Newest first within each section.
 - **STATUS**: partial
 
 ### Roads (decaying desire-paths) & multi-centre trade
-- **NOW**: a per-tile **`World::road`** field in `[0,1]` (serialized): every noot step
-  deposits a little on the entered tile, the whole field decays exponentially each tick
-  (`accumulate_traffic`), roads cut the movement-cost surcharge by up to `ROAD_RELIEF`
-  (`hunger_tick`), and the value-guided step is pulled toward them. The deposit→relief→pull
-  loop is positive feedback, so traffic self-reinforces into worn corridors that fade if
-  abandoned — rendered live by the **Roads** map overlay (distinct from the cumulative
-  **Routes** overlay). To stop all trade bunching on one hub, travel was made costlier
-  (`CARRY_HUNGER_K` 0.6→1.6, `MARKET_DIST_PENALTY` 3→8) and a **`SHOP_RANGE`** gate added so
-  a noot sells at a *local* market rather than trekking to a far shop — bounding each shop's
-  catchment so several centres coexist. Headless (80k, 3 seeds): the busiest trade tile
-  drops from ~82% to ~44-57% of trades (2-3 centres), consumption holds/improves, roads form
-  (~27% of tiles, peaks ~0.4). *(partial)*
+- **NOW**: per-**edge** road wear (**`World::road_edges`**, flat `tile*6+dir`, canonical slot
+  per link; serialized). Crossing an edge wears it in (`accumulate_traffic`, via each noot's
+  `last_tile`), but only when **>2 distinct** noots cross *that edge* within a window, so lone
+  shuttles don't wear roads. Wear decays **linearly** each tick (slow, persistent), and the
+  **effective** strength is a **quadratic** ramp of wear (flat span: slow build, not a
+  switch). Roads cut the crossed-edge's movement surcharge up to `ROAD_RELIEF` (`hunger_tick`,
+  via `last_edge_road`) and pull the value-guided step *across* the edge with `ROAD_PULL = 26`
+  — set between `ROUTE_OPTIMISM` and `2×` it, so a noot merges sideways onto a full road and
+  rides it but won't go backwards (leaves when it curves away). Roads are drawn **permanently**
+  as line segments between hex centres (`RoadEdge`/`update_roads`), not a toggle. To curb trade
+  bunching, travel was made costlier (`CARRY_HUNGER_K` 0.6→1.6, `MARKET_DIST_PENALTY` 3→8) and
+  a **`SHOP_RANGE`** gate sends a noot to a *local* market rather than a far shop. Headless
+  (100-150k, 3 seeds): a selective network (~10-20 segments, 5-8 full), economy healthy, roads
+  persist across saves. *(partial)*
 - **INTENDED**: roads vs. multiple centres are in tension (roads are winner-take-all);
   landed ~2-3 centres, not a clean 4-5. `SHOP_RANGE` is the dial (lower = more/smaller
   centres + softer roads). Wants on-device tuning of the road constants
-  (`ROAD_DEPOSIT`/`ROAD_DECAY`/`ROAD_PULL`/`ROAD_RELIEF`) and the catchment, and ideally a
+  (`ROAD_DEPOSIT`/`ROAD_DECAY`/`ROAD_PULL`/`ROAD_RELIEF`/`ROAD_WEAR_FULL`) and the catchment,
+  and ideally a
   cost-to-go (not greedy) router so roads can justify real detours, not just tie-breaks.
 - **STATUS**: partial
 

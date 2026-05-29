@@ -14,37 +14,42 @@ everyone funnels to it. Travel was nearly free, so distance didn't gate it.
 
 ## What shipped
 
-### Roads (`World::road` = decaying *wear*, fed through a quadratic strength)
-- A per-tile raw **wear** ∈ `[0, ROAD_MAX]`, serialized with the world (`#[serde(default)]`,
-  lazily resized). `accumulate_traffic` (right after `policy_step`) decays the whole field
-  each tick by a flat **linear** amount (`ROAD_DECAY = 0.00005` subtracted, not a fraction —
-  so a full road persists ~20k ticks of disuse before fading, with a clean survive-or-fade
-  threshold) and deposits `ROAD_DEPOSIT = 0.05`
-  on a tile **only when > 2 distinct noots have crossed it within `ROAD_DISTINCT_WINDOW`
-  (600) ticks** — tracked by a small per-tile recency cache (`EconStats::road_seen`,
-  transient). A lone noot shuttling its own route never qualifies, so only genuinely shared
-  corridors wear in; that gate (not a tiny deposit) is what makes roads selective.
+### Roads (`World::road_edges` = per-**edge** decaying wear, fed through a quadratic strength)
+- A road is the **link between two cells**, not a cell. Wear is stored per edge
+  (`World::road_edges`, flat `tile*6 + dir`; the two half-edges share one **canonical** slot
+  via `economy::edge_id`), serialized with the world (`#[serde(default)]`, lazily resized).
+  `accumulate_traffic` (right after `policy_step`) compares each noot's tile to last tick's
+  (`PolicyMemory::last_tile`); an adjacent change is a step across that edge. It decays every
+  edge each tick by a flat **linear** amount (`ROAD_DECAY = 0.00005` subtracted — full road
+  persists ~20k ticks of disuse, clean survive-or-fade threshold) and deposits
+  `ROAD_DEPOSIT = 0.05` on the crossed edge **only when > 2 distinct noots have crossed *that
+  edge* within `ROAD_DISTINCT_WINDOW` (600) ticks** (per-edge recency cache
+  `EconStats::road_seen`, transient). A lone noot shuttling its own route never qualifies, so
+  only genuinely shared links wear in.
 - **Effective strength is quadratic in wear** (`road_strength`): `((wear − LO)/(FULL − LO))²`
   with `LO = 0.04`, `FULL = 0.7`. Quadratic so the low-wear wash is squashed toward zero,
   and the span is *wide* so a road brightens gradually over a lot of sustained travel rather
-  than snapping to full — a slow build, not a switch. Because mid-build roads stay dim, the
-  pull stays gentle, which keeps trade from funnelling onto one hub (top trade tile ~35-48%,
-  vs ~82-95% with a steep ramp). Travel-cost relief, the movement pull, and the overlay all
-  read this.
-- `hunger_tick`: strength cuts the movement surcharge (terrain + carry) by up to
-  `ROAD_RELIEF = 0.85` — the "dramatically cheaper on roads" payoff.
-- `value_guided_step`: adds `ROAD_PULL · strength − TERRAIN_PUSH · difficulty`. `ROAD_PULL =
-  26` sits **between** `ROUTE_OPTIMISM = 20` and `2×` it: above 20, so a noot steps *sideways
-  onto* a full road, giving up a hex of straight progress because riding is cheaper (instead
-  of trudging the bare ground beside it); below 40, so it won't step *backwards* for a road,
-  which is what makes it leave once the road curves away from its goal — "merge on, ride,
-  get off at the end." Scaled by strength, so only well-formed roads earn the detour. (Pull
-  is local/adjacent only; attracting toward a *distant* road would need a cost-to-go field.)
-- Result (80-150k, 3 seeds): roads form on only **1-5% of tiles** but those reach **full
-  strength** — a few bright corridors, not a smear. Trade-off: bright roads are
-  winner-take-all, so they pull trade back toward one hub (top trade tile 43-95%), partly
-  undoing the `SHOP_RANGE` dispersal — the two goals (one-hub-vs-many-centres and strong
-  roads) genuinely tension.
+  than snapping to full — a slow build, not a switch. Travel-cost relief, the movement pull,
+  and the road rendering all read this.
+- `hunger_tick`: the strength of the **edge just crossed** (cached on
+  `PolicyMemory::last_edge_road`, since `hunger_tick` runs before the move) cuts the movement
+  surcharge (terrain + carry) by up to `ROAD_RELIEF = 0.85` — the "dramatically cheaper on
+  roads" payoff for *riding* a road, not standing on a cell.
+- `value_guided_step`: adds `ROAD_PULL · strength(edge) − TERRAIN_PUSH · difficulty`, where
+  the road term is the **edge** to that neighbour. `ROAD_PULL = 26` sits **between**
+  `ROUTE_OPTIMISM = 20` and `2×` it: above 20, so a noot steps *sideways onto* a full road,
+  giving up a hex of straight progress because riding is cheaper (instead of trudging the
+  bare ground beside it); below 40, so it won't step *backwards* for a road, which is what
+  makes it leave once the road curves away — "merge on, ride, get off at the end." (Pull is
+  local/adjacent only; attracting toward a *distant* road would need a cost-to-go field.)
+- **Rendering**: roads are drawn **permanently** on the map (`update_roads`, no toggle) as
+  thin line segments between hex centres (`RoadEdge`, one shared mesh, per-edge transform),
+  opacity ∝ strength, hidden below a small threshold; seam-wrapping edges aren't drawn. The
+  old per-cell Roads *overlay* was removed; Terrain/Trades/Routes overlays remain.
+- Result (100-150k, 3 seeds): a selective network of **~10-20 road segments (5-8 full)**,
+  economy healthy (cons ~4.9-6.7k; 0xBEEF low ~1.6k as always), roads persist across saves.
+  Trade-off: strong roads are winner-take-all and can pull trade toward one hub (top trade
+  tile 50-94%) — the one-hub-vs-many-centres and strong-roads goals genuinely tension.
 
 ### Higher travel cost + multi-centre dispersal
 - `CARRY_HUNGER_K` 0.6 → **1.6**: hauling a full load hurts much more. The hunger PID

@@ -463,6 +463,12 @@ pub struct PolicyMemory {
     /// Steps left before the committed option is force-terminated, so a plan that can't
     /// reach its goal (e.g. a market with no buyers) can't run forever.
     pub plan_ticks: u32,
+    /// Last tile this noot occupied, so the road system can tell which **edge** it just
+    /// crossed (roads are links between cells). `None` until its first observed move.
+    pub last_tile: Option<usize>,
+    /// Strength of the road edge the noot most recently traversed, cached so `hunger_tick`
+    /// (which runs before the move) can discount this tick's travel by the road it's on.
+    pub last_edge_road: f32,
 }
 
 impl PolicyMemory {
@@ -480,6 +486,8 @@ impl PolicyMemory {
             committed: false,
             plan_target: None,
             plan_ticks: 0,
+            last_tile: None,
+            last_edge_road: 0.0,
         }
     }
 }

@@ -510,14 +510,30 @@ fn note_traverser(slots: &mut [(u64, u64); 3], id: u64, now: u64) -> bool {
     slots.iter().filter(|s| s.0 != ROAD_SEEN_EMPTY).count() >= ROAD_MIN_DISTINCT
 }
 
+/// Opposite of a hex direction index — `+3` around the six-neighbour ring. Holds for both
+/// row parities in [`crate::hex::neighbors`], so it always points back at the source tile.
+fn opposite_dir(d: usize) -> usize {
+    (d + 3) % 6
+}
+
+/// Flat **canonical** id of the undirected edge leaving `(col,row)` toward neighbour `d`.
+/// Both half-edges — `(this, d)` and `(neighbour, d+3)` — collapse to the same slot, so a
+/// road link is stored, gated and drawn once. Index into `World::road_edges` (`len tiles*6`).
+pub fn edge_id(col: i32, row: i32, d: usize, cols: i32, rows: i32) -> usize {
+    let (nc, nr) = neighbors(col, row, cols, rows)[d];
+    let here = (row * cols + col) as usize * 6 + d;
+    let there = (nr * cols + nc) as usize * 6 + opposite_dir(d);
+    here.min(there)
+}
+
 pub fn hunger_tick(
     ctrl: Res<HungerControl>,
     sim: Res<Sim>,
-    mut q: Query<(&TilePos, &Action, &Inventory, &mut Hunger)>,
+    mut q: Query<(&TilePos, &Action, &Inventory, &PolicyMemory, &mut Hunger)>,
 ) {
     let base = ctrl.rate * TICK_DT;
     let world = &sim.0;
-    for (pos, action, inv, mut h) in &mut q {
+    for (pos, action, inv, mem, mut h) in &mut q {
         let idx = (pos.row * world.cols + pos.col) as usize;
         let difficulty = world.tiles[idx].difficulty.clamp(0.0, 1.0);
         // Carrying weighs on a noot only while it's actually hauling (a Move tick).
@@ -527,10 +543,10 @@ pub fn hunger_tick(
         } else {
             0.0
         };
-        // A road on this tile dramatically cheapens the movement surcharge (terrain + carry)
-        // — the payoff that makes worn corridors worth following over raw ground.
-        let road = road_strength(world.road.get(idx).copied().unwrap_or(0.0));
-        let surcharge = (HUNGER_TERRAIN_K * difficulty + carry) * (1.0 - ROAD_RELIEF * road);
+        // The road edge the noot most recently crossed dramatically cheapens the movement
+        // surcharge (terrain + carry) — the payoff that makes riding worn corridors worth it.
+        let surcharge =
+            (HUNGER_TERRAIN_K * difficulty + carry) * (1.0 - ROAD_RELIEF * mem.last_edge_road);
         let d = base * (1.0 + surcharge);
         for a in &mut h.staple {
             *a = (*a + d).min(STAPLE_SATIATION);
@@ -870,11 +886,13 @@ fn value_guided_step(
     let here = torus_distance(col, row, target.0, target.1, cols, rows);
     let mut best = (col, row);
     let mut best_score = f32::MIN;
-    for (nc, nr) in neighbors(col, row, cols, rows) {
-        let d = torus_distance(nc, nr, target.0, target.1, cols, rows);
-        let on_route = (here - d) as f32; // +1 closer, 0 sideways, −1 farther
+    for (dir, (nc, nr)) in neighbors(col, row, cols, rows).into_iter().enumerate() {
+        let dist = torus_distance(nc, nr, target.0, target.1, cols, rows);
+        let on_route = (here - dist) as f32; // +1 closer, 0 sideways, −1 farther
         let tile = (nr * cols + nc) as usize;
-        let road = road_strength(world.road.get(tile).copied().unwrap_or(0.0));
+        // Road pull is on the *edge* we'd cross to reach this neighbour, not the tile.
+        let edge = edge_id(col, row, dir, cols, rows);
+        let road = road_strength(world.road_edges.get(edge).copied().unwrap_or(0.0));
         let diff = world.tiles[tile].difficulty.clamp(0.0, 1.0);
         let score = ROUTE_OPTIMISM * on_route + ROAD_PULL * road - TERRAIN_PUSH * diff
             + ac.value(tile, o);
@@ -886,49 +904,66 @@ fn value_guided_step(
     best
 }
 
-/// Paint the movement heatmap and lay/decay roads. Runs right after `policy_step` (the only
-/// writer of `TilePos` during a move), so Bevy's `Changed` filter yields exactly this tick's
-/// steps — lingering at a deposit or market (no `TilePos` write) doesn't accumulate, so the
-/// picture favours the travelled corridors over the endpoints. Each tick the whole road
-/// field decays exponentially; each step bumps the all-time `traffic_hexes` counter, and —
-/// only when **more than two distinct** noots have crossed the tile within
-/// `ROAD_DISTINCT_WINDOW` (so one noot's own shuttle never wears a road) — deposits fresh
-/// road on it. See `EconStats::traffic_hexes` (cumulative, for the Routes overlay) and
-/// `World::road` (decaying wear, fed through `road_strength` for the gameplay field).
+/// Paint the movement heatmap and lay/decay roads, per **edge**. Runs right after
+/// `policy_step` (the only writer of `TilePos`), comparing each noot's tile to the one it
+/// held last tick: an adjacent change is a step across that edge. Each tick the whole road
+/// field decays linearly; a step bumps the all-time `traffic_hexes` counter and — only when
+/// **more than two distinct** noots have crossed that edge within `ROAD_DISTINCT_WINDOW` (so
+/// one noot's own shuttle never wears a road) — deposits wear on the edge's canonical slot.
+/// It also caches the crossed edge's strength on the noot for `hunger_tick`'s travel relief.
+/// See `EconStats::traffic_hexes` (cumulative, Routes overlay) and `World::road_edges`.
 pub fn accumulate_traffic(
     mut sim: ResMut<Sim>,
-    moved: Query<(Entity, &TilePos), Changed<TilePos>>,
+    mut movers: Query<(Entity, &TilePos, &mut PolicyMemory)>,
     mut stats: ResMut<EconStats>,
 ) {
     let world = &mut sim.0;
-    let n_tiles = (world.cols * world.rows) as usize;
+    let (cols, rows) = (world.cols, world.rows);
+    let n_tiles = (cols * rows) as usize;
+    let n_edges = n_tiles * 6;
     let now = stats.ticks;
     let stats = &mut *stats;
     if stats.traffic_hexes.len() != n_tiles {
         stats.traffic_hexes = vec![0; n_tiles];
     }
-    if stats.road_seen.len() != n_tiles {
-        stats.road_seen = vec![[(ROAD_SEEN_EMPTY, 0); 3]; n_tiles];
+    if stats.road_seen.len() != n_edges {
+        stats.road_seen = vec![[(ROAD_SEEN_EMPTY, 0); 3]; n_edges];
     }
-    if world.road.len() != n_tiles {
-        world.road = vec![0.0; n_tiles];
+    if world.road_edges.len() != n_edges {
+        world.road_edges = vec![0.0; n_edges];
     }
-    for r in world.road.iter_mut() {
+    for r in world.road_edges.iter_mut() {
         *r = (*r - ROAD_DECAY).max(0.0);
     }
-    let cols = world.cols;
-    for (e, pos) in &moved {
-        let tile = (pos.row * cols + pos.col) as usize;
-        if let Some(c) = stats.traffic_hexes.get_mut(tile) {
-            *c += 1;
-        }
-        // Lay road only on shared corridors: a tile must see > 2 distinct recent traversers.
-        if let (Some(slots), Some(r)) = (stats.road_seen.get_mut(tile), world.road.get_mut(tile))
-        {
-            if note_traverser(slots, e.to_bits(), now) {
-                *r = (*r + ROAD_DEPOSIT).min(ROAD_MAX);
+    for (e, pos, mut mem) in &mut movers {
+        let cur = (pos.row * cols + pos.col) as usize;
+        let mut edge_road = 0.0;
+        if let Some(prev) = mem.last_tile {
+            // A one-hex move means `cur` is one of `prev`'s neighbours; anything else is a
+            // respawn teleport, which lays no road.
+            if prev != cur {
+                let (pc, pr) = (prev as i32 % cols, prev as i32 / cols);
+                let dir = neighbors(pc, pr, cols, rows)
+                    .iter()
+                    .position(|&(c, r)| c == pos.col && r == pos.row);
+                if let Some(dir) = dir {
+                    if let Some(c) = stats.traffic_hexes.get_mut(cur) {
+                        *c += 1;
+                    }
+                    let edge = edge_id(pc, pr, dir, cols, rows);
+                    if let (Some(slots), Some(r)) =
+                        (stats.road_seen.get_mut(edge), world.road_edges.get_mut(edge))
+                    {
+                        if note_traverser(slots, e.to_bits(), now) {
+                            *r = (*r + ROAD_DEPOSIT).min(ROAD_MAX);
+                        }
+                        edge_road = road_strength(*r);
+                    }
+                }
             }
         }
+        mem.last_edge_road = edge_road;
+        mem.last_tile = Some(cur);
     }
 }
 
