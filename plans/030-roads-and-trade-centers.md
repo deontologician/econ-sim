@@ -17,7 +17,9 @@ everyone funnels to it. Travel was nearly free, so distance didn't gate it.
 ### Roads (`World::road` = decaying *wear*, fed through a quadratic strength)
 - A per-tile raw **wear** ∈ `[0, ROAD_MAX]`, serialized with the world (`#[serde(default)]`,
   lazily resized). `accumulate_traffic` (right after `policy_step`) decays the whole field
-  each tick (`ROAD_DECAY = 0.999`, ~690-tick half-life) and deposits `ROAD_DEPOSIT = 0.05`
+  each tick by a flat **linear** amount (`ROAD_DECAY = 0.0002` subtracted, not a fraction —
+  so full roads erode gently and persist for thousands of ticks, with a clean survive-or-fade
+  threshold) and deposits `ROAD_DEPOSIT = 0.05`
   on a tile **only when > 2 distinct noots have crossed it within `ROAD_DISTINCT_WINDOW`
   (600) ticks** — tracked by a small per-tile recency cache (`EconStats::road_seen`,
   transient). A lone noot shuttling its own route never qualifies, so only genuinely shared

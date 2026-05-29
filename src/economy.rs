@@ -443,10 +443,13 @@ const ROAD_MAX: f32 = 1.0;
 /// qualifies — so the deposit itself can be brisk enough that a genuinely shared corridor
 /// builds up past [`ROAD_WEAR_FULL`] into a full-strength road rather than a faint smear.
 const ROAD_DEPOSIT: f32 = 0.05;
-/// Per-tick exponential decay of every tile's wear (~690-tick half-life). Slow, so a road
-/// reflects sustained travel over a long window and lingers once earned — but still fades
-/// if a corridor is abandoned, keeping the network honest.
-const ROAD_DECAY: f32 = 0.999;
+/// Per-tick **linear** wear lost by every tile — a flat subtraction, not a fraction of the
+/// current level. Unlike exponential decay (which bleeds fastest right when a road is
+/// strongest), this sheds the same tiny amount whatever the level, so a full road persists
+/// for thousands of ticks of disuse and erodes gently. It also sets a clean survive-or-fade
+/// threshold: a tile stays a road only if its qualifying traffic replaces at least this much
+/// wear per tick, otherwise it drifts back to bare ground.
+const ROAD_DECAY: f32 = 0.0002;
 /// Wear below which a tile is bare ground (no road at all) and above which it is a fully
 /// formed road. Between them, [`road_strength`] ramps **quadratically** — slow at first,
 /// then shooting up — so casual criss-crossing leaves no road while a lane that earns
@@ -909,7 +912,7 @@ pub fn accumulate_traffic(
         world.road = vec![0.0; n_tiles];
     }
     for r in world.road.iter_mut() {
-        *r *= ROAD_DECAY;
+        *r = (*r - ROAD_DECAY).max(0.0);
     }
     let cols = world.cols;
     for (e, pos) in &moved {
