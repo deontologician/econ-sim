@@ -853,7 +853,12 @@ fn setup(
         }
     }
 
-    spawn_ui(&mut commands, &ui_font, &graph_assets);
+    spawn_ui(
+        &mut commands,
+        &ui_font,
+        &graph_assets,
+        &econ_sim::worldname::world_name(world.seed),
+    );
 
     commands.insert_resource(SimRng(sim_rng));
     commands.insert_resource(Sim(world));
@@ -931,7 +936,7 @@ fn spawn_noot(
     ));
 }
 
-fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) {
+fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets, world_name: &str) {
     commands
         .spawn(Node {
             width: Val::Percent(100.0),
@@ -954,7 +959,7 @@ fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) 
             ))
             .with_children(|panel| {
                 panel.spawn((
-                    Text::new("tap a noot to follow it, or a hex to inspect it"),
+                    Text::new(world_name.to_string()),
                     TextFont {
                         font: font.clone(),
                         font_size: 13.0,
@@ -2680,20 +2685,21 @@ fn update_selection_panel(
     let Ok(mut text) = panel.single_mut() else {
         return;
     };
-    let hint = "tap a noot to follow it, or a hex to inspect it";
-    // No noot followed: show the inspected hex, or the hint.
+    // With nothing selected the bottom-left shows the world's name (its identity on the
+    // leaderboard), not a how-to-play tip.
+    let idle = || econ_sim::worldname::world_name(sim.0.seed);
     let Some(entity) = selection.0 else {
         text.0 = match selected_hex.0 {
             Some(tile) => {
                 let claimed = noots.iter().any(|(c, ..)| c.hex == Some(tile));
                 describe_hex(&sim.0, tile, claimed)
             }
-            None => hint.into(),
+            None => idle(),
         };
         return;
     };
     let Ok((claim, trader, wallet, hunger, inv, mem, meta, action, name)) = noots.get(entity) else {
-        text.0 = hint.into();
+        text.0 = idle();
         return;
     };
 

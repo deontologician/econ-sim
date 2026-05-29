@@ -15,6 +15,7 @@ pub mod policy;
 pub mod rng;
 pub mod save;
 pub mod world;
+pub mod worldname;
 
 #[cfg(feature = "gui")]
 pub mod graph;
