@@ -151,18 +151,20 @@ impl World {
     }
 }
 
-/// Deposits come in clusters (a "field" of the same element) of `DEPOSITS_PER_CLUSTER`
-/// within `CLUSTER_RADIUS` tiles, so resources read as related fields, not lone tiles.
-/// How *many* clusters a slot gets depends on what its consumable good is — see
-/// `CLUSTERS_BY_CONSUMPTION_RANK` — so the staples a noot eats are common and the
-/// luxuries are scarce.
+/// Each element's deposit count = its `CLUSTERS_BY_CONSUMPTION_RANK` entry ×
+/// `DEPOSITS_PER_CLUSTER`; they all pack into that element's single region (a tight blob, not
+/// scattered fields), so the staples a noot eats are common and luxuries are scarce.
 const DEPOSITS_PER_CLUSTER: usize = 3;
-/// Clusters per slot, indexed by `consumption_rank`: the raw staple eaten directly is
-/// most common, then the staple that must be refined to eat, then the raw positional
-/// luxury, then the refined positional luxury (rarest). Total deposits =
+/// Deposit-count weight per slot, indexed by `consumption_rank`: the raw staple eaten
+/// directly is most common, then the staple that must be refined to eat, then the raw
+/// positional luxury, then the refined positional luxury (rarest). Total deposits =
 /// `(sum) × DEPOSITS_PER_CLUSTER` = `(4+3+2+1) × 3 = 30`.
 const CLUSTERS_BY_CONSUMPTION_RANK: [usize; 4] = [4, 3, 2, 1];
-const CLUSTER_RADIUS: i32 = 2;
+/// Radius of the tight blob each element's deposits pack into around its (well-separated)
+/// region centre. Small so a single resource clumps into a compact territory and *different*
+/// resources sit far apart — forcing noots to trade across regions rather than mining
+/// everything in one spot. Big enough to hold the most-common element's deposit count.
+const ELEMENT_RADIUS: i32 = 2;
 const SMOOTHING_PASSES: usize = 5;
 /// How much a smoothing pass keeps a hex's own difficulty vs. its neighbours'
 /// mean. Lower = smoother, so terrain clumps into larger regions.
@@ -434,26 +436,76 @@ fn consumption_rank(good: &goods::ConsumableGood) -> usize {
 }
 
 fn place_deposits(rng: &mut Rng, world: &mut World) {
+    // Give every element its own region centre, each as far as possible from the others'
+    // (farthest-point sampling), so different resources end up in distant territories.
+    let mut region: Vec<usize> = Vec::with_capacity(world.chosen.len());
+    for slot in 0..world.chosen.len() {
+        let prefer_hard = matches!(world.chosen[slot].role, ResourceRole::Finite);
+        let center = pick_separated_center(rng, world, &region, prefer_hard);
+        region.push(center);
+    }
     for slot in 0..world.chosen.len() {
         let role = world.chosen[slot].role;
-        // Replenishables thrive on easy land; finite stocks hide in hard terrain.
-        let prefer_hard = matches!(role, ResourceRole::Finite);
-        // Common staples get more fields than scarce luxuries (see the rank table).
-        let clusters = CLUSTERS_BY_CONSUMPTION_RANK[consumption_rank(&world.goods.goods[slot])];
-        // Seed each cluster centre on the preferred terrain, then pack the rest nearby.
-        for _ in 0..clusters {
-            let Some(center) = pick_empty_tile(rng, &world.tiles, prefer_hard) else {
-                continue;
+        // Common staples get more deposits than scarce luxuries (see the rank table); all of
+        // them pack into this element's region, so the resource clumps and stays clear of the
+        // others.
+        let total =
+            CLUSTERS_BY_CONSUMPTION_RANK[consumption_rank(&world.goods.goods[slot])] * DEPOSITS_PER_CLUSTER;
+        for _ in 0..total {
+            let Some(tile) = pick_near_empty(rng, world, region[slot], ELEMENT_RADIUS) else {
+                break;
             };
-            push_deposit(rng, world, slot, role, center);
-            for _ in 1..DEPOSITS_PER_CLUSTER {
-                let Some(tile) = pick_near_empty(rng, world, center, CLUSTER_RADIUS) else {
-                    break;
-                };
-                push_deposit(rng, world, slot, role, tile);
-            }
+            push_deposit(rng, world, slot, role, tile);
         }
     }
+}
+
+/// Pick an empty region centre as far as possible from every already-chosen element centre
+/// (maximising the minimum toroidal distance), with a small nudge toward the element's
+/// preferred terrain. Sampling many candidates and keeping the best spreads the four element
+/// territories across the map instead of letting them overlap.
+fn pick_separated_center(
+    rng: &mut Rng,
+    world: &World,
+    centers: &[usize],
+    prefer_hard: bool,
+) -> usize {
+    let n = world.tiles.len();
+    let mut best: Option<(f32, usize)> = None;
+    for _ in 0..256 {
+        let t = rng.below(n);
+        if world.tiles[t].deposit.is_some() {
+            continue;
+        }
+        let (tc, tr) = (world.tiles[t].col, world.tiles[t].row);
+        let min_dist = centers
+            .iter()
+            .map(|&c| {
+                crate::hex::torus_distance(
+                    tc,
+                    tr,
+                    world.tiles[c].col,
+                    world.tiles[c].row,
+                    world.cols,
+                    world.rows,
+                )
+            })
+            .min()
+            .unwrap_or(world.cols + world.rows); // no centres yet: any tile is "far"
+        let terrain_bonus = if (world.tiles[t].difficulty > 0.5) == prefer_hard {
+            2.0
+        } else {
+            0.0
+        };
+        let score = min_dist as f32 + terrain_bonus;
+        if best.is_none_or(|(s, _)| score > s) {
+            best = Some((score, t));
+        }
+    }
+    best
+        .map(|(_, t)| t)
+        .or_else(|| (0..n).find(|&t| world.tiles[t].deposit.is_none()))
+        .unwrap_or(0)
 }
 
 fn push_deposit(rng: &mut Rng, world: &mut World, slot: usize, role: ResourceRole, tile: usize) {
@@ -496,20 +548,4 @@ fn pick_near_empty(rng: &mut Rng, world: &World, center: usize, radius: i32) -> 
         }
     }
     None
-}
-
-fn pick_empty_tile(rng: &mut Rng, tiles: &[Tile], prefer_hard: bool) -> Option<usize> {
-    let n = tiles.len();
-    let mut fallback = None;
-    for _ in 0..40 {
-        let t = rng.below(n);
-        if tiles[t].deposit.is_some() {
-            continue;
-        }
-        if (tiles[t].difficulty > 0.5) == prefer_hard {
-            return Some(t);
-        }
-        fallback = Some(t);
-    }
-    fallback.or_else(|| (0..n).find(|&t| tiles[t].deposit.is_none()))
 }
