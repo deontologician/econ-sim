@@ -110,6 +110,13 @@ fn snapshot_from_value(mut value: serde_json::Value) -> Option<Snapshot> {
     }
 }
 
+/// Parse a snapshot from a JSON string, replaying migrations and applying the same
+/// non-finite-policy recovery as the loaders. Used by the leaderboard server to accept
+/// posted snapshots.
+pub fn from_json(raw: &str) -> Option<Snapshot> {
+    snapshot_from_value(serde_json::from_str(raw).ok()?)
+}
+
 // --- Browser backend (localStorage) -----------------------------------------
 #[cfg(target_arch = "wasm32")]
 const SAVE_KEY: &str = "econ-sim-save";

@@ -501,6 +501,7 @@ fn main() {
                     pause_controls,
                     overlay_controls,
                     save_game,
+                    submit_leaderboard,
                     new_world_controls,
                     speed_controls,
                     graphs_controls,
@@ -2140,6 +2141,100 @@ fn save_game(
         }
     }
 }
+
+/// Leaderboard endpoint the sim POSTs its snapshot to. `None` = disabled (the default, so
+/// the public deploy phones home nowhere until you point this at your `server` instance,
+/// e.g. `Some("https://your-host/submit")`).
+const LEADERBOARD_URL: Option<&str> = None;
+/// Report to the leaderboard this often (sim ticks). Out of band: the POST is a fire-and-
+/// forget `fetch`, so it never blocks the fixed-tick loop.
+const LEADERBOARD_EVERY_TICKS: u64 = 1000;
+
+/// Every `LEADERBOARD_EVERY_TICKS`, serialize the current save snapshot (reusing the save
+/// format) and POST it to the leaderboard server without awaiting the response. No-op when
+/// `LEADERBOARD_URL` is unset or off-wasm.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn submit_leaderboard(
+    sim: Res<Sim>,
+    hunger: Res<HungerControl>,
+    income: Res<economy::IncomeControl>,
+    stats: Res<EconStats>,
+    policy: Res<ActorCritic>,
+    stat_history: Res<StatHistory>,
+    price_history: Res<PriceHistory>,
+    noots: Query<(
+        &TilePos,
+        &Inventory,
+        &Wallet,
+        &Hunger,
+        &Claim,
+        &Trader,
+        &NootMeta,
+        &NootName,
+        &PolicyMemory,
+    )>,
+    mut last: Local<u64>,
+) {
+    let Some(url) = LEADERBOARD_URL else {
+        return;
+    };
+    if stats.ticks < *last + LEADERBOARD_EVERY_TICKS {
+        return;
+    }
+    *last = stats.ticks;
+    let noot_saves = noots
+        .iter()
+        .map(|(pos, inv, wal, hun, claim, trader, meta, name, mem)| save::NootSave {
+            pos: *pos,
+            inv: inv.clone(),
+            wallet: wal.clone(),
+            hunger: hun.clone(),
+            claim: claim.clone(),
+            trader: trader.clone(),
+            meta: meta.clone(),
+            name: name.clone(),
+            explore: mem.explore,
+        })
+        .collect();
+    let snapshot = save::Snapshot {
+        version: save::SAVE_VERSION,
+        world: sim.0.clone(),
+        hunger: hunger.clone(),
+        income: income.clone(),
+        stats: stats.clone(),
+        policy: policy.clone(),
+        noots: noot_saves,
+        stat_history: stat_history.0.clone(),
+        price_history: price_history.0.clone(),
+    };
+    if let Ok(json) = serde_json::to_string(&snapshot) {
+        post_snapshot(url, &json);
+    }
+}
+
+/// Fire-and-forget POST of the snapshot JSON (browser `fetch`; the Promise is intentionally
+/// dropped — the request still goes, and we never block on the reply).
+#[cfg(target_arch = "wasm32")]
+fn post_snapshot(url: &str, json: &str) {
+    use wasm_bindgen::JsValue;
+    use web_sys::{Headers, Request, RequestInit};
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let opts = RequestInit::new();
+    opts.set_method("POST");
+    opts.set_body(&JsValue::from_str(json));
+    if let Ok(headers) = Headers::new() {
+        let _ = headers.set("Content-Type", "application/json");
+        opts.set_headers(&headers);
+    }
+    if let Ok(req) = Request::new_with_str_and_init(url, &opts) {
+        let _ = window.fetch_with_request(&req);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn post_snapshot(_url: &str, _json: &str) {}
 
 /// G key or the "New" button: clear the saved snapshot and reload, starting a fresh
 /// world. (Reloading re-runs setup, which rolls a new random world.)

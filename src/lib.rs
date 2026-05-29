@@ -10,6 +10,7 @@ pub mod elements;
 pub mod goods;
 pub mod hex;
 pub mod history;
+pub mod leaderboard;
 pub mod noot;
 pub mod policy;
 pub mod rng;

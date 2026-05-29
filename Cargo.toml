@@ -12,9 +12,15 @@ edition = "2021"
 default = ["gui"]
 gui = ["bevy/default"]
 headless = []
+# Native leaderboard server. Build with `--no-default-features --features server` so it
+# pulls core Bevy (for the shared save types) plus axum/tokio, never the GUI/wasm libs.
+server = ["dep:axum", "dep:tokio"]
 
 [dependencies]
 bevy = { version = "0.18", default-features = false }
+# Leaderboard server only (feature = "server"); never in the wasm/phone build.
+axum = { version = "0.7", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"], optional = true }
 # Save/load only. Both are already in Bevy's dependency tree, so this adds no real
 # bundle or compile cost — see CLAUDE.md. JSON (not RON) because serde_json::Value
 # round-trips enums faithfully, which the save migration replay relies on.
@@ -33,10 +39,17 @@ name = "headless"
 path = "src/bin/headless.rs"
 required-features = ["headless"]
 
+# Native leaderboard server (axum). Receives full snapshots, serves the league table.
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+required-features = ["server"]
+
 # Web-only: hide the loading screen once Bevy boots, and draw an entropy seed.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "DomTokenList", "Storage", "Location"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "DomTokenList", "Storage", "Location", "Request", "RequestInit", "RequestMode", "Headers"] }
 js-sys = "0.3"
+wasm-bindgen = "0.2"
 
 # Build dependencies with optimizations even in dev so the sim runs smoothly,
 # while keeping our own crate fast to recompile.
