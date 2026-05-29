@@ -2142,10 +2142,17 @@ fn save_game(
     }
 }
 
-/// Leaderboard endpoint the sim POSTs its snapshot to. `None` = disabled (the default, so
-/// the public deploy phones home nowhere until you point this at your `server` instance,
-/// e.g. `Some("https://your-host/submit")`).
-const LEADERBOARD_URL: Option<&str> = None;
+/// Leaderboard endpoint the sim POSTs its snapshot to, baked in at compile time from the
+/// `LEADERBOARD_URL` env var (e.g. set by the Pages build to the Sprite's public URL,
+/// `https://<sprite>-<org>.sprites.dev/submit`). Unset or empty = disabled, so the default
+/// build phones home nowhere.
+const LEADERBOARD_URL: Option<&str> = leaderboard_url();
+const fn leaderboard_url() -> Option<&'static str> {
+    match option_env!("LEADERBOARD_URL") {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => None,
+    }
+}
 /// Report to the leaderboard this often (sim ticks). Out of band: the POST is a fire-and-
 /// forget `fetch`, so it never blocks the fixed-tick loop.
 const LEADERBOARD_EVERY_TICKS: u64 = 1000;

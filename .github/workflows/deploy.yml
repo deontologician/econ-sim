@@ -33,8 +33,13 @@ jobs:
           version: latest
 
       # Project pages are served from a subpath, so assets must resolve
-      # relative to /econ-sim/.
+      # relative to /econ-sim/. LEADERBOARD_URL is baked in via option_env! — set the repo
+      # variable LEADERBOARD_SUBMIT_URL (Settings → Secrets and variables → Actions →
+      # Variables) to the Sprite's public submit URL to turn reporting on; leave it unset to
+      # keep the build phoning home nowhere.
       - name: Build wasm bundle
+        env:
+          LEADERBOARD_URL: ${{ vars.LEADERBOARD_SUBMIT_URL }}
         run: trunk build --release --public-url /econ-sim/
 
       - uses: actions/upload-pages-artifact@v3
