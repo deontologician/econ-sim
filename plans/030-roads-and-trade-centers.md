@@ -17,17 +17,20 @@ everyone funnels to it. Travel was nearly free, so distance didn't gate it.
 ### Roads (`World::road` = decaying *wear*, fed through a quadratic strength)
 - A per-tile raw **wear** ∈ `[0, ROAD_MAX]`, serialized with the world (`#[serde(default)]`,
   lazily resized). `accumulate_traffic` (right after `policy_step`) decays the whole field
-  each tick by a flat **linear** amount (`ROAD_DECAY = 0.0002` subtracted, not a fraction —
-  so full roads erode gently and persist for thousands of ticks, with a clean survive-or-fade
-  threshold) and deposits `ROAD_DEPOSIT = 0.05`
+  each tick by a flat **linear** amount (`ROAD_DECAY = 0.0001` subtracted, not a fraction —
+  so full roads erode gently and persist for many thousands of ticks, with a clean
+  survive-or-fade threshold) and deposits `ROAD_DEPOSIT = 0.05`
   on a tile **only when > 2 distinct noots have crossed it within `ROAD_DISTINCT_WINDOW`
   (600) ticks** — tracked by a small per-tile recency cache (`EconStats::road_seen`,
   transient). A lone noot shuttling its own route never qualifies, so only genuinely shared
   corridors wear in; that gate (not a tiny deposit) is what makes roads selective.
 - **Effective strength is quadratic in wear** (`road_strength`): `((wear − LO)/(FULL − LO))²`
-  with `LO = 0.04`, `FULL = 0.22`. Slow at first then shooting up, so a qualifying corridor
-  tips from nothing to a full-strength road, while any residual low-wear wash is squashed
-  toward zero. Travel-cost relief, the movement pull, and the overlay all read this.
+  with `LO = 0.04`, `FULL = 0.7`. Quadratic so the low-wear wash is squashed toward zero,
+  and the span is *wide* so a road brightens gradually over a lot of sustained travel rather
+  than snapping to full — a slow build, not a switch. Because mid-build roads stay dim, the
+  pull stays gentle, which keeps trade from funnelling onto one hub (top trade tile ~35-48%,
+  vs ~82-95% with a steep ramp). Travel-cost relief, the movement pull, and the overlay all
+  read this.
 - `hunger_tick`: strength cuts the movement surcharge (terrain + carry) by up to
   `ROAD_RELIEF = 0.85` — the "dramatically cheaper on roads" payoff.
 - `value_guided_step`: adds `ROAD_PULL · strength − TERRAIN_PUSH · difficulty`. `ROAD_PULL =

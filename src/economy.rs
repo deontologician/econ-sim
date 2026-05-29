@@ -449,14 +449,13 @@ const ROAD_DEPOSIT: f32 = 0.05;
 /// for thousands of ticks of disuse and erodes gently. It also sets a clean survive-or-fade
 /// threshold: a tile stays a road only if its qualifying traffic replaces at least this much
 /// wear per tick, otherwise it drifts back to bare ground.
-const ROAD_DECAY: f32 = 0.0002;
+const ROAD_DECAY: f32 = 0.0001;
 /// Wear below which a tile is bare ground (no road at all) and above which it is a fully
-/// formed road. Between them, [`road_strength`] ramps **quadratically** — slow at first,
-/// then shooting up — so casual criss-crossing leaves no road while a lane that earns
-/// sustained traffic tips over into a real, full-strength road. Tuned near the wear the
-/// busiest lanes actually reach so they do tip over.
+/// formed road. Between them, [`road_strength`] ramps quadratically. The span is wide on
+/// purpose — a road brightens *gradually* over a lot of sustained travel rather than
+/// snapping to full, so the ramp-up reads as a slow build, not a switch.
 const ROAD_WEAR_LO: f32 = 0.04;
-const ROAD_WEAR_FULL: f32 = 0.22;
+const ROAD_WEAR_FULL: f32 = 0.7;
 
 /// A tile's **effective road strength** in `[0, 1]` from its raw accumulated `wear`: a
 /// quadratic ramp between [`ROAD_WEAR_LO`] and [`ROAD_WEAR_FULL`]. Quadratic so the curve
