@@ -17,9 +17,9 @@ everyone funnels to it. Travel was nearly free, so distance didn't gate it.
 ### Roads (`World::road` = decaying *wear*, fed through a quadratic strength)
 - A per-tile raw **wear** ∈ `[0, ROAD_MAX]`, serialized with the world (`#[serde(default)]`,
   lazily resized). `accumulate_traffic` (right after `policy_step`) decays the whole field
-  each tick by a flat **linear** amount (`ROAD_DECAY = 0.0001` subtracted, not a fraction —
-  so full roads erode gently and persist for many thousands of ticks, with a clean
-  survive-or-fade threshold) and deposits `ROAD_DEPOSIT = 0.05`
+  each tick by a flat **linear** amount (`ROAD_DECAY = 0.00005` subtracted, not a fraction —
+  so a full road persists ~20k ticks of disuse before fading, with a clean survive-or-fade
+  threshold) and deposits `ROAD_DEPOSIT = 0.05`
   on a tile **only when > 2 distinct noots have crossed it within `ROAD_DISTINCT_WINDOW`
   (600) ticks** — tracked by a small per-tile recency cache (`EconStats::road_seen`,
   transient). A lone noot shuttling its own route never qualifies, so only genuinely shared
@@ -34,8 +34,12 @@ everyone funnels to it. Travel was nearly free, so distance didn't gate it.
 - `hunger_tick`: strength cuts the movement surcharge (terrain + carry) by up to
   `ROAD_RELIEF = 0.85` — the "dramatically cheaper on roads" payoff.
 - `value_guided_step`: adds `ROAD_PULL · strength − TERRAIN_PUSH · difficulty`. `ROAD_PULL =
-  12` < `ROUTE_OPTIMISM = 20`, so a noot never trades forward progress for a road but picks
-  the road among equally-progressing hexes — funnelling parallel paths onto a shared lane.
+  26` sits **between** `ROUTE_OPTIMISM = 20` and `2×` it: above 20, so a noot steps *sideways
+  onto* a full road, giving up a hex of straight progress because riding is cheaper (instead
+  of trudging the bare ground beside it); below 40, so it won't step *backwards* for a road,
+  which is what makes it leave once the road curves away from its goal — "merge on, ride,
+  get off at the end." Scaled by strength, so only well-formed roads earn the detour. (Pull
+  is local/adjacent only; attracting toward a *distant* road would need a cost-to-go field.)
 - Result (80-150k, 3 seeds): roads form on only **1-5% of tiles** but those reach **full
   strength** — a few bright corridors, not a smear. Trade-off: bright roads are
   winner-take-all, so they pull trade back toward one hub (top trade tile 43-95%), partly

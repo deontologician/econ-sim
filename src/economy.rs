@@ -449,7 +449,7 @@ const ROAD_DEPOSIT: f32 = 0.05;
 /// for thousands of ticks of disuse and erodes gently. It also sets a clean survive-or-fade
 /// threshold: a tile stays a road only if its qualifying traffic replaces at least this much
 /// wear per tick, otherwise it drifts back to bare ground.
-const ROAD_DECAY: f32 = 0.0001;
+const ROAD_DECAY: f32 = 0.00005;
 /// Wear below which a tile is bare ground (no road at all) and above which it is a fully
 /// formed road. Between them, [`road_strength`] ramps quadratically. The span is wide on
 /// purpose — a road brightens *gradually* over a lot of sustained travel rather than
@@ -471,11 +471,14 @@ pub fn road_strength(wear: f32) -> f32 {
 /// Fraction of the movement surcharge (terrain + carry) a fully-formed road removes — the
 /// "dramatically cheaper on roads" payoff that makes basins worth forming.
 const ROAD_RELIEF: f32 = 0.85;
-/// How hard a fully-formed neighbouring road pulls the value-guided step toward it. Kept
-/// below [`ROUTE_OPTIMISM`] so a noot never sacrifices forward progress for a road, but
-/// high enough to decide *which* of several equally-progressing hexes it takes — that
-/// tie-breaking is what funnels parallel paths onto a shared lane.
-const ROAD_PULL: f32 = 12.0;
+/// How hard a fully-formed neighbouring road pulls the value-guided step toward it. Set
+/// *above* [`ROUTE_OPTIMISM`] (but below `2×` it) on purpose: above, so a noot will step
+/// **sideways onto** a full road, giving up a hex of straight-line progress because riding
+/// the road is cheaper — instead of trudging the bare ground right beside it; below `2×`,
+/// so it still won't step *backwards* for a road, which is what makes it leave the road
+/// once the road curves away from its goal. Scaled by road strength, so only well-formed
+/// roads earn the detour.
+const ROAD_PULL: f32 = 26.0;
 /// How hard rough terrain pushes the value-guided step away from a neighbouring tile, so
 /// noots prefer easy ground (where roads also form) when it costs no progress.
 const TERRAIN_PUSH: f32 = 6.0;
