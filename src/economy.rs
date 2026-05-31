@@ -449,7 +449,7 @@ const ROAD_DEPOSIT: f32 = 0.05;
 /// for thousands of ticks of disuse and erodes gently. It also sets a clean survive-or-fade
 /// threshold: a tile stays a road only if its qualifying traffic replaces at least this much
 /// wear per tick, otherwise it drifts back to bare ground.
-const ROAD_DECAY: f32 = 0.000005;
+const ROAD_DECAY: f32 = 0.0000005;
 /// Wear below which a tile is bare ground (no road at all) and above which it is a fully
 /// formed road. Between them, [`road_strength`] ramps quadratically. The span is wide on
 /// purpose — a road brightens *gradually* over a lot of sustained travel rather than
