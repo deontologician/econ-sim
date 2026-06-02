@@ -776,8 +776,11 @@ fn setup(
     // Permanent road network: one thin quad per drawable edge, between the two hex centres,
     // recoloured by `update_roads` from the canonical `World::road_edges` wear. All six
     // neighbours are equidistant, so the segments share one mesh and differ only by
-    // transform. Drawn under the noot layer (z 0.5); seam-wrapping edges are skipped (their
-    // endpoints are on opposite sides of the map, so a straight segment would be wrong).
+    // transform. Drawn under the noot layer (z 0.5). For edges that cross a torus seam
+    // (`hex::neighbors` returns the wrapped tile, so its world-space position is one
+    // period away), unwrap the neighbour by ±period to keep the segment a single
+    // edge-length quad straddling the seam — the 8 ghost children then cover all four
+    // seams of the 3×3 mosaic so a road never looks broken at the wrap.
     let edge_len = hex::SQRT3 * hex_size;
     let seg_mesh = meshes.add(Rectangle::new(edge_len, hex_size * 0.22));
     for tile in &world.tiles {
@@ -792,10 +795,15 @@ fn setup(
             if a * 6 + dir != edge {
                 continue;
             }
-            let (bx, by) = hex::hex_center(nc, nr, hex_size);
-            // Skip seam wraps: real neighbours are exactly `edge_len` apart.
-            if ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt() > edge_len * 1.5 {
-                continue;
+            let (mut bx, mut by) = hex::hex_center(nc, nr, hex_size);
+            // Pick whichever ±period shift brings the neighbour adjacent to (ax, ay):
+            // hex::neighbors already wrapped its coordinates through `rem_euclid`, so for
+            // seam tiles the returned `(bx, by)` lives a full period away in world space.
+            if (bx - ax).abs() > period_x * 0.5 {
+                bx += if bx > ax { -period_x } else { period_x };
+            }
+            if (by - ay).abs() > period_y * 0.5 {
+                by += if by > ay { -period_y } else { period_y };
             }
             let (mx, my) = ((ax + bx) * 0.5 + offset.x, (ay + by) * 0.5 + offset.y);
             let angle = (by - ay).atan2(bx - ax);
