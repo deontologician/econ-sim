@@ -31,7 +31,29 @@ const N_NOOTS: usize = 56;
 
 // --- Camera limits ----------------------------------------------------------
 const MIN_ZOOM: f32 = 0.3;
+/// Hard upper cap on zoom-out (world-units per pixel). The effective cap is the smaller
+/// of this and a dynamic limit derived from the window + map size (see
+/// [`max_zoom_for`]) — the dynamic one is what enforces "at most 1.5 maps fit on the
+/// longest screen axis", this is just a safety ceiling for tiny windows.
 const MAX_ZOOM: f32 = 8.0;
+/// How many tiled copies of the map fit along the longest screen axis at maximum
+/// zoom-out — enough to see the seam without revealing too much beyond it.
+const MAX_MAP_FIT: f32 = 1.5;
+
+// --- Map tiling (torus visualisation) ---------------------------------------
+/// Eight `(dx, dy)` offsets that surround the canonical map at (0, 0): every visual on
+/// the map spawns 8 ghost children at these multiples of the wrap period, so panning
+/// past a seam shows the same content rather than empty space.
+const TILE_OFFSETS_8: [(f32, f32); 8] = [
+    (-1.0, -1.0),
+    (0.0, -1.0),
+    (1.0, -1.0),
+    (-1.0, 0.0),
+    (1.0, 0.0),
+    (-1.0, 1.0),
+    (0.0, 1.0),
+    (1.0, 1.0),
+];
 
 // --- Selection / follow -----------------------------------------------------
 /// Max screen-pixels a touch may move and still count as a tap (not a pan).
@@ -431,6 +453,14 @@ struct StructureMarker {
     structure: usize,
 }
 
+/// Ghost-child of [`StructureEmblem`]: one of the eight tiled mosaic copies, carrying its
+/// parent's structure index so `sync_structure_markers` can swap its mesh in step if a
+/// build-over flips the kind. Children's Mesh2d does not auto-follow the parent's.
+#[derive(Component)]
+struct StructureEmblemGhost {
+    structure: usize,
+}
+
 /// The white emblem on top of a structure that signals its kind by *shape* — an upward
 /// triangle (shop) or a diamond (refinery) — so the two read apart at a glance, not by
 /// colour alone. `sync_structure_markers` swaps the mesh if a build-over flips the kind.
@@ -506,6 +536,7 @@ fn main() {
                     speed_controls,
                     graphs_controls,
                     fit_camera_to_screen,
+                    wrap_camera_to_torus,
                     prices_controls,
                     wealth_controls,
                 ),
@@ -639,6 +670,10 @@ fn setup(
     let offset = -(min + max) * 0.5;
     let map_w = (max.x - min.x) + hex_size * 2.0;
     let map_h = (max.y - min.y) + hex_size * 2.0;
+    // The wrap period is the exact tile-to-identical-tile distance (no padding), so the
+    // 3×3 mosaic of ghosts lines up seamlessly across the seam.
+    let period_x = hex_size * hex::SQRT3 * world.cols as f32;
+    let period_y = hex_size * 1.5 * world.rows as f32;
     let init_zoom = (map_w / 400.0).min(map_h / 800.0).clamp(MIN_ZOOM, MAX_ZOOM);
 
     commands.spawn((Camera2d, Transform::from_scale(Vec3::splat(init_zoom))));
@@ -646,52 +681,96 @@ fn setup(
     // Tiles share one neutral material — difficulty is shown *only* via the toggleable
     // terrain overlay. Each tile also gets three hidden heat cells stacked above it
     // (z 0.4 terrain, z 1.5 routes, z 1.6 trades) — only one shows at a time, and they sit
-    // just under the noot layer (z 2.0).
+    // just under the noot layer (z 2.0). Each visual is spawned with 8 ghost children at
+    // the wrap-period offsets so the torus tiles seamlessly into a 3×3 mosaic — children
+    // inherit the parent's Transform, Visibility, and shared material handle for free.
     let hex_mesh = meshes.add(RegularPolygon::new(hex_size * 0.96, 6));
     let tile_mat = materials.add(Color::srgb(0.18, 0.20, 0.22));
     for tile in &world.tiles {
         let (x, y) = hex::hex_center(tile.col, tile.row, hex_size);
         let (px, py) = (x + offset.x, y + offset.y);
-        commands.spawn((
-            Mesh2d(hex_mesh.clone()),
-            MeshMaterial2d(tile_mat.clone()),
-            Transform::from_xyz(px, py, 0.0),
-        ));
+        commands
+            .spawn((
+                Mesh2d(hex_mesh.clone()),
+                MeshMaterial2d(tile_mat.clone()),
+                Transform::from_xyz(px, py, 0.0),
+            ))
+            .with_children(|p| {
+                for (dx, dy) in TILE_OFFSETS_8 {
+                    p.spawn((
+                        Mesh2d(hex_mesh.clone()),
+                        MeshMaterial2d(tile_mat.clone()),
+                        Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                    ));
+                }
+            });
 
         // Terrain-difficulty overlay: green (easy) → red (hard), by the tile's
         // continuous difficulty. A sub-1.0 alpha makes `ColorMaterial` blend.
         let d = tile.difficulty.clamp(0.0, 1.0);
         let terr_color = Color::srgba((0.2 + 1.6 * d).min(1.0), (0.7 - 1.2 * d).max(0.0), 0.1, 0.5);
-        commands.spawn((
-            Mesh2d(hex_mesh.clone()),
-            MeshMaterial2d(materials.add(terr_color)),
-            Transform::from_xyz(px, py, 0.4),
-            Visibility::Hidden,
-            TerrainOverlay,
-        ));
+        let terr_mat = materials.add(terr_color);
+        commands
+            .spawn((
+                Mesh2d(hex_mesh.clone()),
+                MeshMaterial2d(terr_mat.clone()),
+                Transform::from_xyz(px, py, 0.4),
+                Visibility::Hidden,
+                TerrainOverlay,
+            ))
+            .with_children(|p| {
+                for (dx, dy) in TILE_OFFSETS_8 {
+                    p.spawn((
+                        Mesh2d(hex_mesh.clone()),
+                        MeshMaterial2d(terr_mat.clone()),
+                        Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                    ));
+                }
+            });
 
         // Trade-density heat overlay (gold), recoloured by `update_trade_overlay` from
         // the cumulative trade heatmap. Born translucent (alpha < 1) so the material is
         // created in blend mode; sits just under the noot layer (z 2.0).
         let idx = (tile.row * world.cols + tile.col) as usize;
-        commands.spawn((
-            Mesh2d(hex_mesh.clone()),
-            MeshMaterial2d(materials.add(Color::srgba(0.98, 0.80, 0.15, 0.0))),
-            Transform::from_xyz(px, py, 1.6),
-            Visibility::Hidden,
-            TradeOverlay { tile: idx },
-        ));
+        let trade_mat = materials.add(Color::srgba(0.98, 0.80, 0.15, 0.0));
+        commands
+            .spawn((
+                Mesh2d(hex_mesh.clone()),
+                MeshMaterial2d(trade_mat.clone()),
+                Transform::from_xyz(px, py, 1.6),
+                Visibility::Hidden,
+                TradeOverlay { tile: idx },
+            ))
+            .with_children(|p| {
+                for (dx, dy) in TILE_OFFSETS_8 {
+                    p.spawn((
+                        Mesh2d(hex_mesh.clone()),
+                        MeshMaterial2d(trade_mat.clone()),
+                        Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                    ));
+                }
+            });
 
         // Movement (route) heat overlay (cyan), recoloured by `update_route_overlay` from
         // the cumulative traffic heatmap. Same translucent-birth trick as the trade cell.
-        commands.spawn((
-            Mesh2d(hex_mesh.clone()),
-            MeshMaterial2d(materials.add(Color::srgba(0.25, 0.70, 0.95, 0.0))),
-            Transform::from_xyz(px, py, 1.5),
-            Visibility::Hidden,
-            RouteOverlay { tile: idx },
-        ));
-
+        let route_mat = materials.add(Color::srgba(0.25, 0.70, 0.95, 0.0));
+        commands
+            .spawn((
+                Mesh2d(hex_mesh.clone()),
+                MeshMaterial2d(route_mat.clone()),
+                Transform::from_xyz(px, py, 1.5),
+                Visibility::Hidden,
+                RouteOverlay { tile: idx },
+            ))
+            .with_children(|p| {
+                for (dx, dy) in TILE_OFFSETS_8 {
+                    p.spawn((
+                        Mesh2d(hex_mesh.clone()),
+                        MeshMaterial2d(route_mat.clone()),
+                        Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                    ));
+                }
+            });
     }
 
     // Permanent road network: one thin quad per drawable edge, between the two hex centres,
@@ -720,48 +799,100 @@ fn setup(
             }
             let (mx, my) = ((ax + bx) * 0.5 + offset.x, (ay + by) * 0.5 + offset.y);
             let angle = (by - ay).atan2(bx - ax);
-            commands.spawn((
-                Mesh2d(seg_mesh.clone()),
-                MeshMaterial2d(materials.add(Color::srgba(0.78, 0.60, 0.30, 0.0))),
-                Transform::from_xyz(mx, my, 0.5).with_rotation(Quat::from_rotation_z(angle)),
-                Visibility::Hidden,
-                RoadEdge { edge },
-            ));
+            let road_mat = materials.add(Color::srgba(0.78, 0.60, 0.30, 0.0));
+            commands
+                .spawn((
+                    Mesh2d(seg_mesh.clone()),
+                    MeshMaterial2d(road_mat.clone()),
+                    Transform::from_xyz(mx, my, 0.5).with_rotation(Quat::from_rotation_z(angle)),
+                    Visibility::Hidden,
+                    RoadEdge { edge },
+                ))
+                .with_children(|p| {
+                    for (dx, dy) in TILE_OFFSETS_8 {
+                        p.spawn((
+                            Mesh2d(seg_mesh.clone()),
+                            MeshMaterial2d(road_mat.clone()),
+                            Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                        ));
+                    }
+                });
         }
     }
 
     // Deposit markers: a dark backing disc carrying the element's thematic icon,
-    // with a hidden claim outline ringing it.
+    // with a hidden claim outline ringing it. All three layers get ghost children at the
+    // wrap-period offsets so the deposit shows up in every tiled copy of the map.
     let disc_mesh = meshes.add(Circle::new(hex_size * 0.5));
     let outline_mesh = meshes.add(Annulus::new(hex_size * 0.54, hex_size * 0.62));
+    let disc_mat = materials.add(Color::srgba(0.08, 0.08, 0.10, 0.88));
+    let outline_mat = materials.add(Color::srgb(0.97, 0.97, 0.92));
     for (di, deposit) in world.deposits.iter().enumerate() {
         let tile = &world.tiles[deposit.tile];
         let (x, y) = hex::hex_center(tile.col, tile.row, hex_size);
         let (px, py) = (x + offset.x, y + offset.y);
-        commands.spawn((
-            Mesh2d(disc_mesh.clone()),
-            MeshMaterial2d(materials.add(Color::srgba(0.08, 0.08, 0.10, 0.88))),
-            Transform::from_xyz(px, py, 1.0),
-        ));
-        commands.spawn((
-            Sprite {
-                image: icons[deposit.element_slot].clone(),
-                custom_size: Some(Vec2::splat(hex_size * 0.85)),
-                ..default()
-            },
-            Transform::from_xyz(px, py, 1.05),
-        ));
-        commands.spawn((
-            Mesh2d(outline_mesh.clone()),
-            MeshMaterial2d(materials.add(Color::srgb(0.97, 0.97, 0.92))),
-            Transform::from_xyz(px, py, 1.1),
-            Visibility::Hidden,
-            DepositOutline { deposit: di },
-        ));
+        commands
+            .spawn((
+                Mesh2d(disc_mesh.clone()),
+                MeshMaterial2d(disc_mat.clone()),
+                Transform::from_xyz(px, py, 1.0),
+            ))
+            .with_children(|p| {
+                for (dx, dy) in TILE_OFFSETS_8 {
+                    p.spawn((
+                        Mesh2d(disc_mesh.clone()),
+                        MeshMaterial2d(disc_mat.clone()),
+                        Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                    ));
+                }
+            });
+        let icon = icons[deposit.element_slot].clone();
+        commands
+            .spawn((
+                Sprite {
+                    image: icon.clone(),
+                    custom_size: Some(Vec2::splat(hex_size * 0.85)),
+                    ..default()
+                },
+                Transform::from_xyz(px, py, 1.05),
+            ))
+            .with_children(|p| {
+                for (dx, dy) in TILE_OFFSETS_8 {
+                    p.spawn((
+                        Sprite {
+                            image: icon.clone(),
+                            custom_size: Some(Vec2::splat(hex_size * 0.85)),
+                            ..default()
+                        },
+                        Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                    ));
+                }
+            });
+        commands
+            .spawn((
+                Mesh2d(outline_mesh.clone()),
+                MeshMaterial2d(outline_mat.clone()),
+                Transform::from_xyz(px, py, 1.1),
+                Visibility::Hidden,
+                DepositOutline { deposit: di },
+            ))
+            .with_children(|p| {
+                for (dx, dy) in TILE_OFFSETS_8 {
+                    p.spawn((
+                        Mesh2d(outline_mesh.clone()),
+                        MeshMaterial2d(outline_mat.clone()),
+                        Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                    ));
+                }
+            });
     }
 
     // Pool of world-space stack-count labels (one per possible 2-noot pairing), parked
-    // off-screen and hidden; `update_stack_labels` positions/fills the active ones.
+    // off-screen and hidden; `update_stack_labels` positions/fills the active ones. Stack
+    // labels are *not* mosaic-tiled — text isn't shared across children the way mesh
+    // materials are, so duplicating would mean N×9 text updates per frame. Leaving them
+    // central-only is the acceptable trade-off; stacks still read clearly on the canonical
+    // map a follow/pan settles into.
     for _ in 0..N_NOOTS {
         commands.spawn((
             Text2d::new(""),
@@ -782,27 +913,52 @@ fn setup(
         hex_size,
         map_w,
         map_h,
+        period_x,
+        period_y,
     });
 
-    // Highlight ring for the selected noot (hidden until something is picked).
+    // Highlight ring for the selected noot (hidden until something is picked). Ghost
+    // children follow the parent's transform so the ring lights up on every tiled copy.
     let ring_mesh = meshes.add(Annulus::new(hex_size * 0.34, hex_size * 0.46));
-    commands.spawn((
-        Mesh2d(ring_mesh),
-        MeshMaterial2d(materials.add(Color::srgb(1.0, 0.95, 0.3))),
-        Transform::from_xyz(0.0, 0.0, 2.5),
-        Visibility::Hidden,
-        SelectionRing,
-    ));
+    let ring_mat = materials.add(Color::srgb(1.0, 0.95, 0.3));
+    commands
+        .spawn((
+            Mesh2d(ring_mesh.clone()),
+            MeshMaterial2d(ring_mat.clone()),
+            Transform::from_xyz(0.0, 0.0, 2.5),
+            Visibility::Hidden,
+            SelectionRing,
+        ))
+        .with_children(|p| {
+            for (dx, dy) in TILE_OFFSETS_8 {
+                p.spawn((
+                    Mesh2d(ring_mesh.clone()),
+                    MeshMaterial2d(ring_mat.clone()),
+                    Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                ));
+            }
+        });
 
     // Wider white ring marking the tapped (inspected) hex; sits just above the terrain.
     let hex_ring = meshes.add(Annulus::new(hex_size * 0.7, hex_size * 0.82));
-    commands.spawn((
-        Mesh2d(hex_ring),
-        MeshMaterial2d(materials.add(Color::srgba(1.0, 1.0, 1.0, 0.85))),
-        Transform::from_xyz(0.0, 0.0, 0.5),
-        Visibility::Hidden,
-        HexHighlight,
-    ));
+    let hex_ring_mat = materials.add(Color::srgba(1.0, 1.0, 1.0, 0.85));
+    commands
+        .spawn((
+            Mesh2d(hex_ring.clone()),
+            MeshMaterial2d(hex_ring_mat.clone()),
+            Transform::from_xyz(0.0, 0.0, 0.5),
+            Visibility::Hidden,
+            HexHighlight,
+        ))
+        .with_children(|p| {
+            for (dx, dy) in TILE_OFFSETS_8 {
+                p.spawn((
+                    Mesh2d(hex_ring.clone()),
+                    MeshMaterial2d(hex_ring_mat.clone()),
+                    Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                ));
+            }
+        });
 
     // Each noot owns a unique material so `update_noot_color` can tint it alone.
     let mut sim_rng = Rng::new(world.seed ^ 0xA5A5_5A5A);
@@ -832,6 +988,8 @@ fn setup(
                     materials.add(color),
                     ns,
                     tile_to_pixel(col, row, hex_size, offset),
+                    period_x,
+                    period_y,
                 );
             }
         }
@@ -849,6 +1007,8 @@ fn setup(
                     col,
                     row,
                     tile_to_pixel(col, row, hex_size, offset),
+                    period_x,
+                    period_y,
                 );
             }
         }
@@ -866,7 +1026,10 @@ fn setup(
 }
 
 /// Respawn a noot from a save: its saved components plus a fresh `PolicyMemory`
-/// (transient RL cache) carrying the saved exploration ε.
+/// (transient RL cache) carrying the saved exploration ε. The noot's circle mesh also
+/// spawns 8 ghost children at the wrap-period offsets so it shows up in every tiled copy
+/// of the torus.
+#[allow(clippy::too_many_arguments)]
 fn spawn_restored_noot(
     commands: &mut Commands,
     rng: &mut Rng,
@@ -874,6 +1037,8 @@ fn spawn_restored_noot(
     material: Handle<ColorMaterial>,
     ns: save::NootSave,
     pixel: Vec2,
+    period_x: f32,
+    period_y: f32,
 ) {
     // A pre-names save loads unnamed; give those a fresh name on resume.
     let name = if ns.name.is_unnamed() {
@@ -881,22 +1046,32 @@ fn spawn_restored_noot(
     } else {
         ns.name
     };
-    commands.spawn((
-        Mesh2d(mesh),
-        MeshMaterial2d(material),
-        Transform::from_xyz(pixel.x, pixel.y, 2.0),
-        Noot,
-        Action::default(),
-        ns.claim,
-        ns.trader,
-        ns.meta,
-        name,
-        ns.pos,
-        ns.inv,
-        ns.wallet,
-        ns.hunger,
-        PolicyMemory::new(ns.explore),
-    ));
+    commands
+        .spawn((
+            Mesh2d(mesh.clone()),
+            MeshMaterial2d(material.clone()),
+            Transform::from_xyz(pixel.x, pixel.y, 2.0),
+            Noot,
+            Action::default(),
+            ns.claim,
+            ns.trader,
+            ns.meta,
+            name,
+            ns.pos,
+            ns.inv,
+            ns.wallet,
+            ns.hunger,
+            PolicyMemory::new(ns.explore),
+        ))
+        .with_children(|p| {
+            for (dx, dy) in TILE_OFFSETS_8 {
+                p.spawn((
+                    Mesh2d(mesh.clone()),
+                    MeshMaterial2d(material.clone()),
+                    Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                ));
+            }
+        });
 }
 
 fn random_tile(rng: &mut Rng, world: &World) -> (i32, i32) {
@@ -916,25 +1091,37 @@ fn spawn_noot(
     col: i32,
     row: i32,
     pixel: Vec2,
+    period_x: f32,
+    period_y: f32,
 ) {
-    commands.spawn((
-        Mesh2d(mesh),
-        MeshMaterial2d(material),
-        Transform::from_xyz(pixel.x, pixel.y, 2.0),
-        Noot,
-        Action::default(),
-        Claim::new(claim),
-        Trader::new(),
-        NootMeta::new(),
-        NootName::random(rng),
-        TilePos { col, row },
-        Inventory::new(),
-        Wallet {
-            bucks: STARTING_BUCKS,
-        },
-        Hunger::fresh(rng),
-        PolicyMemory::new(rng.range(EXPLORE_MIN, EXPLORE_MAX)),
-    ));
+    commands
+        .spawn((
+            Mesh2d(mesh.clone()),
+            MeshMaterial2d(material.clone()),
+            Transform::from_xyz(pixel.x, pixel.y, 2.0),
+            Noot,
+            Action::default(),
+            Claim::new(claim),
+            Trader::new(),
+            NootMeta::new(),
+            NootName::random(rng),
+            TilePos { col, row },
+            Inventory::new(),
+            Wallet {
+                bucks: STARTING_BUCKS,
+            },
+            Hunger::fresh(rng),
+            PolicyMemory::new(rng.range(EXPLORE_MIN, EXPLORE_MAX)),
+        ))
+        .with_children(|p| {
+            for (dx, dy) in TILE_OFFSETS_8 {
+                p.spawn((
+                    Mesh2d(mesh.clone()),
+                    MeshMaterial2d(material.clone()),
+                    Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                ));
+            }
+        });
 }
 
 fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets, world_name: &str) {
@@ -1859,10 +2046,30 @@ fn pause_controls(
     }
 }
 
+/// Dynamic upper cap on the camera scale (world-units per pixel): at most `MAX_MAP_FIT`
+/// copies of the longest map side fit on the longest screen axis. Falls back to the
+/// static [`MAX_ZOOM`] when the window or map is degenerate. The torus is rendered as a
+/// 3×3 mosaic, so a tighter cap is what stops the user from zooming so far out that the
+/// tiled copies become tiny smudges.
+fn max_zoom_for(view: &MapView, window: Option<&Window>) -> f32 {
+    let Some(w) = window else {
+        return MAX_ZOOM;
+    };
+    let (sw, sh) = (w.width(), w.height());
+    let screen = sw.max(sh);
+    let map = view.period_x.max(view.period_y);
+    if screen < 1.0 || map <= 0.0 {
+        return MAX_ZOOM;
+    }
+    (MAX_MAP_FIT * map / screen).min(MAX_ZOOM)
+}
+
 /// Touch: one finger drags the map, two fingers pinch to zoom (and pan). A
 /// deliberate drag also releases any follow lock.
 fn touch_camera(
     touches: Res<Touches>,
+    view: Res<MapView>,
+    windows: Query<&Window, With<PrimaryWindow>>,
     mut camera: Query<&mut Transform, With<Camera2d>>,
     mut selection: ResMut<Selection>,
 ) {
@@ -1871,6 +2078,7 @@ fn touch_camera(
     };
     let scale = transform.scale.x;
     let active: Vec<&Touch> = touches.iter().collect();
+    let max_zoom = max_zoom_for(&view, windows.single().ok());
 
     match active.as_slice() {
         [finger] => {
@@ -1888,7 +2096,7 @@ fn touch_camera(
             let current = (a.position() - b.position()).length();
             let previous = (a.previous_position() - b.previous_position()).length();
             if previous > 1.0 && current > 1.0 {
-                let zoom = (scale * previous / current).clamp(MIN_ZOOM, MAX_ZOOM);
+                let zoom = (scale * previous / current).clamp(MIN_ZOOM, max_zoom);
                 transform.scale = Vec3::splat(zoom);
             }
         }
@@ -1907,6 +2115,8 @@ fn keyboard_mouse_camera(
     keys: Res<ButtonInput<KeyCode>>,
     scroll: Res<AccumulatedMouseScroll>,
     time: Res<Time>,
+    view: Res<MapView>,
+    windows: Query<&Window, With<PrimaryWindow>>,
     mut camera: Query<&mut Transform, With<Camera2d>>,
     mut selection: ResMut<Selection>,
 ) {
@@ -1937,7 +2147,40 @@ fn keyboard_mouse_camera(
 
     if scroll.delta.y != 0.0 {
         let factor = if scroll.delta.y > 0.0 { 0.9 } else { 1.1 };
-        transform.scale = Vec3::splat((scale * factor).clamp(MIN_ZOOM, MAX_ZOOM));
+        let max_zoom = max_zoom_for(&view, windows.single().ok());
+        transform.scale = Vec3::splat((scale * factor).clamp(MIN_ZOOM, max_zoom));
+    }
+}
+
+/// Keep the camera inside the canonical central tile of the 3×3 mosaic: whenever a pan
+/// (touch / WASD) or a follow-lock carries it more than half a wrap-period away from the
+/// origin in either axis, snap it back by exactly one period. The map is identical at
+/// `(x + period_x, y + period_y)`, so the snap is invisible — and the ghost children of
+/// every visual have already shifted into view by the time the snap fires, giving the
+/// impression of an infinite torus the player can keep scrolling across.
+fn wrap_camera_to_torus(
+    view: Res<MapView>,
+    mut camera: Query<&mut Transform, With<Camera2d>>,
+) {
+    let Ok(mut tf) = camera.single_mut() else {
+        return;
+    };
+    let (px, py) = (view.period_x, view.period_y);
+    if px > 0.0 {
+        let hx = px * 0.5;
+        if tf.translation.x > hx {
+            tf.translation.x -= px;
+        } else if tf.translation.x < -hx {
+            tf.translation.x += px;
+        }
+    }
+    if py > 0.0 {
+        let hy = py * 0.5;
+        if tf.translation.y > hy {
+            tf.translation.y -= py;
+        } else if tf.translation.y < -hy {
+            tf.translation.y += py;
+        }
     }
 }
 
@@ -1966,7 +2209,8 @@ fn fit_camera_to_screen(
     let Ok(mut transform) = camera.single_mut() else {
         return;
     };
-    let zoom = (view.map_w / w).min(view.map_h / h).clamp(MIN_ZOOM, MAX_ZOOM);
+    let max_zoom = max_zoom_for(&view, Some(window));
+    let zoom = (view.map_w / w).min(view.map_h / h).clamp(MIN_ZOOM, max_zoom);
     transform.scale = Vec3::splat(zoom);
 }
 
@@ -2037,14 +2281,31 @@ fn pick_selection(
 
     let pick_r2 = (view.hex_size * 0.6).powi(2);
     let hex_r2 = (view.hex_size * 1.1).powi(2);
+    let (px, py) = (view.period_x, view.period_y);
+    // Wrap a world point into the canonical central tile of the mosaic so taps on ghost
+    // copies map back to the underlying entity (which lives in the central tile only).
+    let wrap_to_central = |p: Vec2| -> Vec2 {
+        let wx = if px > 0.0 {
+            (p.x + px * 0.5).rem_euclid(px) - px * 0.5
+        } else {
+            p.x
+        };
+        let wy = if py > 0.0 {
+            (p.y + py * 0.5).rem_euclid(py) - py * 0.5
+        } else {
+            p.y
+        };
+        Vec2::new(wx, wy)
+    };
     for screen in points {
         let Ok(world_pos) = camera.viewport_to_world_2d(cam_tf, screen) else {
             continue;
         };
+        let pick_pos = wrap_to_central(world_pos);
         // Prefer the nearest noot under the pointer — tapping a noot follows it.
         let mut best: Option<(Entity, f32)> = None;
         for (e, tf, _) in &noots {
-            let d2 = tf.translation.truncate().distance_squared(world_pos);
+            let d2 = tf.translation.truncate().distance_squared(pick_pos);
             if d2 <= pick_r2 && best.is_none_or(|(_, bd)| d2 < bd) {
                 best = Some((e, d2));
             }
@@ -2058,7 +2319,7 @@ fn pick_selection(
         let mut nearest: Option<(usize, f32)> = None;
         for (i, t) in sim.0.tiles.iter().enumerate() {
             let c = tile_to_pixel(t.col, t.row, view.hex_size, view.offset);
-            let d2 = c.distance_squared(world_pos);
+            let d2 = c.distance_squared(pick_pos);
             if d2 <= hex_r2 && nearest.is_none_or(|(_, bd)| d2 < bd) {
                 nearest = Some((i, d2));
             }
@@ -2524,7 +2785,8 @@ fn sync_structure_markers(
     mut spawned: Local<usize>,
     mut assets: Local<Option<StructAssets>>,
     bodies: Query<(&StructureMarker, &MeshMaterial2d<ColorMaterial>)>,
-    mut emblems: Query<(&StructureEmblem, &mut Mesh2d)>,
+    mut emblems: Query<(&StructureEmblem, &mut Mesh2d), Without<StructureEmblemGhost>>,
+    mut emblem_ghosts: Query<(&StructureEmblemGhost, &mut Mesh2d), Without<StructureEmblem>>,
 ) {
     let hs = view.hex_size;
     let a = assets.get_or_insert_with(|| StructAssets {
@@ -2536,30 +2798,66 @@ fn sync_structure_markers(
         emblem_mat: materials.add(Color::srgba(0.97, 0.98, 1.0, 0.95)),
     });
     let n = sim.0.structures.len();
+    let (period_x, period_y) = (view.period_x, view.period_y);
     while *spawned < n {
         let s = &sim.0.structures[*spawned];
         let tile = &sim.0.tiles[s.tile];
         let (x, y) = hex::hex_center(tile.col, tile.row, view.hex_size);
         let (px, py) = (x + view.offset.x, y + view.offset.y);
         // Frame (z 0.98) → body (z 1.0) → emblem (z 1.06); all under the noot layer (2.0)
-        // so a noot visiting the shop still draws on top.
-        commands.spawn((
-            Mesh2d(a.frame.clone()),
-            MeshMaterial2d(a.frame_mat.clone()),
-            Transform::from_xyz(px, py, 0.98),
-        ));
-        commands.spawn((
-            Mesh2d(a.body.clone()),
-            MeshMaterial2d(materials.add(structure_color(s.kind))),
-            Transform::from_xyz(px, py, 1.0),
-            StructureMarker { structure: *spawned },
-        ));
-        commands.spawn((
-            Mesh2d(emblem_mesh(s.kind, a)),
-            MeshMaterial2d(a.emblem_mat.clone()),
-            Transform::from_xyz(px, py, 1.06),
-            StructureEmblem { structure: *spawned },
-        ));
+        // so a noot visiting the shop still draws on top. Each layer also spawns 8 ghosts
+        // at the torus wrap offsets so the structure reads in every tiled copy.
+        commands
+            .spawn((
+                Mesh2d(a.frame.clone()),
+                MeshMaterial2d(a.frame_mat.clone()),
+                Transform::from_xyz(px, py, 0.98),
+            ))
+            .with_children(|p| {
+                for (dx, dy) in TILE_OFFSETS_8 {
+                    p.spawn((
+                        Mesh2d(a.frame.clone()),
+                        MeshMaterial2d(a.frame_mat.clone()),
+                        Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                    ));
+                }
+            });
+        let body_mat = materials.add(structure_color(s.kind));
+        commands
+            .spawn((
+                Mesh2d(a.body.clone()),
+                MeshMaterial2d(body_mat.clone()),
+                Transform::from_xyz(px, py, 1.0),
+                StructureMarker { structure: *spawned },
+            ))
+            .with_children(|p| {
+                for (dx, dy) in TILE_OFFSETS_8 {
+                    p.spawn((
+                        Mesh2d(a.body.clone()),
+                        MeshMaterial2d(body_mat.clone()),
+                        Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                    ));
+                }
+            });
+        let em_mesh = emblem_mesh(s.kind, a);
+        let em_idx = *spawned;
+        commands
+            .spawn((
+                Mesh2d(em_mesh.clone()),
+                MeshMaterial2d(a.emblem_mat.clone()),
+                Transform::from_xyz(px, py, 1.06),
+                StructureEmblem { structure: em_idx },
+            ))
+            .with_children(|p| {
+                for (dx, dy) in TILE_OFFSETS_8 {
+                    p.spawn((
+                        Mesh2d(em_mesh.clone()),
+                        MeshMaterial2d(a.emblem_mat.clone()),
+                        Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                        StructureEmblemGhost { structure: em_idx },
+                    ));
+                }
+            });
         *spawned += 1;
     }
     // Keep bodies/emblems in sync with kinds (cheap — few structures).
@@ -2570,6 +2868,14 @@ fn sync_structure_markers(
     }
     for (emblem, mut mesh2d) in &mut emblems {
         let want = emblem_mesh(sim.0.structures[emblem.structure].kind, a);
+        if mesh2d.0 != want {
+            mesh2d.0 = want;
+        }
+    }
+    // Ghosts carry their own Mesh2d (children's mesh isn't inherited), so they need the
+    // same swap on a kind flip to keep the mosaic in step with the central emblem.
+    for (ghost, mut mesh2d) in &mut emblem_ghosts {
+        let want = emblem_mesh(sim.0.structures[ghost.structure].kind, a);
         if mesh2d.0 != want {
             mesh2d.0 = want;
         }

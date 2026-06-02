@@ -45,4 +45,9 @@ pub struct MapView {
     /// Full map extent in world units, used to fit the camera on launch.
     pub map_w: f32,
     pub map_h: f32,
+    /// Wrap period in world units — the exact horizontal/vertical step that maps a tile
+    /// to its torus-identical neighbour. Used to place ghost children for tiled rendering
+    /// and to wrap the camera, so panning across a seam is visually seamless.
+    pub period_x: f32,
+    pub period_y: f32,
 }
