@@ -123,9 +123,40 @@ pub struct World {
     /// lazy resizing in `accumulate_traffic` keep pre-edge saves loading (empty → rebuilt).
     #[serde(default)]
     pub road_edges: Vec<f32>,
+    /// Symmetric **toroidal hex-distance table**, `cols*rows × cols*rows` entries as `u8`
+    /// (distance ≤ `cols/2 + rows/2`, comfortably under 255 for any sane map). Built once
+    /// in `generate` and after `deserialize`; replaces the inline 9-image
+    /// [`hex::torus_distance`] sweep on the hot path (`best_market_tile` was 54 % of
+    /// sim CPU before the table). Skipped by serde and rebuilt lazily on first access
+    /// after a load so old saves still resume.
+    #[serde(skip)]
+    pub dist_table: Vec<u8>,
 }
 
 impl World {
+    /// Toroidal hex distance between two offset coordinates, served from the precomputed
+    /// `dist_table`. Hot path: this replaces the 9-image `hex::torus_distance` sweep in
+    /// `best_market_tile` and friends. `ensure_dist_table` lazily rebuilds the table after
+    /// a save load (it's skipped by serde), so callers can rely on the lookup being safe
+    /// after the first sim tick post-load.
+    #[inline]
+    pub fn dist(&self, ac: i32, ar: i32, bc: i32, br: i32) -> i32 {
+        let n = (self.cols * self.rows) as usize;
+        let a = (ar * self.cols + ac) as usize;
+        let b = (br * self.cols + bc) as usize;
+        self.dist_table[a * n + b] as i32
+    }
+
+    /// Rebuild the distance table if it's missing (e.g. just deserialized from a save
+    /// that predates the field, or one whose map size changed). Idempotent and cheap to
+    /// guard — the `len()` check is a single integer compare.
+    pub fn ensure_dist_table(&mut self) {
+        let n = (self.cols * self.rows) as usize;
+        if self.dist_table.len() != n * n {
+            self.dist_table = build_dist_table(self.cols, self.rows);
+        }
+    }
+
     /// Place a structure of `kind` on `tile`: replace an existing (unclaimed) structure's
     /// kind in place if there is one, else append a new one. Returns the structure index.
     pub fn build_structure(&mut self, tile: usize, kind: StructureKind) -> usize {
@@ -299,6 +330,7 @@ pub fn generate(seed: u64, cols: i32, rows: i32, hex_size: f32) -> World {
 
     let tiles = generate_terrain(&mut rng, cols, rows);
     let road_edges = vec![0.0; tiles.len() * 6];
+    let dist_table = build_dist_table(cols, rows);
     let mut world = World {
         seed,
         cols,
@@ -310,9 +342,32 @@ pub fn generate(seed: u64, cols: i32, rows: i32, hex_size: f32) -> World {
         goods: world_goods,
         structures: Vec::new(),
         road_edges,
+        dist_table,
     };
     place_deposits(&mut rng, &mut world);
     world
+}
+
+/// Precompute the full `cols*rows × cols*rows` toroidal hex-distance table. O(N²) at
+/// gen time, then every per-tile distance lookup on the hot path is one u8 load instead
+/// of nine `cube_distance` evaluations.
+fn build_dist_table(cols: i32, rows: i32) -> Vec<u8> {
+    let n = (cols * rows) as usize;
+    let mut t = vec![0u8; n * n];
+    for ar in 0..rows {
+        for ac in 0..cols {
+            let a = (ar * cols + ac) as usize;
+            // Symmetric: fill (a, b) and (b, a) together, skip the diagonal (zero by init).
+            for b in (a + 1)..n {
+                let bc = (b as i32) % cols;
+                let br = (b as i32) / cols;
+                let d = crate::hex::torus_distance(ac, ar, bc, br, cols, rows) as u8;
+                t[a * n + b] = d;
+                t[b * n + a] = d;
+            }
+        }
+    }
+    t
 }
 
 fn generate_terrain(rng: &mut Rng, cols: i32, rows: i32) -> Vec<Tile> {

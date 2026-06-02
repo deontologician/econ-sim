@@ -94,8 +94,8 @@ fn snapshot_from_value(mut value: serde_json::Value) -> Option<Snapshot> {
         version += 1;
         value["version"] = serde_json::json!(version);
     }
-    match serde_json::from_value::<Snapshot>(value.clone()) {
-        Ok(snap) => Some(snap),
+    let mut snap = match serde_json::from_value::<Snapshot>(value.clone()) {
+        Ok(snap) => snap,
         Err(_) => {
             // Recovery: the shared `policy` is a large float blob, and if any weight
             // ever went non-finite, `serde_json` wrote it as `null` (which won't parse
@@ -105,9 +105,13 @@ fn snapshot_from_value(mut value: serde_json::Value) -> Option<Snapshot> {
             if let Some(obj) = value.as_object_mut() {
                 obj.remove("policy");
             }
-            serde_json::from_value(value).ok()
+            serde_json::from_value(value).ok()?
         }
-    }
+    };
+    // The distance table is `#[serde(skip)]`, so it loads empty — rebuild it before
+    // anything calls `World::dist`. Cheap (a single O(N²) pass at load time).
+    snap.world.ensure_dist_table();
+    Some(snap)
 }
 
 /// Parse a snapshot from a JSON string, replaying migrations and applying the same

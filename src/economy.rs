@@ -11,7 +11,7 @@
 use bevy::prelude::*;
 
 use crate::goods::{self, form_of, GoodForm, ItemRole, N_ITEMS};
-use crate::hex::{hex_center, neighbors, torus_distance};
+use crate::hex::{hex_center, neighbors};
 use crate::noot::*;
 use crate::world::{terrain_factor, DepositKind, World};
 use crate::policy::{self, ActorCritic, PolicyMemory, Trainer, Transition, N_ACT, N_OTHER};
@@ -87,7 +87,7 @@ fn nearest_structure(
             let t = &world.tiles[s.tile];
             (t.col, t.row)
         })
-        .min_by_key(|&(c, r)| torus_distance(pos.col, pos.row, c, r, world.cols, world.rows))
+        .min_by_key(|&(c, r)| world.dist(pos.col, pos.row, c, r))
 }
 
 /// Experience gained per unit produced (mining + refining); experience is per
@@ -619,7 +619,7 @@ fn mine_target(
             let t = &world.tiles[dep.tile];
             (t.col, t.row)
         })
-        .min_by_key(|&(c, r)| torus_distance(pos.col, pos.row, c, r, world.cols, world.rows))
+        .min_by_key(|&(c, r)| world.dist(pos.col, pos.row, c, r))
 }
 
 /// The tile where the goods this noot is carrying would fetch the most, net of the haul
@@ -655,7 +655,7 @@ fn best_market_tile(
             if val <= 0.0 {
                 continue;
             }
-            let dist = torus_distance(pos.col, pos.row, c, r, cols, rows) as f32;
+            let dist = world.dist(pos.col, pos.row, c, r) as f32;
             let score = val - MARKET_DIST_PENALTY * dist;
             if best.is_none_or(|(_, s)| score > s) {
                 best = Some(((c, r), score));
@@ -672,12 +672,12 @@ fn best_market_tile(
 fn heading_gradient(world: &crate::world::World, pos: &TilePos, target: Option<(i32, i32)>) -> [f32; policy::N_DIRS] {
     let mut g = [0.0f32; policy::N_DIRS];
     if let Some((tc, tr)) = target {
-        let here = torus_distance(pos.col, pos.row, tc, tr, world.cols, world.rows);
+        let here = world.dist(pos.col, pos.row, tc, tr);
         for (d, &(nc, nr)) in neighbors(pos.col, pos.row, world.cols, world.rows)
             .iter()
             .enumerate()
         {
-            g[d] = (here - torus_distance(nc, nr, tc, tr, world.cols, world.rows)) as f32;
+            g[d] = (here - world.dist(nc, nr, tc, tr)) as f32;
         }
     }
     g
@@ -719,7 +719,7 @@ fn features(
     o[policy::O_NOOT_DIR..policy::O_NOOT_DIR + policy::N_DIRS].copy_from_slice(&noot);
     if let Some((tc, tr)) = nearest_noot {
         // "Within trade range" ≈ adjacent or co-located (the trade radius is ~1 hex).
-        let d = torus_distance(pos.col, pos.row, tc, tr, world.cols, world.rows);
+        let d = world.dist(pos.col, pos.row, tc, tr);
         o[policy::O_NOOT_NEAR] = if d <= 1 { 1.0 } else { 0.0 };
     }
     o[policy::O_TERRAIN] = world.tiles[pos_idx].difficulty.clamp(0.0, 1.0);
@@ -736,13 +736,12 @@ fn nearest_other_noot(
     snapshot: &[(Entity, i32, i32)],
     me: Entity,
     pos: &TilePos,
-    cols: i32,
-    rows: i32,
+    world: &crate::world::World,
 ) -> Option<(i32, i32)> {
     snapshot
         .iter()
         .filter(|(e, _, _)| *e != me)
-        .min_by_key(|(_, c, r)| torus_distance(pos.col, pos.row, *c, *r, cols, rows))
+        .min_by_key(|(_, c, r)| world.dist(pos.col, pos.row, *c, *r))
         .map(|&(_, c, r)| (c, r))
 }
 
@@ -834,7 +833,7 @@ fn option_target(
         policy::A_MINE => mine_target(world, claim, pos, claimed),
         policy::A_SELL => nearest_structure(world, pos, StructureKind::Shop)
             .filter(|&(c, r)| {
-                torus_distance(pos.col, pos.row, c, r, world.cols, world.rows) <= SHOP_RANGE
+                world.dist(pos.col, pos.row, c, r) <= SHOP_RANGE
             })
             .or_else(|| best_market_tile(field, world, pos, inv, trader)),
         policy::A_REFINE => nearest_structure(world, pos, StructureKind::Refinery),
@@ -883,11 +882,11 @@ fn value_guided_step(
     target: (i32, i32),
 ) -> (i32, i32) {
     let (cols, rows) = (world.cols, world.rows);
-    let here = torus_distance(col, row, target.0, target.1, cols, rows);
+    let here = world.dist(col, row, target.0, target.1);
     let mut best = (col, row);
     let mut best_score = f32::MIN;
     for (dir, (nc, nr)) in neighbors(col, row, cols, rows).into_iter().enumerate() {
-        let dist = torus_distance(nc, nr, target.0, target.1, cols, rows);
+        let dist = world.dist(nc, nr, target.0, target.1);
         let on_route = (here - dist) as f32; // +1 closer, 0 sideways, −1 farther
         let tile = (nr * cols + nc) as usize;
         // Road pull is on the *edge* we'd cross to reach this neighbour, not the tile.
@@ -1021,7 +1020,7 @@ pub fn policy_step(
 
         // Features at the current tile, recomputed each acting step: they feed both the
         // option decision (when re-deciding) and the value-guided "GPS" movement below.
-        let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world.cols, world.rows);
+        let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world);
         let (s_pos, s_o) = features(
             world, &field, &pos, claim, hunger, inv, wallet, trader, &claimed, nearest_noot,
         );
@@ -1612,7 +1611,7 @@ fn rebuild_price_field(field: &mut PriceField, world: &World) {
         for r in 0..rows {
             for c in 0..cols {
                 let tile = (r * cols + c) as usize;
-                let dist = torus_distance(c, r, dt.col, dt.row, cols, rows) as f32;
+                let dist = world.dist(c, r, dt.col, dt.row) as f32;
                 // Nearest source (physical, regardless of fullness) for the haul metric.
                 let sd = &mut field.src_dist[tile * n_slots + slot];
                 *sd = sd.min(dist);
