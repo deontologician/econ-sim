@@ -808,6 +808,12 @@ fn setup(
             let (mx, my) = ((ax + bx) * 0.5 + offset.x, (ay + by) * 0.5 + offset.y);
             let angle = (by - ay).atan2(bx - ax);
             let road_mat = materials.add(Color::srgba(0.78, 0.60, 0.30, 0.0));
+            // The parent's rotation propagates into every child's GlobalTransform, so a
+            // naïve `(dx*period_x, dy*period_y)` child translation would be rotated by
+            // the segment angle before adding to the parent position — scattering the
+            // ghosts to bogus places. Pre-rotate by the inverse so the world-space offset
+            // is the intended axis-aligned period step.
+            let inv_rot = Quat::from_rotation_z(-angle);
             commands
                 .spawn((
                     Mesh2d(seg_mesh.clone()),
@@ -818,10 +824,11 @@ fn setup(
                 ))
                 .with_children(|p| {
                     for (dx, dy) in TILE_OFFSETS_8 {
+                        let local = inv_rot * Vec3::new(dx * period_x, dy * period_y, 0.0);
                         p.spawn((
                             Mesh2d(seg_mesh.clone()),
                             MeshMaterial2d(road_mat.clone()),
-                            Transform::from_xyz(dx * period_x, dy * period_y, 0.0),
+                            Transform::from_translation(local),
                         ));
                     }
                 });
