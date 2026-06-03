@@ -229,6 +229,10 @@ impl ActorCritic {
     /// before this, and we'd otherwise recompute `tanh(embed[pos] + W·o + b1)` for
     /// the same `(pos, o)`. Cutting that out drops one of the three `hidden()` calls
     /// per minibatch sample, the single biggest steady-state hot spot.
+    ///
+    /// `weight` is the importance-sampling correction for prioritised replay
+    /// (`(N · P(i))^(−β)`, normalised per batch to ≤ 1). Pass `1.0` for uniform
+    /// sampling — the multiply is then a no-op and the compiler folds it.
     fn backward_accumulate(
         &self,
         grad: &mut ActorCritic,
@@ -239,6 +243,7 @@ impl ActorCritic {
         act: usize,
         y: f32,
         adv: f32,
+        weight: f32,
     ) {
         let logits = self.logits_from_hidden(h);
         let pi = masked_softmax(&logits, mask);
@@ -250,7 +255,9 @@ impl ActorCritic {
         }
         let v = self.value_from_hidden(h);
 
-        // Gradient on each action logit (policy gradient + entropy bonus).
+        // Gradient on each action logit (policy gradient + entropy bonus). IS weight
+        // scales the whole gradient contribution for this sample so over-sampled
+        // (high-priority) transitions don't bias the parameter update.
         let mut glog = [0.0f32; N_ACT];
         for i in 0..N_ACT {
             if !mask[i] {
@@ -258,9 +265,9 @@ impl ActorCritic {
             }
             let pg = adv * (pi[i] - if i == act { 1.0 } else { 0.0 });
             let eg = ENTROPY_BETA * pi[i] * (pi[i].max(1e-12).ln() + ent);
-            glog[i] = pg + eg;
+            glog[i] = (pg + eg) * weight;
         }
-        let dv = VALUE_COEF * (v - y);
+        let dv = VALUE_COEF * (v - y) * weight;
 
         // Heads.
         for j in 0..H {
@@ -384,6 +391,41 @@ pub fn sample(probs: &[f32; N_ACT], rng: &mut Rng) -> usize {
 }
 
 // --- Replay buffer ----------------------------------------------------------
+/// Runtime knobs for the policy learner — not part of saved state, configured at
+/// startup (headless CLI flag, GUI toggle). Lets us A/B test feature changes (the
+/// initial use is prioritised experience replay) without recompiling.
+#[derive(Resource, Clone)]
+pub struct PolicyConfig {
+    /// When `true`, the replay buffer samples in proportion to `(|TD error| + ε)^α`
+    /// instead of uniformly, and the gradient is corrected by the importance-sampling
+    /// weight `w_i = (N · P(i))^(−β)` (normalised per batch so weights ≤ 1). New
+    /// transitions enter at the running max priority, so they're guaranteed at least
+    /// one sample before aging out. When `false`, the sum tree degenerates to uniform
+    /// sampling (all leaves carry weight 1) — measured overhead vs the old `Vec`-backed
+    /// uniform buffer is <1 % of steady-state CPU, well below noise, so this is the
+    /// path A/B comparisons should treat as the baseline.
+    pub prioritized_replay: bool,
+    /// Priority exponent (PER paper notation: α). 0 → uniform, 1 → fully greedy. 0.6
+    /// is the standard PER default and biases sampling without collapsing diversity.
+    pub per_alpha: f32,
+    /// IS-correction exponent (PER paper notation: β). Usually annealed from 0.4 → 1.0
+    /// over training, but a fixed 0.4 is fine for short ablations.
+    pub per_beta: f32,
+    /// Priority floor — keeps every transition reachable even with zero TD error.
+    pub per_eps: f32,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            prioritized_replay: false,
+            per_alpha: 0.6,
+            per_beta: 0.4,
+            per_eps: 1e-3,
+        }
+    }
+}
+
 /// One MDP transition. `mask` is the action mask at `s` (needed for the actor's
 /// masked softmax); the V-critic bootstrap needs no mask at `s2`.
 #[derive(Clone)]
@@ -398,23 +440,107 @@ pub struct Transition {
     pub done: bool,
 }
 
-#[derive(Default)]
+/// Sum-tree-backed replay buffer. Used by both uniform and prioritised sampling
+/// modes — in uniform mode all leaves carry weight 1 and the tree degenerates to a
+/// flat distribution (sampling is still O(log N) but that's negligible at N=16 K),
+/// so the same code services both branches. The sum tree is a binary heap-shaped
+/// `Vec<f32>` with leaves at indices `[BUFFER_CAP - 1, 2·BUFFER_CAP - 2]`; each
+/// internal node holds the sum of its two children. Insertion + priority update is
+/// O(log N) (propagate the delta up the tree); weighted sampling is O(log N) (walk
+/// down picking the child whose cumulative weight covers a random `u ∈ [0, total)`).
+///
+/// `BUFFER_CAP` must be a power of two for the tree shape.
 struct ReplayBuffer {
     items: Vec<Transition>,
-    head: usize,
+    /// Sum tree of `priority^α` (or 1 in uniform mode). Size `2 · BUFFER_CAP − 1`.
+    tree: Vec<f32>,
+    /// Ring-buffer write cursor.
+    next: usize,
+    /// Running max `priority^α`. New transitions enter at this value so they
+    /// participate in at least one minibatch before aging out.
+    max_p_alpha: f32,
+}
+
+impl Default for ReplayBuffer {
+    fn default() -> Self {
+        Self {
+            items: Vec::with_capacity(BUFFER_CAP),
+            tree: vec![0.0; 2 * BUFFER_CAP - 1],
+            next: 0,
+            max_p_alpha: 1.0,
+        }
+    }
 }
 
 impl ReplayBuffer {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn total(&self) -> f32 {
+        self.tree[0]
+    }
+
+    /// Insert a transition (ring buffer overwrites the oldest once full). Its initial
+    /// priority is the running max so it's guaranteed at least one sample.
     fn push(&mut self, t: Transition) {
+        let leaf = self.next;
         if self.items.len() < BUFFER_CAP {
             self.items.push(t);
         } else {
-            self.items[self.head] = t;
-            self.head = (self.head + 1) % BUFFER_CAP;
+            self.items[leaf] = t;
+        }
+        let p = self.max_p_alpha;
+        self.update_leaf(leaf, p);
+        self.next = (self.next + 1) % BUFFER_CAP;
+    }
+
+    /// Set leaf `leaf`'s `priority^α` to `p` and propagate the delta up the tree.
+    fn update_leaf(&mut self, leaf: usize, p: f32) {
+        if p > self.max_p_alpha {
+            self.max_p_alpha = p;
+        }
+        let mut idx = leaf + BUFFER_CAP - 1;
+        let delta = p - self.tree[idx];
+        self.tree[idx] = p;
+        while idx > 0 {
+            idx = (idx - 1) / 2;
+            self.tree[idx] += delta;
         }
     }
-    fn sample(&self, rng: &mut Rng) -> &Transition {
-        &self.items[rng.below(self.items.len())]
+
+    /// Walk the tree to find the leaf whose cumulative `priority^α` covers `u`.
+    /// Returns `(leaf_idx, leaf's priority^α)`. Clamps the returned leaf to the
+    /// populated range — the internal-node sums are floats and the tree extends to
+    /// `BUFFER_CAP` regardless of how many transitions have actually been pushed, so
+    /// FP rounding lets `u` occasionally exceed the "real" cumulative sum and land
+    /// the descent in a zero-priority unused leaf (`len()`..`BUFFER_CAP`). The clamp
+    /// re-aims at the closest populated leaf with negligible distributional impact.
+    fn find(&self, mut u: f32) -> (usize, f32) {
+        let mut idx = 0;
+        loop {
+            let left = 2 * idx + 1;
+            if left >= self.tree.len() {
+                break;
+            }
+            if u <= self.tree[left] {
+                idx = left;
+            } else {
+                u -= self.tree[left];
+                idx = left + 1;
+            }
+        }
+        let raw_leaf = idx - (BUFFER_CAP - 1);
+        let max_leaf = self.items.len().saturating_sub(1);
+        let leaf = raw_leaf.min(max_leaf);
+        let priority = self.tree[leaf + BUFFER_CAP - 1];
+        (leaf, priority)
+    }
+
+    /// Pick a transition uniformly at random (ignores priorities). Used in uniform
+    /// mode and for the "warming-up" branch before priorities have meaning.
+    fn sample_uniform_idx(&self, rng: &mut Rng) -> usize {
+        rng.below(self.items.len())
     }
 }
 
@@ -426,11 +552,22 @@ pub struct Trainer {
     vel: ActorCritic,
     buffer: ReplayBuffer,
     sized: bool,
+    /// EWMA of per-sample `|y − V(s)|` (the magnitude of the bootstrap residual). It's
+    /// the obvious A/B metric for "did prioritised replay help the critic converge?" —
+    /// surfaced through `EconStats` / the headless JSONL so two runs can be compared
+    /// without recompiling. EWMA so it tracks recent training, not lifetime.
+    pub mean_abs_td_error: f32,
 }
+
+const TD_EWMA_ALPHA: f32 = 0.01;
 
 impl Trainer {
     pub fn record(&mut self, t: Transition) {
         self.buffer.push(t);
+    }
+
+    pub fn mean_abs_td_error(&self) -> f32 {
+        self.mean_abs_td_error
     }
 
     fn ensure_sized(&mut self, online: &ActorCritic) {
@@ -441,15 +578,56 @@ impl Trainer {
         }
     }
 
-    /// One minibatch A2C update on `online` (no-op until the buffer is warm).
-    pub fn train(&mut self, online: &mut ActorCritic, rng: &mut Rng) {
-        if self.buffer.items.len() < WARMUP {
+    /// One minibatch A2C update on `online` (no-op until the buffer is warm). Branches
+    /// on `cfg.prioritized_replay`: in uniform mode we sample by random index and the
+    /// IS weight is `1`; in prioritised mode we sample by tree-walk with `u ∈ [0,
+    /// total)`, compute `w_i = (N · P(i))^(−β)` normalised so `max w_i = 1` over the
+    /// batch, and write back each sample's `(|TD| + ε)^α` to its leaf so the priority
+    /// reflects the *current* network's error. The same forward `h` is reused for
+    /// both the bootstrap value and the backward pass either way.
+    pub fn train(&mut self, online: &mut ActorCritic, rng: &mut Rng, cfg: &PolicyConfig) {
+        if self.buffer.len() < WARMUP {
             return;
         }
         self.ensure_sized(online);
         let mut grad = online.zeros_like();
-        for _ in 0..BATCH {
-            let t = self.buffer.sample(rng).clone();
+        let n = self.buffer.len() as f32;
+        let prioritized = cfg.prioritized_replay;
+
+        // Pre-roll the BATCH leaf indices and raw IS weights, then normalise so the
+        // largest weight in the batch is 1.0 (per PER's "max-normalised IS weights"
+        // — keeps the effective step size stable as priorities change).
+        let mut leaves = [0usize; BATCH];
+        let mut weights = [1.0f32; BATCH];
+        let mut max_w = 0.0f32;
+        if prioritized {
+            let total = self.buffer.total().max(1e-12);
+            for k in 0..BATCH {
+                let u = rng.next_f32() * total;
+                let (leaf, p_alpha) = self.buffer.find(u);
+                leaves[k] = leaf;
+                let p = (p_alpha / total).max(1e-12);
+                let w = (n * p).powf(-cfg.per_beta);
+                weights[k] = w;
+                if w > max_w {
+                    max_w = w;
+                }
+            }
+            if max_w > 0.0 {
+                for w in &mut weights {
+                    *w /= max_w;
+                }
+            }
+        } else {
+            for leaf in &mut leaves {
+                *leaf = self.buffer.sample_uniform_idx(rng);
+            }
+        }
+
+        for k in 0..BATCH {
+            let leaf = leaves[k];
+            let weight = weights[k];
+            let t = self.buffer.items[leaf].clone();
             // Compute the online forward pass *once* and reuse `h` in backward —
             // saves one `hidden()` call (~28 multiplies + tanh) per sample, the
             // biggest single hot spot under steady-state profiling.
@@ -462,12 +640,41 @@ impl Trainer {
             };
             let y = (t.r + GAMMA * v2).clamp(-VALUE_CLIP, VALUE_CLIP);
             let adv = (y - v).clamp(-ADV_CLIP, ADV_CLIP);
-            online.backward_accumulate(&mut grad, t.pos, &t.o, &h, &t.mask, t.act, y, adv);
+            online.backward_accumulate(&mut grad, t.pos, &t.o, &h, &t.mask, t.act, y, adv, weight);
+
+            if prioritized {
+                let td = (y - v).abs();
+                let new_p = (td + cfg.per_eps).powf(cfg.per_alpha);
+                self.buffer.update_leaf(leaf, new_p);
+            }
         }
         online.apply(&grad, &mut self.vel, 1.0 / BATCH as f32);
         self.target.polyak_toward(online);
+
+        // Diagnostic — measure mean |TD| over a *uniform* mini-sample of the buffer
+        // regardless of the training sampler. Updating the EWMA from the training
+        // batch directly would bias PER comparisons (PER deliberately oversamples
+        // high-TD transitions, so the training-sample mean drifts up while the
+        // buffer-wide mean could be falling). 4 samples × 2 forward passes is a
+        // ~6 % overhead on `train()` but makes A/B comparison honest.
+        for _ in 0..TD_DIAG_SAMPLES {
+            let leaf = self.buffer.sample_uniform_idx(rng);
+            let t = &self.buffer.items[leaf];
+            let h = online.hidden(t.pos, &t.o);
+            let v = online.value_from_hidden(&h);
+            let v2 = if t.done {
+                0.0
+            } else {
+                self.target.value(t.pos2, &t.o2)
+            };
+            let y = (t.r + GAMMA * v2).clamp(-VALUE_CLIP, VALUE_CLIP);
+            let td = (y - v).abs();
+            self.mean_abs_td_error += TD_EWMA_ALPHA * (td - self.mean_abs_td_error);
+        }
     }
 }
+
+const TD_DIAG_SAMPLES: usize = 4;
 
 /// Per-noot policy state: exploration ε, decision cadence, the cached last
 /// (state, action) for forming the next transition, and a death flag. Transient
@@ -578,8 +785,9 @@ mod tests {
                 done: true,
             });
         }
+        let cfg = PolicyConfig::default();
         for _ in 0..200 {
-            tr.train(&mut ac, &mut rng);
+            tr.train(&mut ac, &mut rng, &cfg);
         }
         assert!(ac.value(5, &o) > before);
     }

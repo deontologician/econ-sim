@@ -1446,6 +1446,7 @@ pub fn train_policy(
     mut ac: ResMut<ActorCritic>,
     mut trainer: ResMut<Trainer>,
     mut rng: ResMut<SimRng>,
+    cfg: Res<policy::PolicyConfig>,
     mut tick: Local<u32>,
 ) {
     *tick = tick.wrapping_add(1);
@@ -1453,7 +1454,7 @@ pub fn train_policy(
         return;
     }
     for _ in 0..TRAIN_ITERS_PER_ROUND {
-        trainer.train(&mut ac, &mut rng.0);
+        trainer.train(&mut ac, &mut rng.0, &cfg);
     }
 }
 

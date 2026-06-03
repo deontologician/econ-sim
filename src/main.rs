@@ -14,7 +14,7 @@ use econ_sim::noot::{
     Action, Claim, Hunger, Inventory, Noot, NootMeta, NootName, TilePos, Trader, Wallet,
     EXPLORE_MAX, EXPLORE_MIN, STARTING_BUCKS,
 };
-use econ_sim::policy::{ActorCritic, PolicyMemory, Trainer};
+use econ_sim::policy::{ActorCritic, PolicyConfig, PolicyMemory, Trainer};
 use econ_sim::world::{generate, World};
 use econ_sim::history::RollupHistory;
 use econ_sim::{elements, graph, hex, icon, rng::Rng, save, MapView, Sim, SimRng};
@@ -509,6 +509,7 @@ fn main() {
         .init_resource::<economy::TradeBuckets>()
         .init_resource::<economy::MeetTradeScratch>()
         .init_resource::<economy::PolicyStepScratch>()
+        .init_resource::<PolicyConfig>()
         .init_resource::<Trainer>()
         .add_systems(Startup, setup)
         // The fixed-tick simulation pipeline (each system advances the world by one

@@ -32,7 +32,7 @@ use econ_sim::noot::{
     Action, Claim, Hunger, Inventory, NootMeta, NootName, Noot, TilePos, Trader, Wallet,
     EXPLORE_MAX, EXPLORE_MIN, STARTING_BUCKS,
 };
-use econ_sim::policy::{ActorCritic, PolicyMemory, Trainer};
+use econ_sim::policy::{ActorCritic, PolicyConfig, PolicyMemory, Trainer};
 use econ_sim::rng::Rng;
 use econ_sim::world::generate;
 use econ_sim::{save, Sim, SimRng};
@@ -62,11 +62,17 @@ struct Cli {
     sample_every: u64,
     load: Option<String>,
     save: Option<String>,
+    /// `--prioritized` flips the policy's replay sampler to PER (priority ∝
+    /// `(|TD error| + ε)^α` with IS-weight gradient correction). Default off so an
+    /// A/B is `headless ...` vs `headless --prioritized ...` with everything else
+    /// held — same seed, same ticks, same config. The JSONL stream carries
+    /// `mean_abs_td_error` per sample so the two runs can be diffed directly.
+    prioritized: bool,
 }
 
 fn parse_cli() -> Cli {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (mut load, mut save) = (None, None);
+    let (mut load, mut save, mut prioritized) = (None, None, false);
     let mut pos: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -78,6 +84,10 @@ fn parse_cli() -> Cli {
             "--save" => {
                 save = args.get(i + 1).cloned();
                 i += 2;
+            }
+            "--prioritized" => {
+                prioritized = true;
+                i += 1;
             }
             other => {
                 pos.push(other.to_string());
@@ -95,6 +105,7 @@ fn parse_cli() -> Cli {
             .max(1),
         load,
         save,
+        prioritized,
     }
 }
 
@@ -138,6 +149,10 @@ fn main() {
     w.insert_resource(economy::TradeBuckets::default());
     w.insert_resource(economy::MeetTradeScratch::default());
     w.insert_resource(economy::PolicyStepScratch::default());
+    w.insert_resource(PolicyConfig {
+        prioritized_replay: cli.prioritized,
+        ..PolicyConfig::default()
+    });
 
     match restore_noots {
         Some(noots) => {
@@ -268,6 +283,7 @@ fn emit_record(w: &mut World) {
     let stats = w.resource::<EconStats>().clone();
     let hunger = w.resource::<HungerControl>().clone();
     let income = w.resource::<IncomeControl>().clone();
+    let mean_abs_td_error = w.resource::<Trainer>().mean_abs_td_error();
 
     // Population aggregates (one pass over the noots).
     let sim_ref = w.resource::<Sim>();
@@ -352,6 +368,7 @@ fn emit_record(w: &mut World) {
 
     let record = serde_json::json!({
         "tick": stats.ticks,
+        "mean_abs_td_error": mean_abs_td_error,
         "trades_total": stats.trades_total,
         "production_rate": stats.production_rate,
         "consumption_rate": stats.consumption_rate,
