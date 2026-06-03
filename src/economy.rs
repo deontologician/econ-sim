@@ -623,6 +623,16 @@ fn mine_target(
         .min_by_key(|&(c, r)| world.dist(pos.col, pos.row, c, r))
 }
 
+/// Scratch buckets for `meet_and_trade`'s spatial bin pass — hoisted to a resource so
+/// the per-tile noot lists are allocated once and reused, not rebuilt with 660 fresh
+/// `Vec` headers every tick (the naive allocation pattern was burning ~20 % of total
+/// sim CPU). Each inner `Vec` keeps its capacity; per-tick prep is just a 660-wide
+/// `.clear()` sweep, which leaves the heap allocations untouched.
+#[derive(Resource, Default)]
+pub struct TradeBuckets {
+    by_tile: Vec<Vec<u16>>,
+}
+
 /// Per-item resolution along the cost-basis axis. `cb` for any item sits in
 /// `[0, max_ask_for_that_item]`; eight buckets give ~12 % cost-basis granularity, well
 /// under the haul-penalty grain. Memory is `N_ITEMS * N_BUCKETS * N_tiles * 2 B` —
@@ -1889,6 +1899,7 @@ pub fn meet_and_trade(
     field: Res<PriceField>,
     mut stats: ResMut<EconStats>,
     mut income: ResMut<IncomeControl>,
+    mut buckets: ResMut<TradeBuckets>,
     mut q: Query<(
         Entity,
         &TilePos,
@@ -1901,6 +1912,7 @@ pub fn meet_and_trade(
 ) {
     let goods = &sim.0.goods;
     let cols = sim.0.cols;
+    let rows = sim.0.rows;
     let hex_size = sim.0.hex_size;
     let radius2 = (hex_size * TRADE_RADIUS_FACTOR).powi(2);
 
@@ -1924,72 +1936,117 @@ pub fn meet_and_trade(
         })
         .collect();
 
+    // Spatial bucket: bin every noot by its tile, then per noot scan only its own
+    // tile + the 6 hex neighbours. The trade radius (`hex_size · TRADE_RADIUS_FACTOR`,
+    // ~1 hex spacing in pixels) means no candidate partner can sit further than one
+    // hex away, so this fully replaces the O(N²) pair sweep without changing which
+    // pairs end up in the candidate set. The trailing pixel-distance² check is kept
+    // (it filters out toroidal-wrapped neighbours that are hex-adjacent but visually
+    // on the far side of the world — pixel positions don't wrap, so the existing
+    // edge-noot trading semantics are preserved exactly).
+    let n_tiles = (cols * rows) as usize;
+    if buckets.by_tile.len() != n_tiles {
+        buckets.by_tile.resize_with(n_tiles, Vec::new);
+    }
+    for slot in &mut buckets.by_tile {
+        slot.clear();
+    }
+    for (i, snap) in snaps.iter().enumerate() {
+        buckets.by_tile[snap.tile].push(i as u16);
+    }
+    let noots_at_tile = &buckets.by_tile;
+
     let mut txs: Vec<Tx> = Vec::new();
 
     // Trading is automatic: any two nearby noots clear their best mutually-beneficial
     // trade. Each noot's learned `discount` (and hunger-driven reservation) are the
     // internal thresholds that decide what it will buy/sell and at what price.
     for i in 0..snaps.len() {
-        for j in (i + 1)..snaps.len() {
-            if snaps[i].pos.distance_squared(snaps[j].pos) > radius2 {
-                continue;
-            }
-            // Pick the single most valuable feasible trade across both directions.
-            let mut best: Option<(usize, usize, usize, f32, f32)> = None; // buyer_i, seller_i, item, price, surplus
-            for &(bi, si) in &[(i, j), (j, i)] {
-                for item in 0..N_ITEMS {
-                    // One whole unit changes hands, so the seller must hold a full unit
-                    // — selling out of a fractional holding would drive inventory
-                    // negative and corrupt the running cost basis.
-                    if snaps[si].inv[item] < 1.0 {
-                        continue;
-                    }
-                    let local_ask = field.local_ask(goods, snaps[si].tile, item);
-                    let price = seller_ask(local_ask, snaps[si].inv[item], snaps[si].cost_basis[item]);
-                    let buyer_wtp = wtp(goods, item, &snaps[bi]);
-                    let seller_res = reservation(goods, item, &snaps[si]);
-                    if buyer_wtp >= price && seller_res < price && snaps[bi].bucks >= price {
-                        let surplus = buyer_wtp - price;
-                        if best.is_none_or(|(_, _, _, _, s)| surplus > s) {
-                            best = Some((bi, si, item, price, surplus));
+        let tile_i = snaps[i].tile;
+        // Own tile + 6 toroidal neighbours: the only buckets that could hold a partner
+        // within pixel trade range. Fixed 7-slot array stays on the stack; the 6 neighbour
+        // indices come from `World::tile_neighbors`, precomputed at worldgen time so this
+        // is just an array load (no `hex::neighbors` arithmetic on the hot path).
+        let mut tiles_to_check = [0usize; 7];
+        tiles_to_check[0] = tile_i;
+        let ns = sim.0.neighbors_of(tile_i);
+        for k in 0..6 {
+            tiles_to_check[k + 1] = ns[k] as usize;
+        }
+
+        for &t in &tiles_to_check {
+            // The bucket only borrows `noots_at_tile`; mutations inside the trade
+            // block touch `snaps`/`stats`/`income`, which are separate. With 56 noots
+            // over 660 tiles occupancy averages well under 1, so this loop almost
+            // always iterates 0–1 times.
+            let bucket: &[u16] = &noots_at_tile[t];
+            for &j_u16 in bucket {
+                let j = j_u16 as usize;
+                // Skip self, and only process each unordered pair once.
+                if j <= i {
+                    continue;
+                }
+                if snaps[i].pos.distance_squared(snaps[j].pos) > radius2 {
+                    continue;
+                }
+                // Pick the single most valuable feasible trade across both directions.
+                let mut best: Option<(usize, usize, usize, f32, f32)> = None; // buyer_i, seller_i, item, price, surplus
+                for &(bi, si) in &[(i, j), (j, i)] {
+                    for item in 0..N_ITEMS {
+                        // One whole unit changes hands, so the seller must hold a full unit
+                        // — selling out of a fractional holding would drive inventory
+                        // negative and corrupt the running cost basis.
+                        if snaps[si].inv[item] < 1.0 {
+                            continue;
+                        }
+                        let local_ask = field.local_ask(goods, snaps[si].tile, item);
+                        let price =
+                            seller_ask(local_ask, snaps[si].inv[item], snaps[si].cost_basis[item]);
+                        let buyer_wtp = wtp(goods, item, &snaps[bi]);
+                        let seller_res = reservation(goods, item, &snaps[si]);
+                        if buyer_wtp >= price && seller_res < price && snaps[bi].bucks >= price {
+                            let surplus = buyer_wtp - price;
+                            if best.is_none_or(|(_, _, _, _, s)| surplus > s) {
+                                best = Some((bi, si, item, price, surplus));
+                            }
                         }
                     }
                 }
-            }
 
-            if let Some((bi, si, item, price, _)) = best {
-                txs.push(Tx {
-                    buyer: snaps[bi].e,
-                    seller: snaps[si].e,
-                    item,
-                    price,
-                });
-                // Reflect in the snapshot so balances stay consistent this frame.
-                snaps[bi].bucks -= price;
-                snaps[bi].inv[item] += 1.0;
-                snaps[si].bucks += price;
-                snaps[si].inv[item] -= 1.0;
-                stats.trades_total += 1;
-                stats.gdp_window += price;
-                stats.gdp_total += price as f64;
-                stats.haul_window += field.source_dist(snaps[si].tile, item / 2) as f64;
-                stats.haul_count_window += 1;
-                // Spatial trade heatmap: tally the sale at the seller's tile (where the
-                // price clears). Sized lazily so fresh and loaded games both work.
-                let n_tiles = (cols * sim.0.rows) as usize;
-                if stats.trade_hexes.len() != n_tiles {
-                    stats.trade_hexes = vec![0; n_tiles];
+                if let Some((bi, si, item, price, _)) = best {
+                    txs.push(Tx {
+                        buyer: snaps[bi].e,
+                        seller: snaps[si].e,
+                        item,
+                        price,
+                    });
+                    // Reflect in the snapshot so balances stay consistent this frame.
+                    snaps[bi].bucks -= price;
+                    snaps[bi].inv[item] += 1.0;
+                    snaps[si].bucks += price;
+                    snaps[si].inv[item] -= 1.0;
+                    stats.trades_total += 1;
+                    stats.gdp_window += price;
+                    stats.gdp_total += price as f64;
+                    stats.haul_window += field.source_dist(snaps[si].tile, item / 2) as f64;
+                    stats.haul_count_window += 1;
+                    // Spatial trade heatmap: tally the sale at the seller's tile (where the
+                    // price clears). Sized lazily so fresh and loaded games both work.
+                    if stats.trade_hexes.len() != n_tiles {
+                        stats.trade_hexes = vec![0; n_tiles];
+                    }
+                    stats.trade_hexes[snaps[si].tile] += 1;
+                    // Last clearing price for this item — held until its next sale.
+                    stats.last_sale_price[item] = price;
+                    income.this_window += price as f64;
+                    // EWMA of realized sale prices (lazy-init to the first sample).
+                    stats.ewma_price[item] = if stats.ewma_price[item] <= 0.0 {
+                        price
+                    } else {
+                        stats.ewma_price[item]
+                            + PRICE_EWMA_ALPHA * (price - stats.ewma_price[item])
+                    };
                 }
-                stats.trade_hexes[snaps[si].tile] += 1;
-                // Last clearing price for this item — held until its next sale.
-                stats.last_sale_price[item] = price;
-                income.this_window += price as f64;
-                // EWMA of realized sale prices (lazy-init to the first sample).
-                stats.ewma_price[item] = if stats.ewma_price[item] <= 0.0 {
-                    price
-                } else {
-                    stats.ewma_price[item] + PRICE_EWMA_ALPHA * (price - stats.ewma_price[item])
-                };
             }
         }
     }

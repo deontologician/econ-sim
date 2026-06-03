@@ -131,6 +131,13 @@ pub struct World {
     /// after a load so old saves still resume.
     #[serde(skip)]
     pub dist_table: Vec<u8>,
+    /// Per-tile cache of the 6 toroidal neighbour tile indices (`u16`-packed; even and
+    /// odd-row parity already resolved). Built alongside `dist_table`; replaces inline
+    /// `hex::neighbors` calls inside per-tick loops (`meet_and_trade`'s bucket scan and
+    /// `accumulate_traffic`'s edge sweep would otherwise call it tens of thousands of
+    /// times per tick). 6 × `u16` × `cols·rows` = ~8 KB on the 30×22 map.
+    #[serde(skip)]
+    pub tile_neighbors: Vec<[u16; 6]>,
 }
 
 impl World {
@@ -155,6 +162,15 @@ impl World {
         if self.dist_table.len() != n * n {
             self.dist_table = build_dist_table(self.cols, self.rows);
         }
+        if self.tile_neighbors.len() != n {
+            self.tile_neighbors = build_tile_neighbors(self.cols, self.rows);
+        }
+    }
+
+    /// The 6 toroidal neighbour tile indices of `tile`, in `hex::neighbors` order.
+    #[inline]
+    pub fn neighbors_of(&self, tile: usize) -> [u16; 6] {
+        self.tile_neighbors[tile]
     }
 
     /// Place a structure of `kind` on `tile`: replace an existing (unclaimed) structure's
@@ -331,6 +347,7 @@ pub fn generate(seed: u64, cols: i32, rows: i32, hex_size: f32) -> World {
     let tiles = generate_terrain(&mut rng, cols, rows);
     let road_edges = vec![0.0; tiles.len() * 6];
     let dist_table = build_dist_table(cols, rows);
+    let tile_neighbors = build_tile_neighbors(cols, rows);
     let mut world = World {
         seed,
         cols,
@@ -343,9 +360,28 @@ pub fn generate(seed: u64, cols: i32, rows: i32, hex_size: f32) -> World {
         structures: Vec::new(),
         road_edges,
         dist_table,
+        tile_neighbors,
     };
     place_deposits(&mut rng, &mut world);
     world
+}
+
+/// Precompute the 6 toroidal neighbour tile indices for every tile. One `hex::neighbors`
+/// call per tile at gen time replaces the per-tick call from every system that walks
+/// a tile's edges (`meet_and_trade`'s bucket scan, `accumulate_traffic`'s edge sweep).
+fn build_tile_neighbors(cols: i32, rows: i32) -> Vec<[u16; 6]> {
+    let n = (cols * rows) as usize;
+    let mut out = vec![[0u16; 6]; n];
+    for r in 0..rows {
+        for c in 0..cols {
+            let t = (r * cols + c) as usize;
+            let ns = crate::hex::neighbors(c, r, cols, rows);
+            for (k, &(nc, nr)) in ns.iter().enumerate() {
+                out[t][k] = (nr * cols + nc) as u16;
+            }
+        }
+    }
+    out
 }
 
 /// Precompute the full `cols*rows × cols*rows` toroidal hex-distance table. O(N²) at

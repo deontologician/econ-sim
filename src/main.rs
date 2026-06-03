@@ -506,6 +506,7 @@ fn main() {
         .init_resource::<economy::IncomeControl>()
         .init_resource::<economy::PriceField>()
         .init_resource::<economy::MarketIndex>()
+        .init_resource::<economy::TradeBuckets>()
         .init_resource::<Trainer>()
         .add_systems(Startup, setup)
         // The fixed-tick simulation pipeline (each system advances the world by one
