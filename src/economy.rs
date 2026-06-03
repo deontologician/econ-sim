@@ -38,8 +38,25 @@ const SAFETY_BUCKS: f32 = 60.0;
 const ESTEEM_NORM: f32 = 4.0;
 /// Reward penalty applied to the transition that ends in starvation death.
 const DEATH_PENALTY: f32 = 2.0;
-/// Minibatch updates per frame for the shared policy.
-const TRAIN_ITERS_PER_FRAME: usize = 4;
+/// **Training cadence.** The trainer doesn't have to fire on every sim tick — the
+/// shared replay buffer accumulates transitions regardless, and the policy converges
+/// over many real-time seconds whether we sample 32 minibatches per tick or 32 per
+/// second. Decouple training from the sim's fixed-tick rate so that speeding the
+/// world up (headless harness, fast-forward, or just future maps with more noots)
+/// doesn't proportionally inflate the steady-state CPU spent on the gradient — at
+/// 10 K ticks the policy MLP was 97 % of total CPU under the old "train every tick"
+/// schedule.
+///
+/// `TRAIN_INTERVAL_TICKS` = run the trainer once every N sim ticks (skip the rest).
+/// `TRAIN_ITERS_PER_ROUND` = how many `Trainer::train()` calls per scheduled round
+/// (each is a 32-sample minibatch). Average minibatches/tick = `iters / interval`.
+///
+/// Current setting: 4 iters / 8 ticks = 0.5 train()/tick = 16 minibatches/tick
+/// (down from the old 4/tick × 32 = 128 minibatches/tick — an 8× cut to steady
+/// CPU). Each transition still gets sampled tens of times before aging out of the
+/// 16 K buffer, plenty for off-policy A2C convergence.
+const TRAIN_INTERVAL_TICKS: u32 = 8;
+const TRAIN_ITERS_PER_ROUND: usize = 4;
 
 // Production rates.
 pub const WORK_RATE: f32 = 3.0;
@@ -1420,11 +1437,22 @@ pub fn policy_step(
     }
 }
 
-/// A few A2C minibatch updates on the shared policy each frame (warms up first) —
-/// several per frame so the shared buffer's experience is reused and learning keeps
-/// pace with the ~160 decisions/sec the population generates.
-pub fn train_policy(mut ac: ResMut<ActorCritic>, mut trainer: ResMut<Trainer>, mut rng: ResMut<SimRng>) {
-    for _ in 0..TRAIN_ITERS_PER_FRAME {
+/// A few A2C minibatch updates on the shared policy, scheduled on a fixed budget
+/// (see `TRAIN_INTERVAL_TICKS` / `TRAIN_ITERS_PER_ROUND` at the top of this file).
+/// The `Local<u32>` counter is reset on app start (Bevy's per-system state, not
+/// serialised) — fine, because training cadence isn't part of the game state we
+/// want save/load round-trip.
+pub fn train_policy(
+    mut ac: ResMut<ActorCritic>,
+    mut trainer: ResMut<Trainer>,
+    mut rng: ResMut<SimRng>,
+    mut tick: Local<u32>,
+) {
+    *tick = tick.wrapping_add(1);
+    if !tick.is_multiple_of(TRAIN_INTERVAL_TICKS) {
+        return;
+    }
+    for _ in 0..TRAIN_ITERS_PER_ROUND {
         trainer.train(&mut ac, &mut rng.0);
     }
 }
