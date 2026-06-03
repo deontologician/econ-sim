@@ -4,7 +4,9 @@
 # to `main`, and Fly is a manual `fly deploy` alternative useful when we want a
 # bare URL without the `/econ-sim/` subpath or want to iterate without a commit.
 
-app = "econ-sim"
+# `econ-sim` is taken globally on Fly, so the deployed app is `econ-sim-noots`
+# (served at https://econ-sim-noots.fly.dev).
+app = "econ-sim-noots"
 primary_region = "sjc"
 
 [build]
