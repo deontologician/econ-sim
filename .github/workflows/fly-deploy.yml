@@ -44,4 +44,6 @@ jobs:
       - name: Deploy
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only
+        # `--ha=false`: one machine is plenty for a static wasm site, and it stops
+        # Fly re-adding a second HA machine on every deploy.
+        run: flyctl deploy --remote-only --ha=false
