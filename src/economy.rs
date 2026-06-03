@@ -633,6 +633,26 @@ pub struct TradeBuckets {
     by_tile: Vec<Vec<u16>>,
 }
 
+/// Per-tick scratch for `meet_and_trade`: the `Snap` snapshot of every noot
+/// (~5.6 KB on the 30×22 map) and the pending `Tx` list. Hoisting both eliminates
+/// the per-tick `Vec::extend_desugared` cost (which was ~5.6 % of total CPU before
+/// this lift) — the vectors keep their capacities across ticks; we just `.clear()`
+/// and re-extend.
+#[derive(Resource, Default)]
+pub struct MeetTradeScratch {
+    snaps: Vec<Snap>,
+    txs: Vec<Tx>,
+}
+
+/// Per-tick scratch for `policy_step`: the entity-position snapshot used for
+/// neighbour-noot queries and the `claimed`-tile mask. Same lifecycle as
+/// `MeetTradeScratch` (clear + refill each tick, retain capacity).
+#[derive(Resource, Default)]
+pub struct PolicyStepScratch {
+    snapshot: Vec<(Entity, i32, i32)>,
+    claimed: Vec<bool>,
+}
+
 /// Per-item resolution along the cost-basis axis. `cb` for any item sits in
 /// `[0, max_ask_for_that_item]`; eight buckets give ~12 % cost-basis granularity, well
 /// under the haul-penalty grain. Memory is `N_ITEMS * N_BUCKETS * N_tiles * 2 B` —
@@ -665,6 +685,14 @@ pub struct MarketIndex {
     /// tile index of the per-item argmax reachable from `start_tile`. `u16` since
     /// any sane map fits well under 65 K tiles.
     arg: Vec<u16>,
+    /// Scratch for the per-rebuild distance transforms — reused across all 64 DT
+    /// runs per rebuild (and across rebuilds), so the heap and working vectors stay
+    /// allocated. Lives on `MarketIndex` rather than a separate resource because
+    /// only `rebuild_market_index` ever touches them.
+    dt_value: Vec<f32>,
+    dt_g: Vec<i32>,
+    dt_arg: Vec<u16>,
+    dt_heap: BinaryHeap<(i32, u32)>,
 }
 
 impl MarketIndex {
@@ -694,17 +722,24 @@ impl MarketIndex {
 /// keep the lazy-decrease trick (stale entries skipped) to dodge a decrease-key. The
 /// `i32` quantisation (×1024) is so the BinaryHeap orders deterministically — values
 /// live in `[0, ~20]`, so quantisation error is far below the `MARKET_DIST_PENALTY` step.
-fn max_distance_transform(world: &crate::world::World, value: &[f32], lambda: f32) -> Vec<u16> {
+fn max_distance_transform(
+    world: &crate::world::World,
+    value: &[f32],
+    lambda: f32,
+    g: &mut Vec<i32>,
+    arg_out: &mut Vec<u16>,
+    heap: &mut BinaryHeap<(i32, u32)>,
+) {
     let n = value.len();
-    let cols = world.cols;
-    let rows = world.rows;
     let scale = 1024.0f32;
     let q = |v: f32| (v * scale).round() as i32;
     let lambda_q = q(lambda);
 
-    let mut g: Vec<i32> = value.iter().map(|&v| q(v)).collect();
-    let mut arg: Vec<u16> = (0..n as u16).collect();
-    let mut heap: BinaryHeap<(i32, u32)> = BinaryHeap::with_capacity(n);
+    g.clear();
+    g.extend(value.iter().map(|&v| q(v)));
+    arg_out.clear();
+    arg_out.extend(0..n as u16);
+    heap.clear();
     for (t, &gv) in g.iter().enumerate() {
         if gv > 0 {
             heap.push((gv, t as u32));
@@ -724,20 +759,16 @@ fn max_distance_transform(world: &crate::world::World, value: &[f32], lambda: f3
         if new_q <= 0 {
             break;
         }
-        let pc = (p as i32) % cols;
-        let pr = (p as i32) / cols;
-        let origin = arg[p];
-        for &(nc, nr) in neighbors(pc, pr, cols, rows).iter() {
-            let qn = (nr * cols + nc) as usize;
+        let origin = arg_out[p];
+        for &nq in world.neighbors_of(p).iter() {
+            let qn = nq as usize;
             if new_q > g[qn] {
                 g[qn] = new_q;
-                arg[qn] = origin;
+                arg_out[qn] = origin;
                 heap.push((new_q, qn as u32));
             }
         }
     }
-
-    arg
 }
 
 /// Rebuild the per-item bucketed argmax maps from a freshly rebuilt `PriceField`.
@@ -749,37 +780,51 @@ fn rebuild_market_index(index: &mut MarketIndex, world: &crate::world::World, fi
     index.n_tiles = n;
     index.arg.clear();
     index.arg.resize(N_ITEMS * nb * n, 0);
+    if index.dt_value.len() != n {
+        index.dt_value.resize(n, 0.0);
+    }
 
-    let mut value = vec![0.0f32; n];
-    for item in 0..N_ITEMS {
+    // Split borrows so we can stream into `arg` while reading from the DT scratch
+    // buffers — they all live on the same resource, but each loop iteration only
+    // writes one slice of `arg` and otherwise touches scratch.
+    let MarketIndex {
+        bucket_scale,
+        arg,
+        dt_value,
+        dt_g,
+        dt_arg,
+        dt_heap,
+        ..
+    } = &mut *index;
+
+    for (item, scale_slot) in bucket_scale.iter_mut().enumerate() {
         let mut max_ask = 0.0f32;
         for t in 0..n {
             max_ask = max_ask.max(field.local_ask(&world.goods, t, item));
         }
-        index.bucket_scale[item] = max_ask.max(1e-6);
+        *scale_slot = max_ask.max(1e-6);
 
         // Junk has `ask = f32::MAX`; bucketing/DT are nonsense. Leave its arg slice as
         // the identity init (each tile maps to itself), unreachable for the consumer
         // because the per-noot lookup skips Junk items anyway.
         if matches!(world.goods.role_of(item), ItemRole::Junk) {
-            for (b, slot) in (0..nb).zip(0..nb) {
-                let base = item * nb * n + slot * n;
+            for b in 0..nb {
+                let base = item * nb * n + b * n;
                 for t in 0..n {
-                    index.arg[base + t] = t as u16;
+                    arg[base + t] = t as u16;
                 }
-                let _ = b;
             }
             continue;
         }
 
         for b in 0..nb {
             let cb_mid = (b as f32 + 0.5) / nb as f32 * max_ask;
-            for (t, v) in value.iter_mut().enumerate() {
+            for (t, v) in dt_value.iter_mut().enumerate() {
                 *v = (field.local_ask(&world.goods, t, item) - cb_mid).max(0.0);
             }
-            let arg = max_distance_transform(world, &value, MARKET_DIST_PENALTY);
+            max_distance_transform(world, dt_value, MARKET_DIST_PENALTY, dt_g, dt_arg, dt_heap);
             let base = item * nb * n + b * n;
-            index.arg[base..base + n].copy_from_slice(&arg);
+            arg[base..base + n].copy_from_slice(dt_arg);
         }
     }
 }
@@ -1199,6 +1244,7 @@ pub fn policy_step(
     ac: Res<ActorCritic>,
     mut trainer: ResMut<Trainer>,
     mut rng: ResMut<SimRng>,
+    mut scratch: ResMut<PolicyStepScratch>,
     mut q: Query<(
         Entity,
         &mut TilePos,
@@ -1212,14 +1258,18 @@ pub fn policy_step(
     )>,
 ) {
     let world = &sim.0;
+    let n_tiles = (world.cols * world.rows) as usize;
+    let PolicyStepScratch { snapshot, claimed } = &mut *scratch;
     // Snapshot every noot's tile up front so each can read the others' positions while
     // we hold the query mutably (positions only shift one hex/tick, so this is fresh).
-    let snapshot: Vec<(Entity, i32, i32)> =
-        q.iter().map(|(e, p, ..)| (e, p.col, p.row)).collect();
+    snapshot.clear();
+    snapshot.extend(q.iter().map(|(e, p, ..)| (e, p.col, p.row)));
     // Which hexes are owned right now, so a noot heads only for *unclaimed* deposits and
     // the masks know whether a free deposit / any refinery exists (one-hex ownership).
-    let n_tiles = (world.cols * world.rows) as usize;
-    let mut claimed = vec![false; n_tiles];
+    if claimed.len() != n_tiles {
+        claimed.resize(n_tiles, false);
+    }
+    claimed.fill(false);
     for (_, _, claim, ..) in q.iter() {
         if let Some(h) = claim.hex {
             claimed[h] = true;
@@ -1238,9 +1288,9 @@ pub fn policy_step(
 
         // Features at the current tile, recomputed each acting step: they feed both the
         // option decision (when re-deciding) and the value-guided "GPS" movement below.
-        let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world);
+        let nearest_noot = nearest_other_noot(snapshot, e, &pos, world);
         let (s_pos, s_o) = features(
-            world, &field, &index, &pos, claim, hunger, inv, wallet, trader, &claimed,
+            world, &field, &index, &pos, claim, hunger, inv, wallet, trader, claimed,
             nearest_noot,
         );
 
@@ -1297,7 +1347,7 @@ pub fn policy_step(
             mem.has_prev = true;
             mem.committed = true;
             mem.plan_target =
-                option_target(act, world, &field, &index, claim, &pos, inv, trader, &claimed);
+                option_target(act, world, &field, &index, claim, &pos, inv, trader, claimed);
             mem.plan_ticks = OPTION_MAX_TICKS;
         }
 
@@ -1900,6 +1950,7 @@ pub fn meet_and_trade(
     mut stats: ResMut<EconStats>,
     mut income: ResMut<IncomeControl>,
     mut buckets: ResMut<TradeBuckets>,
+    mut scratch: ResMut<MeetTradeScratch>,
     mut q: Query<(
         Entity,
         &TilePos,
@@ -1916,25 +1967,25 @@ pub fn meet_and_trade(
     let hex_size = sim.0.hex_size;
     let radius2 = (hex_size * TRADE_RADIUS_FACTOR).powi(2);
 
-    // Snapshot (immutable read) so we can reason about pairs without aliasing.
-    // Positions come from the tile (pixel centre), so trade has no rendering dep.
-    let mut snaps: Vec<Snap> = q
-        .iter()
-        .map(|(e, tp, inv, wal, hunger, trader, _meta)| {
-            let (px, py) = hex_center(tp.col, tp.row, hex_size);
-            Snap {
-                e,
-                pos: Vec2::new(px, py),
-                tile: (tp.row * cols + tp.col) as usize,
-                inv: inv.items,
-                bucks: wal.bucks,
-                hunger: hunger.staple,
-                satisfied: hunger.satisfied(),
-                discount: trader.discount,
-                cost_basis: trader.cost_basis,
-            }
-        })
-        .collect();
+    // Reused per-tick scratch — keeps the snap/tx capacity across ticks so the
+    // 56-entry `extend` doesn't re-grow a fresh allocation every frame.
+    let MeetTradeScratch { snaps, txs } = &mut *scratch;
+    snaps.clear();
+    snaps.extend(q.iter().map(|(e, tp, inv, wal, hunger, trader, _meta)| {
+        let (px, py) = hex_center(tp.col, tp.row, hex_size);
+        Snap {
+            e,
+            pos: Vec2::new(px, py),
+            tile: (tp.row * cols + tp.col) as usize,
+            inv: inv.items,
+            bucks: wal.bucks,
+            hunger: hunger.staple,
+            satisfied: hunger.satisfied(),
+            discount: trader.discount,
+            cost_basis: trader.cost_basis,
+        }
+    }));
+    txs.clear();
 
     // Spatial bucket: bin every noot by its tile, then per noot scan only its own
     // tile + the 6 hex neighbours. The trade radius (`hex_size · TRADE_RADIUS_FACTOR`,
@@ -1955,8 +2006,6 @@ pub fn meet_and_trade(
         buckets.by_tile[snap.tile].push(i as u16);
     }
     let noots_at_tile = &buckets.by_tile;
-
-    let mut txs: Vec<Tx> = Vec::new();
 
     // Trading is automatic: any two nearby noots clear their best mutually-beneficial
     // trade. Each noot's learned `discount` (and hunger-driven reservation) are the
@@ -2052,7 +2101,7 @@ pub fn meet_and_trade(
     }
 
     // Apply to the ECS, one entity borrow at a time.
-    for tx in txs {
+    for tx in txs.drain(..) {
         // Buyer side: average in the cost basis and grow more cautious.
         if let Ok((_, _, mut inv, mut wal, _, mut trader, mut meta)) = q.get_mut(tx.buyer) {
             let held_before = inv.items[tx.item];

@@ -136,6 +136,8 @@ fn main() {
     w.insert_resource(economy::PriceField::default());
     w.insert_resource(economy::MarketIndex::default());
     w.insert_resource(economy::TradeBuckets::default());
+    w.insert_resource(economy::MeetTradeScratch::default());
+    w.insert_resource(economy::PolicyStepScratch::default());
 
     match restore_noots {
         Some(noots) => {
