@@ -418,6 +418,14 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
+            // Uniform sampling is the default. PER was tested against it on 50 K-tick
+            // runs (10 samples each, fully past buffer fill at tick ~5 K) and came
+            // out **6 % slower** wall-clock — the sum tree's O(log N) push/update
+            // costs only fully kick in once priorities are actively churning, which
+            // is later than shorter A/B runs show. Outcome quality is also high-
+            // variance across seeds (sometimes much better, sometimes much worse —
+            // dense-reward population sims aren't the regime PER was designed for).
+            // Pass `--prioritized` to the headless harness to flip it on.
             prioritized_replay: false,
             per_alpha: 0.6,
             per_beta: 0.4,

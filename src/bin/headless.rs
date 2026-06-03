@@ -63,10 +63,10 @@ struct Cli {
     load: Option<String>,
     save: Option<String>,
     /// `--prioritized` flips the policy's replay sampler to PER (priority ∝
-    /// `(|TD error| + ε)^α` with IS-weight gradient correction). Default off so an
-    /// A/B is `headless ...` vs `headless --prioritized ...` with everything else
-    /// held — same seed, same ticks, same config. The JSONL stream carries
-    /// `mean_abs_td_error` per sample so the two runs can be diffed directly.
+    /// `(|TD error| + ε)^α` with IS-weight gradient correction). Default off — see
+    /// `PolicyConfig::default` for the perf rationale. The JSONL stream carries
+    /// `mean_abs_td_error` per sample (computed on a *uniform* mini-batch regardless
+    /// of mode, so the metric is fair across both samplers).
     prioritized: bool,
 }
 
