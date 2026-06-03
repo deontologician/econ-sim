@@ -1,0 +1,47 @@
+name: Deploy to Fly.io
+
+# Manual trigger — `fly deploy` is a deploy-anytime affordance, not coupled to
+# the canonical Pages flow which runs on every push to main. To use it, add
+# `FLY_API_TOKEN` to the repo secrets (Settings → Secrets and variables →
+# Actions → New repository secret) and click "Run workflow" on this action.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fly-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      # Fly serves at a bare domain (no subpath), unlike Pages — so build without
+      # the `/econ-sim/` prefix.
+      - name: Build wasm bundle
+        env:
+          LEADERBOARD_URL: ${{ vars.LEADERBOARD_SUBMIT_URL }}
+        run: trunk build --release
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      # The Dockerfile copies `dist/` into nginx — see `.dockerignore` for what's
+      # excluded from the build context (everything except dist/ and Dockerfile,
+      # so the multi-GB target/ never ships).
+      - name: Deploy
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl deploy --remote-only

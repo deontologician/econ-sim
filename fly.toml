@@ -1,0 +1,29 @@
+# Fly.io deployment config — static nginx serving the trunk-built wasm bundle.
+# This is a parallel deploy to the existing GitHub Pages target (`.github/
+# workflows/deploy.yml`); the Pages flow stays the canonical deploy on push
+# to `main`, and Fly is a manual `fly deploy` alternative useful when we want a
+# bare URL without the `/econ-sim/` subpath or want to iterate without a commit.
+
+app = "econ-sim"
+primary_region = "sjc"
+
+[build]
+# Pre-built `dist/` is copied in by the Dockerfile — keep the build off Fly's
+# builder so we don't reinstall the Rust toolchain there. Run
+# `trunk build --release` locally (or in CI) before `fly deploy`.
+
+[http_service]
+internal_port = 80
+force_https = true
+auto_stop_machines = "stop"
+auto_start_machines = true
+# A wasm static site has near-zero idle CPU and the machine can hibernate
+# between requests, so one is fine — `auto_start_machines` brings it back on
+# first hit (small cold-start latency, free-tier friendly).
+min_machines_running = 0
+
+[[vm]]
+# Smallest free-tier machine; the wasm runs entirely in the browser, so the
+# server only needs to serve ~22 MB of static assets.
+size = "shared-cpu-1x"
+memory = "256mb"

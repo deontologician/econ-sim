@@ -1,0 +1,7 @@
+# Keep the Fly build context tiny — only the pre-built dist/ is needed by the
+# Dockerfile, and shipping the full repo (notably the multi-GB `target/`) would
+# blow out upload time and Fly's context limit.
+*
+!dist/
+!dist/**
+!Dockerfile
