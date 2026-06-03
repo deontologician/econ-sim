@@ -9,6 +9,7 @@
 //! noot arbitrages.
 
 use bevy::prelude::*;
+use std::collections::BinaryHeap;
 
 use crate::goods::{self, form_of, GoodForm, ItemRole, N_ITEMS};
 use crate::hex::{hex_center, neighbors};
@@ -622,47 +623,251 @@ fn mine_target(
         .min_by_key(|&(c, r)| world.dist(pos.col, pos.row, c, r))
 }
 
+/// Per-item resolution along the cost-basis axis. `cb` for any item sits in
+/// `[0, max_ask_for_that_item]`; eight buckets give ~12 % cost-basis granularity, well
+/// under the haul-penalty grain. Memory is `N_ITEMS * N_BUCKETS * N_tiles * 2 B` —
+/// 84 KB on the 30×22 map.
+const MARKET_INDEX_N_BUCKETS: usize = 8;
+
+/// Per-item, per-cost-basis-bucket spatial argmax: the tile a noot at `pos` should
+/// head to if it cared only about selling that one item, net of the per-hex haul
+/// penalty. Built once per `PriceField` rebuild by running a max-plus distance
+/// transform over the per-item ask field (so the work is shared across all noots
+/// and across hundreds of ticks). Per-noot lookup is then O(N_held): score the
+/// item-specific argmaxes (and the noot's own tile) with the noot's *actual* held
+/// and cost basis, and keep the best. Exact whenever one held item dominates the
+/// bag's value (the typical case for specialised miners); for genuinely multi-item
+/// bags, it's the best of the single-item argmaxes — a tile that's mediocre for
+/// every item but optimal in aggregate is not in the candidate set, which is the
+/// one approximation.
+#[derive(Resource, Default)]
+pub struct MarketIndex {
+    /// Tracks `PriceField::rebuild_count` so the index rebuilds exactly when the
+    /// field does — no separate timer, no double-rebuild on save load.
+    last_rebuild_count: u32,
+    n_tiles: usize,
+    /// Per-item bucketing scale: cost_basis / `bucket_scale[i]` × N_BUCKETS gives the
+    /// bucket index. Set to `max_ask_for_item_i` so the bucket axis spans the full
+    /// realisable cb range (cb beyond max_ask means "I never want to sell" → bucket N-1
+    /// where v = max(0, ask − cb) ≈ 0 everywhere).
+    bucket_scale: [f32; N_ITEMS],
+    /// Flat `arg[item * N_BUCKETS * n_tiles + bucket * n_tiles + start_tile]` →
+    /// tile index of the per-item argmax reachable from `start_tile`. `u16` since
+    /// any sane map fits well under 65 K tiles.
+    arg: Vec<u16>,
+}
+
+impl MarketIndex {
+    fn dim_ok(&self, n_tiles: usize) -> bool {
+        self.n_tiles == n_tiles && self.arg.len() == N_ITEMS * MARKET_INDEX_N_BUCKETS * n_tiles
+    }
+
+    #[inline]
+    fn bucket_of(&self, item: usize, cb: f32) -> usize {
+        let scale = self.bucket_scale[item].max(1e-6);
+        let raw = (cb / scale * MARKET_INDEX_N_BUCKETS as f32) as i32;
+        raw.clamp(0, MARKET_INDEX_N_BUCKETS as i32 - 1) as usize
+    }
+
+    #[inline]
+    fn lookup(&self, item: usize, bucket: usize, tile: usize) -> usize {
+        self.arg[item * MARKET_INDEX_N_BUCKETS * self.n_tiles + bucket * self.n_tiles + tile]
+            as usize
+    }
+}
+
+/// Compute, for every tile `p`, the tile `T` that maximises `value[T] − λ · dist(p, T)`
+/// over the hex torus. Multi-source Dijkstra with origin propagation: seed the heap
+/// with every tile carrying its own value, then relax neighbours by `−λ` per hex. Since
+/// all edges have unit cost, popping in max-value order guarantees each tile's first pop
+/// is its final answer (`g[p]` won't be improved by anything we haven't seen yet); we
+/// keep the lazy-decrease trick (stale entries skipped) to dodge a decrease-key. The
+/// `i32` quantisation (×1024) is so the BinaryHeap orders deterministically — values
+/// live in `[0, ~20]`, so quantisation error is far below the `MARKET_DIST_PENALTY` step.
+fn max_distance_transform(world: &crate::world::World, value: &[f32], lambda: f32) -> Vec<u16> {
+    let n = value.len();
+    let cols = world.cols;
+    let rows = world.rows;
+    let scale = 1024.0f32;
+    let q = |v: f32| (v * scale).round() as i32;
+    let lambda_q = q(lambda);
+
+    let mut g: Vec<i32> = value.iter().map(|&v| q(v)).collect();
+    let mut arg: Vec<u16> = (0..n as u16).collect();
+    let mut heap: BinaryHeap<(i32, u32)> = BinaryHeap::with_capacity(n);
+    for (t, &gv) in g.iter().enumerate() {
+        if gv > 0 {
+            heap.push((gv, t as u32));
+        }
+    }
+
+    while let Some((cur_q, p_u32)) = heap.pop() {
+        let p = p_u32 as usize;
+        // Lazy stale-entry skip — the heap may hold older (smaller) entries for `p`
+        // that were superseded before they were popped.
+        if cur_q < g[p] {
+            continue;
+        }
+        let new_q = cur_q - lambda_q;
+        // Heap is max-ordered, so once the strongest live entry can no longer beat 0
+        // (the implicit floor of `value`), nothing remaining can either.
+        if new_q <= 0 {
+            break;
+        }
+        let pc = (p as i32) % cols;
+        let pr = (p as i32) / cols;
+        let origin = arg[p];
+        for &(nc, nr) in neighbors(pc, pr, cols, rows).iter() {
+            let qn = (nr * cols + nc) as usize;
+            if new_q > g[qn] {
+                g[qn] = new_q;
+                arg[qn] = origin;
+                heap.push((new_q, qn as u32));
+            }
+        }
+    }
+
+    arg
+}
+
+/// Rebuild the per-item bucketed argmax maps from a freshly rebuilt `PriceField`.
+/// O(N_ITEMS · N_BUCKETS · N_tiles · log N_tiles) total — for the 30×22 map and the
+/// 600-tick rebuild cadence that's a few hundred instructions per amortised tick.
+fn rebuild_market_index(index: &mut MarketIndex, world: &crate::world::World, field: &PriceField) {
+    let n = (world.cols * world.rows) as usize;
+    let nb = MARKET_INDEX_N_BUCKETS;
+    index.n_tiles = n;
+    index.arg.clear();
+    index.arg.resize(N_ITEMS * nb * n, 0);
+
+    let mut value = vec![0.0f32; n];
+    for item in 0..N_ITEMS {
+        let mut max_ask = 0.0f32;
+        for t in 0..n {
+            max_ask = max_ask.max(field.local_ask(&world.goods, t, item));
+        }
+        index.bucket_scale[item] = max_ask.max(1e-6);
+
+        // Junk has `ask = f32::MAX`; bucketing/DT are nonsense. Leave its arg slice as
+        // the identity init (each tile maps to itself), unreachable for the consumer
+        // because the per-noot lookup skips Junk items anyway.
+        if matches!(world.goods.role_of(item), ItemRole::Junk) {
+            for (b, slot) in (0..nb).zip(0..nb) {
+                let base = item * nb * n + slot * n;
+                for t in 0..n {
+                    index.arg[base + t] = t as u16;
+                }
+                let _ = b;
+            }
+            continue;
+        }
+
+        for b in 0..nb {
+            let cb_mid = (b as f32 + 0.5) / nb as f32 * max_ask;
+            for (t, v) in value.iter_mut().enumerate() {
+                *v = (field.local_ask(&world.goods, t, item) - cb_mid).max(0.0);
+            }
+            let arg = max_distance_transform(world, &value, MARKET_DIST_PENALTY);
+            let base = item * nb * n + b * n;
+            index.arg[base..base + n].copy_from_slice(&arg);
+        }
+    }
+}
+
 /// The tile where the goods this noot is carrying would fetch the most, net of the haul
-/// to get there: argmax over tiles of `Σ_held (local_ask − cost_basis)·held` minus a
-/// per-hex transport penalty. `None` when it carries nothing worth selling — so the
-/// gate naturally keeps a lightly-loaded noot mining and only sends a full one trekking.
+/// to get there. Looks up the precomputed per-item argmaxes for the noot's bucketed cost
+/// basis (one tile per held item), then picks the best by *exact* per-noot score —
+/// approximation only enters via which tiles end up in the candidate set, not which
+/// tile is named the winner. `None` when nothing the noot carries would sell for a
+/// margin above the haul, so the gate keeps a lightly-loaded noot mining.
 fn best_market_tile(
     field: &PriceField,
+    index: &MarketIndex,
     world: &crate::world::World,
     pos: &TilePos,
     inv: &Inventory,
     trader: &Trader,
 ) -> Option<(i32, i32)> {
-    let carried: Vec<(usize, f32)> = (0..N_ITEMS)
-        .filter(|&i| inv.items[i] >= 1.0 && !matches!(world.goods.role_of(i), ItemRole::Junk))
-        .map(|i| (i, inv.items[i]))
-        .collect();
-    if carried.is_empty() {
+    let n = (world.cols * world.rows) as usize;
+    if !index.dim_ok(n) {
+        // Pre-first-rebuild fallback: no index yet, so no market direction. The very
+        // first sim tick runs `update_price_field` (which triggers a rebuild) before
+        // `policy_step`, so this should only fire if the schedule order changes.
         return None;
     }
-    let (cols, rows) = (world.cols, world.rows);
-    let mut best: Option<((i32, i32), f32)> = None;
-    for r in 0..rows {
-        for c in 0..cols {
-            let tile = (r * cols + c) as usize;
-            let mut val = 0.0f32;
-            for &(item, held) in &carried {
-                let margin = field.local_ask(&world.goods, tile, item) - trader.cost_basis[item];
-                if margin > 0.0 {
-                    val += margin * held;
-                }
-            }
-            if val <= 0.0 {
+    let pos_idx = (pos.row * world.cols + pos.col) as usize;
+
+    let mut best: Option<(usize, f32)> = None;
+    let consider = |t_idx: usize, best: &mut Option<(usize, f32)>| {
+        let mut val = 0.0f32;
+        for item in 0..N_ITEMS {
+            let held = inv.items[item];
+            if held < 1.0 || matches!(world.goods.role_of(item), ItemRole::Junk) {
                 continue;
             }
-            let dist = world.dist(pos.col, pos.row, c, r) as f32;
-            let score = val - MARKET_DIST_PENALTY * dist;
-            if best.is_none_or(|(_, s)| score > s) {
-                best = Some(((c, r), score));
+            let margin = field.local_ask(&world.goods, t_idx, item) - trader.cost_basis[item];
+            if margin > 0.0 {
+                val += margin * held;
             }
         }
+        if val <= 0.0 {
+            return;
+        }
+        let tc = (t_idx as i32) % world.cols;
+        let tr = (t_idx as i32) / world.cols;
+        let dist = world.dist(pos.col, pos.row, tc, tr) as f32;
+        let score = val - MARKET_DIST_PENALTY * dist;
+        if best.is_none_or(|(_, s)| score > s) {
+            *best = Some((t_idx, score));
+        }
+    };
+
+    // Always score the noot's own tile so a noot already standing on a good market
+    // isn't told to leave just because the per-item DT named a further-out optimum.
+    consider(pos_idx, &mut best);
+    let mut any_held = false;
+    for item in 0..N_ITEMS {
+        if inv.items[item] < 1.0 || matches!(world.goods.role_of(item), ItemRole::Junk) {
+            continue;
+        }
+        any_held = true;
+        let bucket = index.bucket_of(item, trader.cost_basis[item]);
+        let cand = index.lookup(item, bucket, pos_idx);
+        consider(cand, &mut best);
+        // Joint-optimum recovery: the per-item argmax is exact when one item dominates
+        // the bag's value, but for genuine multi-item bags the joint optimum can be a
+        // local "compromise" tile near the per-item peak. Scoring the 6 hex neighbours
+        // of each per-item argmax catches that case without needing a per-noot DT —
+        // the joint peak is, in practice, almost always within one step of a per-item
+        // peak (the ask field is smooth: it's a sum of linear-decay kernels around
+        // deposits).
+        let cc = (cand as i32) % world.cols;
+        let cr = (cand as i32) / world.cols;
+        for &(nc, nr) in neighbors(cc, cr, world.cols, world.rows).iter() {
+            let nt = (nr * world.cols + nc) as usize;
+            consider(nt, &mut best);
+        }
     }
-    best.map(|(t, _)| t)
+    if !any_held {
+        return None;
+    }
+
+    best.map(|(t_idx, _)| ((t_idx as i32) % world.cols, (t_idx as i32) / world.cols))
+}
+
+/// Rebuild the `MarketIndex` whenever the price field has rebuilt (their lifecycles
+/// are locked together — the index is a pure derivative of the field).
+pub fn update_market_index(
+    sim: Res<Sim>,
+    field: Res<PriceField>,
+    mut index: ResMut<MarketIndex>,
+) {
+    let world = &sim.0;
+    let n = (world.cols * world.rows) as usize;
+    if !index.dim_ok(n) || index.last_rebuild_count != field.rebuild_count {
+        rebuild_market_index(&mut index, world, &field);
+        index.last_rebuild_count = field.rebuild_count;
+    }
 }
 
 /// Per-direction signed change in toroidal hex distance to `target` if the noot steps
@@ -693,6 +898,7 @@ fn heading_gradient(world: &crate::world::World, pos: &TilePos, target: Option<(
 fn features(
     world: &crate::world::World,
     field: &PriceField,
+    index: &MarketIndex,
     pos: &TilePos,
     claim: &Claim,
     hunger: &Hunger,
@@ -724,7 +930,7 @@ fn features(
     }
     o[policy::O_TERRAIN] = world.tiles[pos_idx].difficulty.clamp(0.0, 1.0);
 
-    let market = best_market_tile(field, world, pos, inv, trader);
+    let market = best_market_tile(field, index, world, pos, inv, trader);
     let market_dir = heading_gradient(world, pos, market);
     o[policy::O_MARKET_DIR..policy::O_MARKET_DIR + policy::N_DIRS].copy_from_slice(&market_dir);
     o[policy::O_HAS_CARGO] = if market.is_some() { 1.0 } else { 0.0 };
@@ -822,6 +1028,7 @@ fn option_target(
     act: usize,
     world: &crate::world::World,
     field: &PriceField,
+    index: &MarketIndex,
     claim: &Claim,
     pos: &TilePos,
     inv: &Inventory,
@@ -835,7 +1042,7 @@ fn option_target(
             .filter(|&(c, r)| {
                 world.dist(pos.col, pos.row, c, r) <= SHOP_RANGE
             })
-            .or_else(|| best_market_tile(field, world, pos, inv, trader)),
+            .or_else(|| best_market_tile(field, index, world, pos, inv, trader)),
         policy::A_REFINE => nearest_structure(world, pos, StructureKind::Refinery),
         _ => None,
     }
@@ -978,6 +1185,7 @@ pub fn accumulate_traffic(
 pub fn policy_step(
     sim: Res<Sim>,
     field: Res<PriceField>,
+    index: Res<MarketIndex>,
     ac: Res<ActorCritic>,
     mut trainer: ResMut<Trainer>,
     mut rng: ResMut<SimRng>,
@@ -1022,7 +1230,8 @@ pub fn policy_step(
         // option decision (when re-deciding) and the value-guided "GPS" movement below.
         let nearest_noot = nearest_other_noot(&snapshot, e, &pos, world);
         let (s_pos, s_o) = features(
-            world, &field, &pos, claim, hunger, inv, wallet, trader, &claimed, nearest_noot,
+            world, &field, &index, &pos, claim, hunger, inv, wallet, trader, &claimed,
+            nearest_noot,
         );
 
         // Re-decide only at option boundaries: when the committed plan is finished, was
@@ -1077,7 +1286,8 @@ pub fn policy_step(
             mem.last_u = u_now;
             mem.has_prev = true;
             mem.committed = true;
-            mem.plan_target = option_target(act, world, &field, claim, &pos, inv, trader, &claimed);
+            mem.plan_target =
+                option_target(act, world, &field, &index, claim, &pos, inv, trader, &claimed);
             mem.plan_ticks = OPTION_MAX_TICKS;
         }
 
@@ -1173,6 +1383,7 @@ pub fn add_sim_systems(schedule: &mut Schedule) {
             hunger_pid,
             age_noots,
             update_price_field,
+            update_market_index,
             policy_step,
             accumulate_traffic,
             build_structures,
@@ -1552,6 +1763,9 @@ pub struct PriceField {
     /// of `slot` — how far a unit of that good has been hauled when sold there.
     src_dist: Vec<f32>,
     elapsed: u32,
+    /// Bumped each time the field is rebuilt; `MarketIndex` compares against its own
+    /// last-seen value to know it must redo its per-item distance transforms.
+    rebuild_count: u32,
 }
 
 impl PriceField {
@@ -1602,6 +1816,7 @@ fn rebuild_price_field(field: &mut PriceField, world: &World) {
     field.n_slots = n_slots;
     field.price = vec![[0.0f32; N_ITEMS]; n];
     field.src_dist = vec![f32::MAX; n * n_slots];
+    field.rebuild_count = field.rebuild_count.wrapping_add(1);
 
     let mut pot = vec![vec![0.0f32; n]; n_slots];
     for dep in &world.deposits {

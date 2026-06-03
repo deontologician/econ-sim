@@ -134,6 +134,7 @@ fn main() {
     };
     w.insert_resource(Trainer::default());
     w.insert_resource(economy::PriceField::default());
+    w.insert_resource(economy::MarketIndex::default());
 
     match restore_noots {
         Some(noots) => {
