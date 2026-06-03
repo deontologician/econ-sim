@@ -5,12 +5,28 @@ Sprite](https://sprites.dev) — a persistent sandbox VM whose filesystem surviv
 whose URL wakes it on demand. That fits a leaderboard perfectly: it costs ~nothing while
 idle, wakes in 100–500ms when a sim POSTs, and keeps `leaderboard.json` across restarts.
 
+Live at **https://econ-leaderboard-bk7w.sprites.app** (the Pages build reports here by
+default — see "Turn on reporting" below).
+
 ## One-time setup
 
 ```bash
 curl -fsSL https://sprites.dev/install.sh | sh   # install the `sprite` CLI
-sprite org auth                                  # log in with your Fly.io account
+sprite login                                     # browser OAuth with your Fly.io account
 ```
+
+No browser (CI / a Fly deploy token)? Mint a Sprite token from the FlyV1 token and hand it
+to the CLI — `sprite login`/`org auth` need a *user* identity, which a deploy token lacks:
+
+```bash
+curl -s -X POST https://api.sprites.dev/v1/organizations/<org-slug>/tokens \
+  -H "Authorization: $FLY_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"econ-sim-deploy"}'                 # -> {"token":"<org>/<id>/<tid>/<secret>"}
+sprite auth setup --token "<org>/<id>/<tid>/<secret>"
+```
+
+Use the org **slug** (e.g. `josh-kuhn`), not the GraphQL org id, and pass the raw `FlyV1 …`
+value as the `Authorization` header (no `Bearer` prefix) — otherwise the mint returns 401.
 
 ## Deploy / redeploy
 
@@ -30,16 +46,18 @@ no Dockerfile/volume to manage. The server defaults to `PORT=8080` and writes
 ## Turn on reporting from the game
 
 The wasm client only POSTs when `LEADERBOARD_URL` is baked in at build time. The Pages
-workflow reads it from a repo variable:
+workflow (`.github/workflows/deploy.yml`) **defaults** it to the deployed Sprite's `/submit`
+URL, so a fresh push to `main` reports out of the box — no repo config needed.
 
-1. After deploy, copy the printed URL and append `/submit`
-   (e.g. `https://econ-leaderboard-yourorg.sprites.dev/submit`).
-2. GitHub → Settings → Secrets and variables → Actions → **Variables** → new variable
-   `LEADERBOARD_SUBMIT_URL` = that URL.
-3. Re-run the Pages deploy (push to `main` or run the workflow). The app now POSTs a full
-   snapshot every 1000 ticks.
+To point reporting elsewhere (a different Sprite, or off):
 
-Leave the variable unset to disable reporting (the default).
+1. Copy the deploy script's printed URL and append `/submit`
+   (e.g. `https://econ-leaderboard-yourorg.sprites.app/submit`).
+2. GitHub → Settings → Secrets and variables → Actions → **Variables** → set
+   `LEADERBOARD_SUBMIT_URL` = that URL. (Set it to a dummy/unreachable value to mute
+   reporting.)
+3. Re-run the Pages deploy (push to `main` or run the workflow). The variable overrides the
+   baked-in default; the app POSTs a full snapshot every 1000 ticks.
 
 ## Endpoints
 
@@ -49,12 +67,17 @@ Leave the variable unset to disable reporting (the default).
 
 ## Service management (on the Sprite)
 
+`sprite exec` parses its own flags up to a `--`, so pass remote commands after `--`:
+
 ```bash
-sprite exec sprite-env services list
-sprite exec sprite-env services get leaderboard
-# stream logs for 30s while debugging a (re)start:
-sprite exec bash -lc "sprite-env curl -X PUT '/v1/services/leaderboard?duration=30s' -d '{\"cmd\":\"/bin/bash\",\"args\":[\"-lc\",\"cd /home/sprite && exec /home/sprite/econ-sim/target/release/server\"]}'"
+sprite exec -- sprite-env services list
+sprite exec -- sprite-env services get leaderboard
+sprite exec -- sprite-env services restart leaderboard      # pick up a new binary
+sprite exec -- tail -n 50 /.sprite/logs/services/leaderboard.log
 ```
+
+The service is registered with `--http-port 8080`, so the Sprite proxy routes inbound HTTP
+to the server and auto-starts it on the first request after an idle sleep.
 
 ## Notes
 

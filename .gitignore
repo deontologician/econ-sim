@@ -1,3 +1,6 @@
 /target
 /dist
 /econ-sim-save.json
+
+# Sprites CLI per-directory state
+.sprite
