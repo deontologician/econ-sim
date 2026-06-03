@@ -304,7 +304,7 @@ fn emit_record(w: &mut World) {
         .collect();
     let mut q =
         w.query::<(&Action, &Hunger, &Claim, &Wallet, &NootMeta, &Trader, &Inventory, &TilePos)>();
-    let mut act = [0u64; 6];
+    let mut act = [0u64; 7];
     let (mut starving, mut claimed, mut n) = (0u64, 0u64, 0u64);
     let (mut miners, mut refiners, mut shopkeepers) = (0u64, 0u64, 0u64);
     let (mut bucks, mut appetite, mut experience, mut age, mut discount, mut positional) =
@@ -320,6 +320,7 @@ fn emit_record(w: &mut World) {
             Action::Idle => act[3] += 1,
             Action::BuildShop => act[4] += 1,
             Action::BuildRefinery => act[5] += 1,
+            Action::Research => act[6] += 1,
         }
         if h.is_starving() {
             starving += 1;
@@ -396,6 +397,10 @@ fn emit_record(w: &mut World) {
         "act_refine": act[2],
         "act_idle": act[3],
         "act_build": act[4] + act[5],
+        "act_research": act[6],
+        "research_rate": stats.research_rate,
+        "research_total": stats.research_total,
+        "research_demand": stats.research_demand,
         "shops": n_shops,
         "refineries": n_refineries,
         "miners": miners,

@@ -38,6 +38,14 @@ const SAFETY_BUCKS: f32 = 60.0;
 const ESTEEM_NORM: f32 = 4.0;
 /// Reward penalty applied to the transition that ends in starvation death.
 const DEATH_PENALTY: f32 = 2.0;
+/// Small per-option reward for a completed Research option (only when it was legal, i.e. the
+/// noot held goods to study). A stand-in to keep Research in the learned repertoire while its
+/// real payoff — discovering/constructing tech — is still a later phase (see plans/035 and
+/// INTENDED_FEATURES). Kept tiny so it never out-competes feeding/earning; tuned in headless.
+const RESEARCH_BONUS: f32 = 0.03;
+/// A noot must be carrying at least this many non-junk units for Research to be a legal
+/// option — there must be something in hand worth studying.
+const RESEARCH_MIN_HELD: f32 = 1.0;
 /// **Training cadence.** The trainer doesn't have to fire on every sim tick — the
 /// shared replay buffer accumulates transitions regardless, and the policy converges
 /// over many real-time seconds whether we sample 32 minibatches per tick or 32 per
@@ -270,6 +278,20 @@ pub struct EconStats {
     #[serde(default)]
     haul_count_window: u32,
     window_ticks: u32,
+    /// Cumulative research demand per **local** item index — how much each held good has been
+    /// studied via the Research action. The submit summary maps these to global
+    /// (element, form) identity (`leaderboard::summarize`) so the server can aggregate demand
+    /// across all worlds and grow the shared tech tree (plans/035, Phases 2–3).
+    #[serde(default)]
+    pub research_demand: [f64; N_ITEMS],
+    /// Cumulative research effort across all items (the sum of `research_demand`).
+    #[serde(default)]
+    pub research_total: f64,
+    /// Research effort per tick over the last window (a liveness readout).
+    #[serde(default)]
+    pub research_rate: f32,
+    #[serde(default)]
+    research_window: f32,
 }
 
 /// Fold the running tallies into per-tick rates once per `RATE_WINDOW_TICKS`.
@@ -283,6 +305,8 @@ pub fn update_rates(mut stats: ResMut<EconStats>) {
         stats.merchant_profit_rate = stats.merchant_profit_window * inv;
         stats.utility_rate = stats.utility_window * inv;
         stats.gdp_rate = stats.gdp_window * inv;
+        stats.research_rate = stats.research_window * inv;
+        stats.research_window = 0.0;
         stats.mean_haul_dist = if stats.haul_count_window > 0 {
             (stats.haul_window / stats.haul_count_window as f64) as f32
         } else {
@@ -1087,6 +1111,7 @@ fn option_mask(
     mask[policy::A_BUILD_SHOP] = owns_nothing && wallet.bucks >= SHOP_COST + SHOP_BUILD_BUFFER;
     mask[policy::A_BUILD_REFINERY] =
         owns_nothing && wallet.bucks >= REFINERY_COST + SHOP_BUILD_BUFFER;
+    mask[policy::A_RESEARCH] = carried_units(world, inv) >= RESEARCH_MIN_HELD;
     mask[policy::A_EXPLORE] = true;
     mask
 }
@@ -1138,7 +1163,9 @@ fn option_done(
         policy::A_SELL => sellable_units(world, inv) < 1.0,
         policy::A_REFINE => !has_intermediate(world, inv),
         policy::A_BUILD_SHOP | policy::A_BUILD_REFINERY => claim.hex.is_some(),
-        policy::A_EXPLORE => false,
+        // Research and Explore run in place until the step cap (handled by `plan_ticks == 0`
+        // above), then the policy re-decides.
+        policy::A_EXPLORE | policy::A_RESEARCH => false,
         _ => true,
     }
 }
@@ -1328,7 +1355,14 @@ pub fn policy_step(
                 let (r, done) = if mem.died {
                     (-DEATH_PENALTY, true)
                 } else {
-                    (u_now - mem.last_u, false)
+                    // Base reward is the ΔU the option accrued; a finished Research option adds
+                    // a small fixed bonus (stand-in — see RESEARCH_BONUS) so the action stays
+                    // learnable before tech discovery exists to reward it intrinsically.
+                    let mut r = u_now - mem.last_u;
+                    if mem.last_act == policy::A_RESEARCH {
+                        r += RESEARCH_BONUS;
+                    }
+                    (r, false)
                 };
                 trainer.record(Transition {
                     pos: mem.last_pos,
@@ -1422,6 +1456,11 @@ pub fn policy_step(
                     *action = Action::Move;
                 }
             }
+            policy::A_RESEARCH => {
+                // Study in place — no move (so only base hunger accrues, no haul cost). The
+                // `research` system reads this Action and records demand for the held goods.
+                *action = Action::Research;
+            }
             _ => {
                 // Explore: a random hex step (scouting for deposits/markets/partners).
                 let (nc, nr) = neighbors(pos.col, pos.row, world.cols, world.rows)
@@ -1479,6 +1518,7 @@ pub fn add_sim_systems(schedule: &mut Schedule) {
             claim_improvements,
             extract,
             refine,
+            research,
             meet_and_trade,
             consume,
             death_and_respawn,
@@ -1677,6 +1717,33 @@ pub fn refine(sim: Res<Sim>, mut q: Query<(&Action, &TilePos, &mut Inventory, &m
             inv.items[raw] -= amount;
             inv.items[refined] += amount;
             meta.experience += amount;
+        }
+    }
+}
+
+/// Record research demand for a noot whose action is `Research`: each held non-junk good is
+/// "studied" in proportion to how much of it the noot carries. The per-item tallies are what
+/// the server aggregates (after the client maps them to global element identity in
+/// `leaderboard::summarize`) to grow the shared tech tree. Phase 1 only *measures* demand;
+/// discovery and tech construction come later (plans/035).
+pub fn research(
+    sim: Res<Sim>,
+    mut stats: ResMut<EconStats>,
+    q: Query<(&Action, &Inventory)>,
+) {
+    let goods = &sim.0.goods;
+    for (action, inv) in &q {
+        if *action != Action::Research {
+            continue;
+        }
+        for i in 0..N_ITEMS {
+            if matches!(goods.role_of(i), ItemRole::Junk) || inv.items[i] <= 0.0 {
+                continue;
+            }
+            let studied = (inv.items[i] * TICK_DT) as f64;
+            stats.research_demand[i] += studied;
+            stats.research_total += studied;
+            stats.research_window += studied as f32;
         }
     }
 }

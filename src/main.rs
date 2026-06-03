@@ -3155,6 +3155,7 @@ fn update_selection_panel(
         Action::Idle => "idle",
         Action::BuildShop => "build shop",
         Action::BuildRefinery => "build refinery",
+        Action::Research => "research",
     };
 
     let utility = economy::maslow_utility(hunger, inv, wallet, &world.goods);

@@ -58,6 +58,9 @@ pub enum Action {
     BuildShop,
     /// Build (or rebuild over) a refinery on the current tile this tick.
     BuildRefinery,
+    /// Study the items in hand this tick — records per-resource research demand the server
+    /// aggregates to grow the global tech tree (see `economy::research`). In-place, no haul.
+    Research,
 }
 
 /// Per-noot life stats, surfaced by the noot-colouring overlays. `age` is seconds

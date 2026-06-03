@@ -40,7 +40,11 @@ pub const A_EXPLORE: usize = 3;
 pub const A_BUILD_SHOP: usize = 4;
 /// Build a refinery (the only place refining happens) — likewise claims the hex.
 pub const A_BUILD_REFINERY: usize = 5;
-pub const N_ACT: usize = 6;
+/// Study held items in place — records per-resource research demand for the tech tree.
+/// Trailing index by design: the actor head `wa` is `[act*H + j]` row-major, so a save
+/// migration grows it by appending one zero block (see `save::migrate_step` v2→v3).
+pub const A_RESEARCH: usize = 6;
+pub const N_ACT: usize = 7;
 /// Hex move directions — the width of the engineered *heading* features below and of the
 /// neighbour set the value-guided executor scores each step, even though a single
 /// direction is not itself a policy action.

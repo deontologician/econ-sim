@@ -396,3 +396,21 @@ design. Newest first within each section.
 - **INTENDED**: guarantee the glyph via a bundled font subset; a proper styled
   currency mark.
 - **STATUS**: partial
+
+### Tech tree — research action + demand reporting (Phase 1 of plans/035)
+- **NOW**: noots have a **Research** action (policy `A_RESEARCH`, masked legal when carrying
+  ≥1 non-junk unit). It studies held goods in place; the `economy::research` system tallies
+  per-item `EconStats::research_demand`, which `leaderboard::summarize` maps to global
+  `(element, form)` identity and ships in the submit `Summary` for the server to aggregate.
+  Save migrated v2→v3 (grows the actor head by one zero block — trained brain preserved).
+  Verified headless: research fires, demand accrues per-resource, economy stays healthy.
+- **STUB**: the research reward is a small fixed `RESEARCH_BONUS` (0.03/option, gated on
+  legality) — a placeholder to keep the action in the learned repertoire. There is **no real
+  payoff yet**: nothing is discovered or built, and tech items don't exist.
+- **INTENDED** (plans/035 Phases 2–3): the server grows a **global, live** tech tree from
+  aggregated demand, randomizes each tech's attributes, and names it via a cheap LLM
+  (OpenRouter/Qwen, procedural fallback); the client fetches the tree, lets a noot **discover**
+  a tech by researching with its prerequisites, then **build a workshop** that constructs the
+  tech as a new good whose attributes feed utility/efficiency. The real research reward
+  replaces the stand-in then.
+- **STATUS**: partial (Phase 1 shipped)
