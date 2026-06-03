@@ -2436,7 +2436,7 @@ const fn leaderboard_url() -> Option<&'static str> {
 }
 /// Report to the leaderboard this often (sim ticks). Out of band: the POST is a fire-and-
 /// forget `fetch`, so it never blocks the fixed-tick loop.
-const LEADERBOARD_EVERY_TICKS: u64 = 1000;
+const LEADERBOARD_EVERY_TICKS: u64 = 5000 * 60;
 
 /// Every `LEADERBOARD_EVERY_TICKS`, serialize the current save snapshot (reusing the save
 /// format) and POST it to the leaderboard server without awaiting the response. No-op when
