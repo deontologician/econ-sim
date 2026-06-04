@@ -50,9 +50,11 @@ required-features = ["server"]
 
 # Web-only: hide the loading screen once Bevy boots, and draw an entropy seed.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "DomTokenList", "Storage", "Location", "Request", "RequestInit", "RequestMode", "Headers"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "DomTokenList", "Storage", "Location", "Request", "RequestInit", "RequestMode", "Headers", "Response"] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
+# Await the leaderboard `fetch` so we can read the tech tree from its response (Phase 3).
+wasm-bindgen-futures = "0.4"
 
 # Build dependencies with optimizations even in dev so the sim runs smoothly,
 # while keeping our own crate fast to recompile.

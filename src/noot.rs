@@ -3,6 +3,7 @@
 
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::goods::N_ITEMS;
 use crate::rng::Rng;
@@ -61,6 +62,10 @@ pub enum Action {
     /// Study the items in hand this tick — records per-resource research demand the server
     /// aggregates to grow the global tech tree (see `economy::research`). In-place, no haul.
     Research,
+    /// Build (or rebuild over) a workshop on the current tile this tick.
+    BuildWorkshop,
+    /// Construct a discovered tech at the workshop underfoot, consuming its inputs.
+    Construct,
 }
 
 /// Per-noot life stats, surfaced by the noot-colouring overlays. `age` is seconds
@@ -237,13 +242,29 @@ pub struct TilePos {
 #[derive(Component, Clone, Serialize, Deserialize)]
 pub struct Inventory {
     pub items: [f32; N_ITEMS],
+    /// Held **tech items** by tech id, separate from the fixed base-good array so the trade /
+    /// pricing / WTP machinery for the 8 base goods is untouched. `BTreeMap` for deterministic
+    /// iteration (utility sums must be order-stable). `#[serde(default)]` for pre-tech saves.
+    #[serde(default)]
+    pub tech: BTreeMap<u64, f32>,
 }
 
 impl Inventory {
     pub fn new() -> Self {
         Self {
             items: [0.0; N_ITEMS],
+            tech: BTreeMap::new(),
         }
+    }
+
+    /// Quantity of tech `id` held.
+    pub fn tech_qty(&self, id: u64) -> f32 {
+        self.tech.get(&id).copied().unwrap_or(0.0)
+    }
+
+    /// Add `amt` of tech `id`.
+    pub fn add_tech(&mut self, id: u64, amt: f32) {
+        *self.tech.entry(id).or_insert(0.0) += amt;
     }
 }
 

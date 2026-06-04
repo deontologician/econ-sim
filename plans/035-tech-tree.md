@@ -1,16 +1,23 @@
 # 035 — Server-grown tech tree (research → discover → construct)
 
-Status: **Phases 1–2 shipped**, Phase 3 designed. Three-phase feature; this doc is the
-contract for all three.
+Status: **Phases 1–3 shipped**. Three-phase feature; this doc is the contract for all three.
 
 - **Phase 1 (shipped)**: client `Research` action + per-resource demand reporting.
 - **Phase 2 (shipped)**: server aggregates demand, grows + names the global tech tree
   (`src/tech.rs` pure logic; `src/bin/server.rs` growth task, OpenRouter naming with
   procedural fallback, `GET /tech`, tree in the `/submit` response, HTML section,
-  `tech_state.json` persistence). Verified live end-to-end (procedural naming; LLM kicks in
-  once `OPENROUTER_API_KEY` is set on the Sprite).
-- **Phase 3 (next)**: client fetches the tree, discovery-on-research, workshop construction,
-  tech-item effects.
+  `tech_state.json` persistence). Verified live end-to-end (LLM naming active once
+  `OPENROUTER_API_KEY` is set on the Sprite).
+- **Phase 3 (shipped)**: the sim mechanics + the client fetch.
+  - *3a (sim, headless-verified)*: `World.tech_catalog` + `discovered`; tech-item inventory
+    (`Inventory.tech: BTreeMap<u64,f32>`); `Action::BuildWorkshop`/`Construct` + policy
+    `A_BUILD_WORKSHOP`/`A_CONSTRUCT` (`N_ACT` 7→9); `discover`/`construct` systems;
+    `StructureKind::Workshop`; tech effects (Nourish food, Esteem utility, Extract/Refine/Carry
+    boosts); save migration v3→v4 (grows actor head 7→9, brain preserved). Verified headless
+    via `--seed-tech`: research→discover→build workshop→construct→tech items, economy healthy.
+  - *3b (wasm fetch)*: the `/submit` POST now reads the response tech tree (web-sys `Response`
+    + `wasm-bindgen-futures`); a boot `GET /tech` seeds the catalog immediately;
+    `apply_fetched_tech` folds it into `Sim`. Compile-checked only (wasm path).
 
 ## Goal (user's framing)
 

@@ -23,8 +23,9 @@ use crate::world::World;
 
 /// Current save schema version. Bump on any change, and add a [`migrate_step`] arm
 /// upgrading the previous version to this one. v2 added the learned `policy`; v3 added the
-/// `Research` action (a 7th actor-head output) and the research-demand stats.
-pub const SAVE_VERSION: u32 = 3;
+/// `Research` action (a 7th actor-head output) and the research-demand stats; v4 added the
+/// `BuildWorkshop`/`Construct` actions (9 outputs) and the tech catalog/inventory.
+pub const SAVE_VERSION: u32 = 4;
 
 /// The persisted parts of one noot. Per-noot RL state (`PolicyMemory`) is transient;
 /// only its intrinsic exploration ε is kept (the shared brain is saved separately).
@@ -80,43 +81,53 @@ fn migrate_step(from_version: u32, save: &mut serde_json::Value) {
     // save (which lacks it) deserializes with an empty net and `setup` re-initializes
     // it to the world's tile count — no JSON surgery needed here.
     //
-    // v2 → v3: the `Research` action added a 7th actor-head output (`N_ACT` 6 → 7). Grow the
-    // saved actor head in place so the *trained* brain survives the schema bump rather than
-    // resetting: append one zero block (`H` weights) to `policy.wa` and one zero to
-    // `policy.ba` — the new action's row starts neutral. The new research-demand stats are
-    // `#[serde(default)]`, so no surgery is needed for them.
-    if from_version == 2 {
-        if let Some(policy) = save.get_mut("policy") {
-            grow_actor_head_v3(policy);
+    // v2 → v3: the `Research` action added a 7th actor-head output (`N_ACT` 6 → 7).
+    // v3 → v4: `BuildWorkshop` + `Construct` added two more (7 → 9).
+    // Grow the saved actor head in place so the *trained* brain survives the schema bump
+    // rather than resetting: append zero rows (`H` weights each) to `policy.wa` and zeros to
+    // `policy.ba` — the new actions start neutral. New `#[serde(default)]` fields (stats, tech
+    // catalog/inventory) need no surgery.
+    match from_version {
+        2 => {
+            if let Some(policy) = save.get_mut("policy") {
+                grow_actor_head(policy, 6, 7);
+            }
         }
+        3 => {
+            if let Some(policy) = save.get_mut("policy") {
+                grow_actor_head(policy, 7, 9);
+            }
+        }
+        _ => {}
     }
 }
 
-/// v2 → v3 helper: append the `Research` action's (zero) row to a saved actor head. Only an
-/// old-shaped, present net qualifies; anything else is left untouched and the loader's
-/// `ActorCritic::fits` check falls back to a fresh net.
-fn grow_actor_head_v3(policy: &mut serde_json::Value) {
+/// Append zero actor rows to a saved net, growing it from `old_n_act` to `new_n_act` outputs
+/// (`wa` gains `(new-old)*H` zeros, `ba` gains `new-old`). Only an old-shaped, present net
+/// qualifies; anything else is left untouched and the loader's `ActorCritic::fits` check falls
+/// back to a fresh net.
+fn grow_actor_head(policy: &mut serde_json::Value, old_n_act: usize, new_n_act: usize) {
     use crate::policy::H;
-    const OLD_N_ACT: usize = 6;
     let Some(obj) = policy.as_object_mut() else {
         return;
     };
     let wa_old = obj
         .get("wa")
         .and_then(|v| v.as_array())
-        .is_some_and(|a| a.len() == OLD_N_ACT * H);
+        .is_some_and(|a| a.len() == old_n_act * H);
     let ba_old = obj
         .get("ba")
         .and_then(|v| v.as_array())
-        .is_some_and(|a| a.len() == OLD_N_ACT);
+        .is_some_and(|a| a.len() == old_n_act);
     if !wa_old || !ba_old {
         return;
     }
+    let add = new_n_act - old_n_act;
     if let Some(wa) = obj.get_mut("wa").and_then(|v| v.as_array_mut()) {
-        wa.extend(std::iter::repeat_n(serde_json::json!(0.0), H));
+        wa.extend(std::iter::repeat_n(serde_json::json!(0.0), add * H));
     }
     if let Some(ba) = obj.get_mut("ba").and_then(|v| v.as_array_mut()) {
-        ba.push(serde_json::json!(0.0));
+        ba.extend(std::iter::repeat_n(serde_json::json!(0.0), add));
     }
 }
 

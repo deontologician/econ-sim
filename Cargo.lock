@@ -2338,6 +2338,7 @@ dependencies = [
  "tokio",
  "ureq",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 

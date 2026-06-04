@@ -511,7 +511,7 @@ fn main() {
         .init_resource::<economy::PolicyStepScratch>()
         .init_resource::<PolicyConfig>()
         .init_resource::<Trainer>()
-        .add_systems(Startup, setup)
+        .add_systems(Startup, (setup, boot_fetch_tech))
         // The fixed-tick simulation pipeline (each system advances the world by one
         // `TICK_DT`), driven many times per frame by `run_sim_ticks`. The system list
         // lives in `economy::add_sim_systems`, shared with the headless harness.
@@ -537,6 +537,7 @@ fn main() {
                     overlay_controls,
                     save_game,
                     submit_leaderboard,
+                    apply_fetched_tech,
                     new_world_controls,
                     speed_controls,
                     graphs_controls,
@@ -2500,8 +2501,8 @@ fn submit_leaderboard(
     }
 }
 
-/// Fire-and-forget POST of the snapshot JSON (browser `fetch`; the Promise is intentionally
-/// dropped — the request still goes, and we never block on the reply).
+/// POST the snapshot JSON (browser `fetch`); the server's response body is the current tech
+/// tree, which we parse and stash for `apply_fetched_tech` to fold into the world.
 #[cfg(target_arch = "wasm32")]
 fn post_snapshot(url: &str, json: &str) {
     use wasm_bindgen::JsValue;
@@ -2517,12 +2518,84 @@ fn post_snapshot(url: &str, json: &str) {
         opts.set_headers(&headers);
     }
     if let Ok(req) = Request::new_with_str_and_init(url, &opts) {
-        let _ = window.fetch_with_request(&req);
+        store_tech_from_fetch(window.fetch_with_request(&req));
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn post_snapshot(_url: &str, _json: &str) {}
+
+// Filled by the async fetch callbacks (submit response / boot GET), drained by
+// `apply_fetched_tech` into `Sim` on the next frame. Single-threaded wasm, so a thread-local
+// `RefCell` is a safe hand-off between the JS callback and the ECS system.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_TECH: std::cell::RefCell<Option<Vec<econ_sim::tech::Tech>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Await a `fetch` promise, read the body as text, parse it as a `TechTree`, and stash the
+/// techs. Best-effort: any failure (network, non-JSON) silently leaves the catalog as-is.
+#[cfg(target_arch = "wasm32")]
+fn store_tech_from_fetch(promise: js_sys::Promise) {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::{spawn_local, JsFuture};
+    use web_sys::Response;
+    spawn_local(async move {
+        let Ok(resp) = JsFuture::from(promise).await else {
+            return;
+        };
+        let Ok(resp) = resp.dyn_into::<Response>() else {
+            return;
+        };
+        let Ok(text_promise) = resp.text() else {
+            return;
+        };
+        let Ok(text) = JsFuture::from(text_promise).await else {
+            return;
+        };
+        if let Some(text) = text.as_string() {
+            if let Ok(tree) = serde_json::from_str::<econ_sim::tech::TechTree>(&text) {
+                PENDING_TECH.with(|p| *p.borrow_mut() = Some(tree.techs));
+            }
+        }
+    });
+}
+
+/// Boot-time GET of the tech tree (sibling `/tech` of the configured submit URL) so a fresh
+/// client has the catalog before its first periodic submit. No-op without a leaderboard URL.
+#[cfg(target_arch = "wasm32")]
+fn boot_fetch_tech() {
+    use web_sys::{Request, RequestInit};
+    let Some(base) = LEADERBOARD_URL.and_then(|u| u.strip_suffix("submit")) else {
+        return;
+    };
+    let tech_url = format!("{base}tech");
+    if let Some(window) = web_sys::window() {
+        let opts = RequestInit::new();
+        opts.set_method("GET");
+        if let Ok(req) = Request::new_with_str_and_init(&tech_url, &opts) {
+            store_tech_from_fetch(window.fetch_with_request(&req));
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn boot_fetch_tech() {}
+
+/// Fold a fetched tech tree into the world's catalog (so discovery/construction can see the
+/// server's latest techs). Wasm-only effect; a no-op system elsewhere.
+#[cfg(target_arch = "wasm32")]
+fn apply_fetched_tech(mut sim: ResMut<Sim>) {
+    PENDING_TECH.with(|p| {
+        if let Some(techs) = p.borrow_mut().take() {
+            sim.0.tech_catalog = techs;
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_fetched_tech() {}
 
 /// G key or the "New" button: clear the saved snapshot and reload, starting a fresh
 /// world. (Reloading re-runs setup, which rolls a new random world.)
@@ -2762,19 +2835,22 @@ fn update_roads(
     }
 }
 
-/// Colour a structure marker by its kind: cyan shop, orange refinery.
+/// Colour a structure marker by its kind: cyan shop, orange refinery, green workshop.
 fn structure_color(kind: econ_sim::world::StructureKind) -> Color {
     match kind {
         econ_sim::world::StructureKind::Shop => Color::srgb(0.30, 0.80, 0.85),
         econ_sim::world::StructureKind::Refinery => Color::srgb(0.95, 0.55, 0.20),
+        econ_sim::world::StructureKind::Workshop => Color::srgb(0.55, 0.85, 0.60),
     }
 }
 
-/// The emblem mesh for a kind: an upward triangle (shop) or a diamond (refinery).
+/// The emblem mesh for a kind: an upward triangle (shop) or a diamond (refinery/workshop —
+/// the workshop reuses the diamond for now, tinted green by `structure_color`).
 fn emblem_mesh(kind: econ_sim::world::StructureKind, a: &StructAssets) -> Handle<Mesh> {
     match kind {
         econ_sim::world::StructureKind::Shop => a.shop_emblem.clone(),
         econ_sim::world::StructureKind::Refinery => a.refinery_emblem.clone(),
+        econ_sim::world::StructureKind::Workshop => a.refinery_emblem.clone(),
     }
 }
 
@@ -3078,6 +3154,7 @@ fn describe_hex(world: &econ_sim::world::World, tile: usize, claimed: bool) -> S
         let (what, note) = match kind {
             StructureKind::Shop => ("shop", "a sell waypoint — trade clears here"),
             StructureKind::Refinery => ("refinery", "noots refine intermediates here"),
+            StructureKind::Workshop => ("workshop", "noots construct discovered techs here"),
         };
         let who = if claimed {
             "owned"
@@ -3142,6 +3219,7 @@ fn update_selection_panel(
                 match world.structure_kind(h) {
                     Some(econ_sim::world::StructureKind::Shop) => "owns shop".to_string(),
                     Some(econ_sim::world::StructureKind::Refinery) => "owns refinery".to_string(),
+                    Some(econ_sim::world::StructureKind::Workshop) => "owns workshop".to_string(),
                     None => "unclaimed".to_string(),
                 }
             }
@@ -3156,9 +3234,11 @@ fn update_selection_panel(
         Action::BuildShop => "build shop",
         Action::BuildRefinery => "build refinery",
         Action::Research => "research",
+        Action::BuildWorkshop => "build workshop",
+        Action::Construct => "construct",
     };
 
-    let utility = economy::maslow_utility(hunger, inv, wallet, &world.goods);
+    let utility = economy::maslow_utility(hunger, inv, wallet, world);
     let mut out = format!(
         "[selected] {} — {}   action {}   skill {:.2}×   discount {:.2}   explore {:.2}   ₦{:.0}   hunger {:.1}   utility {:.2}\n",
         name.display(),

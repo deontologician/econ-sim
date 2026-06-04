@@ -414,8 +414,20 @@ design. Newest first within each section.
 - **STUB**: the research reward is still a small fixed `RESEARCH_BONUS` (0.03/option) — no real
   payoff until Phase 3. Demand decay over time isn't implemented (global demand is the sum of
   worlds' latest cumulative). The LLM only names if `OPENROUTER_API_KEY` is set on the Sprite.
-- **INTENDED** (Phase 3, client): fetch the tree from the `/submit` response, let a noot
-  **discover** a tech by researching with its prerequisites, **build a workshop** that
-  constructs the tech as a new good, and apply tech attributes (nourish/esteem/efficiency).
-  The real research reward replaces the stand-in then.
-- **STATUS**: partial (Phases 1–2 shipped)
+- **NOW (Phase 3, client)**: worlds cache the server tree (`World.tech_catalog`); a noot
+  researching while holding a tech's full inputs **discovers** it (`World.discovered`);
+  discovered → noots `BuildWorkshop` then `Construct` (consume inputs → +1 tech item,
+  `Inventory.tech: BTreeMap`). Effects: Nourish (consumable food), Esteem (durable utility),
+  Extract/Refine/Carry boosts (held multipliers). `StructureKind::Workshop`; actions
+  `A_BUILD_WORKSHOP`/`A_CONSTRUCT` (`N_ACT` 7→9); save migration v3→v4 (actor head grows,
+  brain preserved). The wasm client reads the tree from the `/submit` response + a boot
+  `GET /tech`. Headless `--seed-tech` drives the whole loop; verified there.
+- **STUB**: `consumable` is mechanically honored only for Nourish (food eaten); Esteem/boosts
+  are durable-while-held regardless. Boosts take the single best held tech (no stacking).
+  Workshop reuses the refinery emblem (green-tinted). Tech items aren't traded. The Phase-1
+  `RESEARCH_BONUS` nudge stays (discovery/tech utility now reward too). The wasm fetch path is
+  compile-checked only (no wasm runtime in the sandbox).
+- **INTENDED**: full consumable/durable mechanics (single-use boosts, decaying esteem); tech
+  trading + pricing; stacking/diminishing boost combos; a workshop emblem + HUD/leaderboard
+  tech panel; demand decay; rewarding discovery directly.
+- **STATUS**: partial (Phases 1–3 shipped; refinements above outstanding)

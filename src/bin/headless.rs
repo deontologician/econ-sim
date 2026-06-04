@@ -68,11 +68,15 @@ struct Cli {
     /// `mean_abs_td_error` per sample (computed on a *uniform* mini-batch regardless
     /// of mode, so the metric is fair across both samplers).
     prioritized: bool,
+    /// `--seed-tech` injects a synthetic tech catalog (one tech per effect, each built from
+    /// the world's own first element) so the Phase-3 discover/construct/effect path can be
+    /// exercised headless without a live server. Verification aid only.
+    seed_tech: bool,
 }
 
 fn parse_cli() -> Cli {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (mut load, mut save, mut prioritized) = (None, None, false);
+    let (mut load, mut save, mut prioritized, mut seed_tech) = (None, None, false, false);
     let mut pos: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -87,6 +91,10 @@ fn parse_cli() -> Cli {
             }
             "--prioritized" => {
                 prioritized = true;
+                i += 1;
+            }
+            "--seed-tech" => {
+                seed_tech = true;
                 i += 1;
             }
             other => {
@@ -106,7 +114,32 @@ fn parse_cli() -> Cli {
         load,
         save,
         prioritized,
+        seed_tech,
     }
+}
+
+/// Build a synthetic catalog (one tech per effect) whose single input is the raw form of the
+/// world's first element — guaranteed buildable in this world. Lets the headless harness drive
+/// the Phase-3 discover/construct/effect path without a live server.
+fn synth_catalog(world: &econ_sim::world::World) -> Vec<econ_sim::tech::Tech> {
+    use econ_sim::goods::{GoodCategory, GoodForm};
+    use econ_sim::tech::{Tech, TechInput, EFFECTS};
+    let element = world.chosen[0].id;
+    EFFECTS
+        .iter()
+        .enumerate()
+        .map(|(i, &effect)| Tech {
+            id: i as u64,
+            name: format!("Test {}", effect.label()),
+            inputs: vec![TechInput { element, form: GoodForm::Raw, qty: 1 }],
+            effect,
+            magnitude: 1.5,
+            consumable: matches!(effect, econ_sim::tech::TechEffect::Nourish),
+            category: GoodCategory::Positional,
+            tier: 1,
+            created_unix: 0,
+        })
+        .collect()
 }
 
 fn main() {
@@ -198,6 +231,10 @@ fn main() {
                 ));
             }
         }
+    }
+    let mut world = world;
+    if cli.seed_tech && world.tech_catalog.is_empty() {
+        world.tech_catalog = synth_catalog(&world);
     }
     w.insert_resource(Sim(world));
     w.insert_resource(SimRng(rng));
@@ -297,6 +334,14 @@ fn emit_record(w: &mut World) {
         .iter()
         .filter(|s| s.kind == StructureKind::Refinery)
         .count() as u64;
+    let n_workshops = sim_ref
+        .0
+        .structures
+        .iter()
+        .filter(|s| s.kind == StructureKind::Workshop)
+        .count() as u64;
+    let n_discovered = sim_ref.0.discovered.len() as u64;
+    let n_catalog = sim_ref.0.tech_catalog.len() as u64;
     // Per-tile improvement lookups so we can classify each noot's claimed hex.
     let tile_deposit: Vec<bool> = sim_ref.0.tiles.iter().map(|t| t.deposit.is_some()).collect();
     let tile_refinery: Vec<bool> = (0..tile_deposit.len())
@@ -304,12 +349,13 @@ fn emit_record(w: &mut World) {
         .collect();
     let mut q =
         w.query::<(&Action, &Hunger, &Claim, &Wallet, &NootMeta, &Trader, &Inventory, &TilePos)>();
-    let mut act = [0u64; 7];
+    let mut act = [0u64; 9];
     let (mut starving, mut claimed, mut n) = (0u64, 0u64, 0u64);
     let (mut miners, mut refiners, mut shopkeepers) = (0u64, 0u64, 0u64);
     let (mut bucks, mut appetite, mut experience, mut age, mut discount, mut positional) =
         (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut transactions = 0.0f64;
+    let mut tech_items = 0.0f64;
     let mut tiles: Vec<(i32, i32)> = Vec::new();
     let mut wealth: Vec<f32> = Vec::new();
     for (a, h, c, wal, m, tr, inv, tp) in q.iter(w) {
@@ -321,6 +367,8 @@ fn emit_record(w: &mut World) {
             Action::BuildShop => act[4] += 1,
             Action::BuildRefinery => act[5] += 1,
             Action::Research => act[6] += 1,
+            Action::BuildWorkshop => act[7] += 1,
+            Action::Construct => act[8] += 1,
         }
         if h.is_starving() {
             starving += 1;
@@ -347,6 +395,7 @@ fn emit_record(w: &mut World) {
             .filter(|&i| matches!(goods.role_of(i), ItemRole::Positional(_)))
             .map(|i| inv.items[i])
             .sum::<f32>() as f64;
+        tech_items += inv.tech.values().map(|&q| q as f64).sum::<f64>();
         tiles.push((tp.col, tp.row));
         n += 1;
     }
@@ -398,9 +447,17 @@ fn emit_record(w: &mut World) {
         "act_idle": act[3],
         "act_build": act[4] + act[5],
         "act_research": act[6],
+        "act_build_workshop": act[7],
+        "act_construct": act[8],
         "research_rate": stats.research_rate,
         "research_total": stats.research_total,
         "research_demand": stats.research_demand,
+        "discovered_total": stats.discovered_total,
+        "constructed_total": stats.constructed_total,
+        "n_catalog": n_catalog,
+        "n_discovered": n_discovered,
+        "workshops": n_workshops,
+        "tech_items": tech_items,
         "shops": n_shops,
         "refineries": n_refineries,
         "miners": miners,

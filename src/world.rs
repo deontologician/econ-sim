@@ -14,6 +14,7 @@ use crate::elements::{element_count, ElementId};
 use crate::goods::{self, WorldGoods};
 use crate::hex::neighbors;
 use crate::rng::Rng;
+use crate::tech::Tech;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -91,6 +92,9 @@ impl Deposit {
 pub enum StructureKind {
     Shop,
     Refinery,
+    /// Constructs a discovered tech: a noot standing here with the tech's input goods turns
+    /// them into the tech item (see `economy::construct`). Built once a tech is discovered.
+    Workshop,
 }
 
 /// A noot-built structure on a tile. Persistent: it outlives its builder and, while
@@ -123,6 +127,16 @@ pub struct World {
     /// lazy resizing in `accumulate_traffic` keep pre-edge saves loading (empty → rebuilt).
     #[serde(default)]
     pub road_edges: Vec<f32>,
+    /// The tech tree this world knows about — a cache of the server's global tree, refreshed
+    /// from each `/submit` response (the headless harness can seed it directly). Drives which
+    /// techs are discoverable/constructible here. `#[serde(default)]` so pre-tech saves load
+    /// with an empty catalog.
+    #[serde(default)]
+    pub tech_catalog: Vec<Tech>,
+    /// Ids of techs **discovered** in this world (a noot researched while holding the recipe's
+    /// inputs). Discovery unlocks building a workshop and constructing the tech. Sorted, small.
+    #[serde(default)]
+    pub discovered: Vec<u64>,
     /// Symmetric **toroidal hex-distance table**, `cols*rows × cols*rows` entries as `u8`
     /// (distance ≤ `cols/2 + rows/2`, comfortably under 255 for any sane map). Built once
     /// in `generate` and after `deserialize`; replaces the inline 9-image
@@ -195,6 +209,48 @@ impl World {
     /// The kind of structure on `tile`, if any.
     pub fn structure_kind(&self, tile: usize) -> Option<StructureKind> {
         self.tiles[tile].structure.map(|i| self.structures[i].kind)
+    }
+
+    /// Whether tech `id` has been discovered in this world.
+    pub fn is_discovered(&self, id: u64) -> bool {
+        self.discovered.binary_search(&id).is_ok()
+    }
+
+    /// Mark tech `id` discovered (kept sorted, deduped). Returns true if newly discovered.
+    pub fn discover(&mut self, id: u64) -> bool {
+        match self.discovered.binary_search(&id) {
+            Ok(_) => false,
+            Err(pos) => {
+                self.discovered.insert(pos, id);
+                true
+            }
+        }
+    }
+
+    /// A catalog tech by id.
+    pub fn tech_by_id(&self, id: u64) -> Option<&Tech> {
+        self.tech_catalog.iter().find(|t| t.id == id)
+    }
+
+    /// Map a tech's global `(element, form)` inputs to this world's **local** item indices and
+    /// quantities, or `None` if the world lacks one of the input elements (so the tech can't
+    /// be built here). The bridge from the global tree to per-world goods (plans/035).
+    pub fn tech_local_inputs(&self, tech: &Tech) -> Option<Vec<(usize, f32)>> {
+        tech.inputs
+            .iter()
+            .map(|inp| {
+                let slot = self.chosen.iter().position(|c| c.id == inp.element)?;
+                Some((goods::item_index(slot, inp.form), inp.qty as f32))
+            })
+            .collect()
+    }
+
+    /// Whether this world has at least one discovered tech whose inputs all exist here — i.e.
+    /// building a workshop would be useful.
+    pub fn has_buildable_tech(&self) -> bool {
+        self.tech_catalog
+            .iter()
+            .any(|t| self.is_discovered(t.id) && self.tech_local_inputs(t).is_some())
     }
 }
 
@@ -359,6 +415,8 @@ pub fn generate(seed: u64, cols: i32, rows: i32, hex_size: f32) -> World {
         goods: world_goods,
         structures: Vec::new(),
         road_edges,
+        tech_catalog: Vec::new(),
+        discovered: Vec::new(),
         dist_table,
         tile_neighbors,
     };

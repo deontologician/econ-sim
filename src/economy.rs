@@ -86,9 +86,10 @@ const OPTION_MAX_TICKS: u32 = 48;
 /// destination without getting lost — while a much higher-valued neighbour can still pull
 /// it off-route. The route is suggested, not commanded.
 const ROUTE_OPTIMISM: f32 = 20.0;
-/// Bucks to build a structure (shop or refinery). Both cost the same.
+/// Bucks to build a structure (shop, refinery, or workshop). All cost the same.
 const SHOP_COST: f32 = 100.0;
 const REFINERY_COST: f32 = 100.0;
+const WORKSHOP_COST: f32 = 100.0;
 /// Extra bucks a noot keeps in reserve before a Build option is offered, so building
 /// can't bankrupt it out of food money.
 const SHOP_BUILD_BUFFER: f32 = 50.0;
@@ -292,6 +293,12 @@ pub struct EconStats {
     pub research_rate: f32,
     #[serde(default)]
     research_window: f32,
+    /// Cumulative count of techs discovered in this world (Phase 3).
+    #[serde(default)]
+    pub discovered_total: u64,
+    /// Cumulative tech items constructed at workshops.
+    #[serde(default)]
+    pub constructed_total: f64,
 }
 
 /// Fold the running tallies into per-tick rates once per `RATE_WINDOW_TICKS`.
@@ -622,7 +629,8 @@ pub fn gini(values: &[f32]) -> f32 {
 /// Maslow-tiered utility over the game's concepts: physiological (fed) ≫ safety
 /// (food buffer + savings) ≫ esteem (positional wealth). Higher tiers only count
 /// once lower ones are satisfied, so the policy learns the hierarchy. Reward = ΔU.
-pub fn maslow_utility(hunger: &Hunger, inv: &Inventory, wallet: &Wallet, goods: &goods::WorldGoods) -> f32 {
+pub fn maslow_utility(hunger: &Hunger, inv: &Inventory, wallet: &Wallet, world: &World) -> f32 {
+    let goods = &world.goods;
     let phys = hunger.utility() / N_STAPLES as f32; // ∈[0,1]
     let min_food = (0..N_ITEMS)
         .filter_map(|i| match goods.role_of(i) {
@@ -633,7 +641,8 @@ pub fn maslow_utility(hunger: &Hunger, inv: &Inventory, wallet: &Wallet, goods: 
     let min_food = if min_food.is_finite() { min_food } else { 0.0 };
     let safety = 0.5 * (min_food / FOOD_RESERVE).clamp(0.0, 1.0)
         + 0.5 * (wallet.bucks / SAFETY_BUCKS).clamp(0.0, 1.0);
-    let esteem = positional_utility(goods, inv); // Σ ln(1+held)
+    // Esteem from durable positional base goods plus held prestige (Esteem) tech items.
+    let esteem = positional_utility(goods, inv) + tech_esteem(world, inv); // Σ ln(1+held)
     // Tier gate: higher needs start to matter once a lower need is partly met (≈30%)
     // and count fully past ≈70%. A softer gate than a hard 0.5 step so a chronically
     // half-hungry noot still gets a learning gradient for stocking food and earning.
@@ -1056,7 +1065,7 @@ fn can_mine_here(world: &crate::world::World, claim: &Claim, pos: &TilePos, inv:
     claim.hex == Some(tile)
         && world.tiles[tile].deposit.is_some_and(|d| {
             let slot = world.deposits[d].element_slot;
-            inv.items[goods::item_index(slot, GoodForm::Raw)] < CARRY_CAP
+            inv.items[goods::item_index(slot, GoodForm::Raw)] < carry_cap(world, inv)
         })
 }
 
@@ -1112,6 +1121,17 @@ fn option_mask(
     mask[policy::A_BUILD_REFINERY] =
         owns_nothing && wallet.bucks >= REFINERY_COST + SHOP_BUILD_BUFFER;
     mask[policy::A_RESEARCH] = carried_units(world, inv) >= RESEARCH_MIN_HELD;
+    let any_workshop = world
+        .structures
+        .iter()
+        .any(|s| s.kind == crate::world::StructureKind::Workshop);
+    // Build a workshop only when there's a discovered, locally-buildable tech and none exists
+    // yet; construct only at an existing workshop while holding some tech's inputs.
+    mask[policy::A_BUILD_WORKSHOP] = owns_nothing
+        && wallet.bucks >= WORKSHOP_COST + SHOP_BUILD_BUFFER
+        && world.has_buildable_tech()
+        && !any_workshop;
+    mask[policy::A_CONSTRUCT] = any_workshop && can_construct_any(world, inv);
     mask[policy::A_EXPLORE] = true;
     mask
 }
@@ -1141,6 +1161,7 @@ fn option_target(
             })
             .or_else(|| best_market_tile(field, index, world, pos, inv, trader)),
         policy::A_REFINE => nearest_structure(world, pos, StructureKind::Refinery),
+        policy::A_CONSTRUCT => nearest_structure(world, pos, StructureKind::Workshop),
         _ => None,
     }
 }
@@ -1162,7 +1183,10 @@ fn option_done(
         policy::A_MINE => carried_units(world, inv) >= LOAD_THRESHOLD,
         policy::A_SELL => sellable_units(world, inv) < 1.0,
         policy::A_REFINE => !has_intermediate(world, inv),
-        policy::A_BUILD_SHOP | policy::A_BUILD_REFINERY => claim.hex.is_some(),
+        policy::A_BUILD_SHOP | policy::A_BUILD_REFINERY | policy::A_BUILD_WORKSHOP => {
+            claim.hex.is_some()
+        }
+        policy::A_CONSTRUCT => !can_construct_any(world, inv),
         // Research and Explore run in place until the step cap (handled by `plan_ticks == 0`
         // above), then the policy re-decides.
         policy::A_EXPLORE | policy::A_RESEARCH => false,
@@ -1344,7 +1368,7 @@ pub fn policy_step(
             || mem.died
             || option_done(mem.last_act, world, claim, inv, mem.plan_ticks);
         if finished {
-            let u_now = maslow_utility(hunger, inv, wallet, &world.goods);
+            let u_now = maslow_utility(hunger, inv, wallet, world);
 
             // Close out the previous option's transition (reward = the ΔU the option
             // accrued, or a death penalty). Committed options make the long
@@ -1438,14 +1462,25 @@ pub fn policy_step(
                 }
                 None => *action = Action::Idle,
             },
-            policy::A_BUILD_SHOP | policy::A_BUILD_REFINERY => {
+            policy::A_CONSTRUCT => match mem.plan_target {
+                // Construction happens only inside a workshop — go there, then construct.
+                Some((tc, tr)) if pos.col == tc && pos.row == tr => *action = Action::Construct,
+                Some((tc, tr)) => {
+                    let (nc, nr) = value_guided_step(world, &ac, &s_o, pos.col, pos.row, (tc, tr));
+                    pos.col = nc;
+                    pos.row = nr;
+                    *action = Action::Move;
+                }
+                None => *action = Action::Idle,
+            },
+            policy::A_BUILD_SHOP | policy::A_BUILD_REFINERY | policy::A_BUILD_WORKSHOP => {
                 let here = (pos.row * world.cols + pos.col) as usize;
                 // Buildable iff not a deposit hex (open ground, or build over a structure).
                 if world.tiles[here].deposit.is_none() {
-                    *action = if mem.last_act == policy::A_BUILD_SHOP {
-                        Action::BuildShop
-                    } else {
-                        Action::BuildRefinery
+                    *action = match mem.last_act {
+                        policy::A_BUILD_SHOP => Action::BuildShop,
+                        policy::A_BUILD_REFINERY => Action::BuildRefinery,
+                        _ => Action::BuildWorkshop,
                     };
                 } else {
                     // Standing on a deposit — hop to a neighbour to find open ground.
@@ -1502,28 +1537,39 @@ pub fn train_policy(
 /// for the sim order, shared by the GUI app's `SimSchedule` and the headless harness —
 /// neither defines the list itself. (Movement is a GUI-only sprite glide, not here.)
 pub fn add_sim_systems(schedule: &mut Schedule) {
+    // Split into two chained groups because a single `.chain()` tuple caps at 20 systems.
+    // The outer `.chain()` runs all of the first group before all of the second, and each
+    // inner `.chain()` orders within its group — so the whole list still runs in sequence.
     schedule.add_systems(
         (
-            simulate,
-            income,
-            income_controller,
-            hunger_tick,
-            hunger_pid,
-            age_noots,
-            update_price_field,
-            update_market_index,
-            policy_step,
-            accumulate_traffic,
-            build_structures,
-            claim_improvements,
-            extract,
-            refine,
-            research,
-            meet_and_trade,
-            consume,
-            death_and_respawn,
-            update_rates,
-            train_policy,
+            (
+                simulate,
+                income,
+                income_controller,
+                hunger_tick,
+                hunger_pid,
+                age_noots,
+                update_price_field,
+                update_market_index,
+                policy_step,
+                accumulate_traffic,
+                build_structures,
+            )
+                .chain(),
+            (
+                claim_improvements,
+                extract,
+                refine,
+                research,
+                discover,
+                construct,
+                meet_and_trade,
+                consume,
+                death_and_respawn,
+                update_rates,
+                train_policy,
+            )
+                .chain(),
         )
             .chain(),
     );
@@ -1613,11 +1659,14 @@ pub fn extract(
         };
         let slot = sim.0.deposits[deposit].element_slot;
         let raw = goods::item_index(slot, GoodForm::Raw);
-        if inv.items[raw] >= CARRY_CAP {
+        if inv.items[raw] >= carry_cap(&sim.0, &inv) {
             continue;
         }
-        // Learning by doing: a seasoned miner pulls more per second.
-        let rate = WORK_RATE * skill_factor(meta.experience);
+        // Learning by doing: a seasoned miner pulls more per second; a held ExtractBoost tech
+        // multiplies the rate further.
+        let rate = WORK_RATE
+            * skill_factor(meta.experience)
+            * tech_boost(&sim.0, &inv, crate::tech::TechEffect::ExtractBoost);
         let got = sim.0.extract_from(deposit, rate, TICK_DT) as f32;
         inv.items[raw] += got;
         meta.experience += got;
@@ -1644,6 +1693,7 @@ pub fn build_structures(
         let (kind, cost) = match action {
             Action::BuildShop => (crate::world::StructureKind::Shop, SHOP_COST),
             Action::BuildRefinery => (crate::world::StructureKind::Refinery, REFINERY_COST),
+            Action::BuildWorkshop => (crate::world::StructureKind::Workshop, WORKSHOP_COST),
             _ => continue,
         };
         if claim.hex.is_some() || wallet.bucks < cost {
@@ -1706,7 +1756,9 @@ pub fn refine(sim: Res<Sim>, mut q: Query<(&Action, &TilePos, &mut Inventory, &m
         if sim.0.structure_kind(tile) != Some(crate::world::StructureKind::Refinery) {
             continue;
         }
-        let rate = REFINE_RATE * skill_factor(meta.experience);
+        let rate = REFINE_RATE
+            * skill_factor(meta.experience)
+            * tech_boost(&sim.0, &inv, crate::tech::TechEffect::RefineBoost);
         for slot in 0..4 {
             let raw = goods::item_index(slot, GoodForm::Raw);
             if sim.0.goods.role_of(raw) != ItemRole::Intermediate || inv.items[raw] <= 0.0 {
@@ -1748,6 +1800,75 @@ pub fn research(
     }
 }
 
+/// Discovery: a noot researching (`Action::Research`) while holding the full input set of a
+/// catalog tech this world hasn't discovered yet unlocks it world-wide. After discovery, noots
+/// can build a workshop and construct the tech. Mutates the world's `discovered` set.
+pub fn discover(
+    mut sim: ResMut<Sim>,
+    mut stats: ResMut<EconStats>,
+    q: Query<(&Action, &Inventory)>,
+) {
+    let mut newly: Vec<u64> = Vec::new();
+    {
+        let world = &sim.0;
+        for (action, inv) in &q {
+            if *action != Action::Research {
+                continue;
+            }
+            for t in &world.tech_catalog {
+                if world.is_discovered(t.id) || newly.contains(&t.id) {
+                    continue;
+                }
+                if holds_inputs(world, inv, t) {
+                    newly.push(t.id);
+                }
+            }
+        }
+    }
+    for id in newly {
+        if sim.0.discover(id) {
+            stats.discovered_total += 1;
+        }
+    }
+}
+
+/// Construct a discovered tech for a noot whose action is `Construct` and that stands inside a
+/// workshop: consume the first discovered tech's input goods it can afford, mint one tech item.
+pub fn construct(
+    sim: Res<Sim>,
+    mut stats: ResMut<EconStats>,
+    mut q: Query<(&Action, &TilePos, &mut Inventory, &mut NootMeta)>,
+) {
+    let world = &sim.0;
+    for (action, pos, mut inv, mut meta) in &mut q {
+        if *action != Action::Construct {
+            continue;
+        }
+        let tile = (pos.row * world.cols + pos.col) as usize;
+        if world.structure_kind(tile) != Some(crate::world::StructureKind::Workshop) {
+            continue;
+        }
+        let pick = world
+            .tech_catalog
+            .iter()
+            .filter(|t| world.is_discovered(t.id))
+            .find_map(|t| {
+                world
+                    .tech_local_inputs(t)
+                    .filter(|reqs| reqs.iter().all(|&(i, q)| inv.items[i] >= q))
+                    .map(|reqs| (t.id, reqs))
+            });
+        if let Some((id, reqs)) = pick {
+            for (i, q) in reqs {
+                inv.items[i] -= q;
+            }
+            inv.add_tech(id, 1.0);
+            meta.experience += 1.0;
+            stats.constructed_total += 1.0;
+        }
+    }
+}
+
 pub fn consume(
     sim: Res<Sim>,
     mut stats: ResMut<EconStats>,
@@ -1773,6 +1894,46 @@ pub fn consume(
                 }
             }
         }
+        // Consumable "nourishing" tech items act as bonus food: each unit clears `magnitude`
+        // appetite across the staples. Durable techs (esteem/boosts) are never eaten.
+        let nourish: Vec<(u64, f32)> = inv
+            .tech
+            .iter()
+            .filter(|(_, &q)| q > 0.0)
+            .filter_map(|(id, _)| {
+                sim.0
+                    .tech_by_id(*id)
+                    .filter(|t| t.consumable && t.effect == crate::tech::TechEffect::Nourish)
+                    .map(|t| (*id, t.magnitude))
+            })
+            .collect();
+        for (id, mag) in nourish {
+            let appetite: f32 = hunger.staple.iter().sum();
+            if appetite <= 0.0 {
+                break;
+            }
+            if mag <= 0.0 {
+                continue;
+            }
+            let units = (appetite / mag).min(inv.tech_qty(id));
+            if units <= 0.0 {
+                continue;
+            }
+            let mut budget = units * mag;
+            for s in hunger.staple.iter_mut() {
+                let d = (*s).min(budget);
+                *s -= d;
+                budget -= d;
+                if budget <= 0.0 {
+                    break;
+                }
+            }
+            if let Some(q) = inv.tech.get_mut(&id) {
+                *q -= units;
+            }
+            eaten += units;
+            utility_gained += (units * mag) / STAPLE_SATIATION;
+        }
     }
     stats.consumed_window += eaten;
     stats.consumed_total += eaten as f64;
@@ -1787,6 +1948,57 @@ pub fn positional_utility(goods: &goods::WorldGoods, inv: &Inventory) -> f32 {
         .filter(|&i| matches!(goods.role_of(i), ItemRole::Positional(_)))
         .map(|i| (1.0 + inv.items[i]).ln())
         .sum()
+}
+
+// --- Tech-item effects (plans/035, Phase 3) ---------------------------------
+
+/// The catalog techs a noot currently holds (qty > 0), paired with the held quantity. Only
+/// techs the world knows (in its catalog) count.
+fn held_techs<'a>(
+    world: &'a World,
+    inv: &'a Inventory,
+) -> impl Iterator<Item = (&'a crate::tech::Tech, f32)> {
+    inv.tech
+        .iter()
+        .filter(|(_, &q)| q > 0.0)
+        .filter_map(move |(id, &q)| world.tech_by_id(*id).map(|t| (t, q)))
+}
+
+/// Greatest magnitude among held techs with `effect`, or `1.0` if none — a multiplicative
+/// boost that applies simply by holding the tech (durable effect, takes the best one held).
+fn tech_boost(world: &World, inv: &Inventory, effect: crate::tech::TechEffect) -> f32 {
+    held_techs(world, inv)
+        .filter(|(t, _)| t.effect == effect)
+        .map(|(t, _)| t.magnitude)
+        .fold(1.0, f32::max)
+}
+
+/// Diminishing welfare from held durable prestige (`Esteem`) tech items, scaled by magnitude.
+fn tech_esteem(world: &World, inv: &Inventory) -> f32 {
+    held_techs(world, inv)
+        .filter(|(t, _)| t.effect == crate::tech::TechEffect::Esteem)
+        .map(|(t, q)| (1.0 + q).ln() * t.magnitude)
+        .sum()
+}
+
+/// A noot's effective carry capacity, raised by any held `CarryBoost` tech.
+fn carry_cap(world: &World, inv: &Inventory) -> f32 {
+    CARRY_CAP * tech_boost(world, inv, crate::tech::TechEffect::CarryBoost)
+}
+
+/// Whether a discovered, buildable tech's full input set is held (the construct precondition).
+fn holds_inputs(world: &World, inv: &Inventory, tech: &crate::tech::Tech) -> bool {
+    world
+        .tech_local_inputs(tech)
+        .is_some_and(|reqs| reqs.iter().all(|&(i, q)| inv.items[i] >= q))
+}
+
+/// Whether the noot can construct *some* discovered tech right now (holds its inputs).
+fn can_construct_any(world: &World, inv: &Inventory) -> bool {
+    world
+        .tech_catalog
+        .iter()
+        .any(|t| world.is_discovered(t.id) && holds_inputs(world, inv, t))
 }
 
 struct Snap {

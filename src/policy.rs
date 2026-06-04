@@ -44,7 +44,11 @@ pub const A_BUILD_REFINERY: usize = 5;
 /// Trailing index by design: the actor head `wa` is `[act*H + j]` row-major, so a save
 /// migration grows it by appending one zero block (see `save::migrate_step` v2→v3).
 pub const A_RESEARCH: usize = 6;
-pub const N_ACT: usize = 7;
+/// Build a workshop (where discovered techs are constructed) — claims the hex like a refinery.
+pub const A_BUILD_WORKSHOP: usize = 7;
+/// Construct a discovered tech at a workshop, turning its input goods into the tech item.
+pub const A_CONSTRUCT: usize = 8;
+pub const N_ACT: usize = 9;
 /// Hex move directions — the width of the engineered *heading* features below and of the
 /// neighbour set the value-guided executor scores each step, even though a single
 /// direction is not itself a policy action.
