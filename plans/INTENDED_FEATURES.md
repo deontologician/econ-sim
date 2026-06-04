@@ -440,11 +440,16 @@ design. Newest first within each section.
   out left→right in tier columns; each discovered tech is a card with its effect and full
   recipe (`needs: <base goods + prerequisite tech names>`). The panel rebuilds when the
   discovered set changes; taps over it / the open sidebar don't fall through to the map.
-- **STUB**: tier columns convey progression left→right but there are **no drawn connector
-  lines** between a tech and its prerequisite techs (recipes are listed textually per card).
-  The workshop still reuses the refinery emblem. Only **discovered** techs show (undiscovered
-  catalog techs aren't greyed-in). Compile-checked on the wasm gate only — the GUI can't run in
-  the sandbox, so the actual layout/legibility needs an on-device look after deploy.
-- **INTENDED**: SVG/line connectors between prereqs (true Civ tree); show undiscovered techs
-  dimmed with lock state; a workshop emblem; per-tier scroll for many techs.
+- **NOW (connectors)**: a behind-the-columns overlay (`TechEdgeLayer`) draws a thin
+  prereq→dependent **connector line** for every tree edge whose ends are both discovered.
+  Each card carries a `TechCard(id)` tag; `position_tech_edges` re-derives the line geometry
+  every frame from the live card rects (right edge of the prereq → left edge of the dependent),
+  sizing/rotating a 2px bar via `UiTransform` so it pivots onto the a→b vector. Rebuilt set when
+  the discovered set changes; geometry tracks layout each frame, so it's resize-robust.
+- **STUB**: the workshop still reuses the refinery emblem. Only **discovered** techs show
+  (undiscovered catalog techs aren't greyed-in). Connector geometry is compile-checked on the
+  wasm gate only — the GUI can't run in the sandbox, so the actual line placement/legibility
+  needs an on-device look after deploy.
+- **INTENDED**: show undiscovered techs dimmed with lock state; a workshop emblem; per-tier
+  scroll for many techs.
 - **STATUS**: partial

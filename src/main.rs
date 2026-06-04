@@ -422,6 +422,21 @@ struct TechButton;
 struct TechPanel;
 #[derive(Component)]
 struct TechPanelBody;
+/// Full-panel absolute overlay (drawn behind the tier columns) that holds the connector
+/// lines between a tech and its prerequisite techs — the "tree" edges.
+#[derive(Component)]
+struct TechEdgeLayer;
+/// Tags a tech card node with its tech id so `position_tech_edges` can find the card's
+/// screen rect and anchor connector lines to it.
+#[derive(Component)]
+struct TechCard(u64);
+/// One connector line: drawn from prerequisite tech `from` (right edge) to dependent tech
+/// `to` (left edge). Geometry is re-derived every frame from the live card positions.
+#[derive(Component)]
+struct TechEdge {
+    from: u64,
+    to: u64,
+}
 
 /// The embedded UI font handle, kept as a resource so runtime-rebuilt UI (the tech panel) can
 /// spawn text without re-loading it.
@@ -593,7 +608,7 @@ fn main() {
                     sidebar_controls,
                     tech_controls,
                     update_tech_panel,
-                    hide_loading_screen,
+                    (position_tech_edges, hide_loading_screen),
                 ),
             )
                 .after(SimDriver),
@@ -1483,6 +1498,20 @@ fn spawn_tech_panel(commands: &mut Commands, font: &Handle<Font>) {
             TechPanel,
         ))
         .with_children(|p| {
+            // Connector-line layer: absolute, covers the whole panel, spawned first so it
+            // sits *behind* the header and tier columns. Lines run through the column gaps,
+            // so the cards stay fully legible on top.
+            p.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(0.0),
+                    top: Val::Px(0.0),
+                    right: Val::Px(0.0),
+                    bottom: Val::Px(0.0),
+                    ..default()
+                },
+                TechEdgeLayer,
+            ));
             p.spawn((
                 Text::new("Tech tree — discovered technologies (tap Tech to close)"),
                 TextFont {
@@ -1548,12 +1577,16 @@ fn tech_controls(
 
 /// While the tech panel is open, (re)build its tier columns from the world's discovered techs.
 /// Rebuilds only when the catalog/discovered set changes (tracked in a `Local` signature).
+// Wide by nature: a Bevy system threading several disjoint queries/resources, not refactorable
+// into fewer args without an artificial SystemParam bundle.
+#[allow(clippy::too_many_arguments)]
 fn update_tech_panel(
     mut commands: Commands,
     overlays: Res<Overlays>,
     sim: Res<Sim>,
     ui_font: Res<UiFont>,
     body: Query<Entity, With<TechPanelBody>>,
+    edge_layer: Query<Entity, With<TechEdgeLayer>>,
     children: Query<&Children>,
     mut last_sig: Local<usize>,
 ) {
@@ -1641,6 +1674,7 @@ fn update_tech_panel(
                             ..default()
                         },
                         BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.06)),
+                        TechCard(t.id),
                     ))
                     .with_children(|card| {
                         card.spawn((
@@ -1663,6 +1697,94 @@ fn update_tech_panel(
             });
         }
     });
+
+    // Rebuild the connector-line pool: one TechEdge per (prereq -> dependent) edge where both
+    // ends are discovered (and so have a card). Geometry is filled in by `position_tech_edges`
+    // from the live card rects; here we only spawn the right *set* of lines for this catalog.
+    if let Ok(layer_e) = edge_layer.single() {
+        if let Ok(ch) = children.get(layer_e) {
+            for c in ch.iter() {
+                commands.entity(c).despawn();
+            }
+        }
+        let shown: std::collections::HashSet<u64> = discovered.iter().map(|t| t.id).collect();
+        commands.entity(layer_e).with_children(|layer| {
+            for t in &discovered {
+                for pr in &t.tech_inputs {
+                    if shown.contains(&pr.tech) {
+                        layer.spawn((
+                            Node {
+                                position_type: PositionType::Absolute,
+                                height: Val::Px(2.0),
+                                width: Val::Px(0.0),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.60, 0.84, 0.75, 0.55)),
+                            UiTransform::IDENTITY,
+                            TechEdge { from: pr.tech, to: t.id },
+                        ));
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Every frame the tech panel is open, re-derive each connector line's geometry from the live
+/// card rects: anchor it from the prerequisite card's right edge to the dependent card's left
+/// edge, sizing/rotating a thin bar to span the gap. Runs in `Update` off the previous frame's
+/// laid-out positions (UI layout writes `UiGlobalTransform` in `PostUpdate`); the cards are
+/// static while the modal panel is open, so the one-frame lag is invisible.
+fn position_tech_edges(
+    overlays: Res<Overlays>,
+    cards: Query<(&TechCard, &UiGlobalTransform, &ComputedNode)>,
+    layer: Query<(&UiGlobalTransform, &ComputedNode), With<TechEdgeLayer>>,
+    mut edges: Query<(&TechEdge, &mut Node, &mut UiTransform)>,
+) {
+    if !overlays.tech {
+        return;
+    }
+    let Ok((layer_gt, layer_cn)) = layer.single() else {
+        return;
+    };
+    // Layer top-left in physical px; everything below is computed relative to it, then scaled
+    // to logical px (Val::Px is logical) via the layout's inverse scale factor.
+    let inv = layer_cn.inverse_scale_factor;
+    let layer_tl = layer_gt.translation - 0.5 * layer_cn.size;
+
+    // Map each visible tech id to its physical rect (center + half-extent), skipping any card
+    // not yet laid out (zero size on its first frame).
+    let mut rects: std::collections::HashMap<u64, (Vec2, Vec2)> = std::collections::HashMap::new();
+    for (card, gt, cn) in &cards {
+        if cn.size.x > 0.0 {
+            rects.insert(card.0, (gt.translation, 0.5 * cn.size));
+        }
+    }
+
+    for (edge, mut node, mut tf) in &mut edges {
+        let (Some(&(from_c, from_h)), Some(&(to_c, to_h))) =
+            (rects.get(&edge.from), rects.get(&edge.to))
+        else {
+            node.width = Val::Px(0.0);
+            continue;
+        };
+        // Right edge of the prerequisite to the left edge of the dependent (the tree flows
+        // left→right by tier); local to the layer, then logical.
+        let a = (Vec2::new(from_c.x + from_h.x, from_c.y) - layer_tl) * inv;
+        let b = (Vec2::new(to_c.x - to_h.x, to_c.y) - layer_tl) * inv;
+        let d = b - a;
+        let len = d.length();
+        if len < 1.0 {
+            node.width = Val::Px(0.0);
+            continue;
+        }
+        let mid = 0.5 * (a + b);
+        node.width = Val::Px(len);
+        node.left = Val::Px(mid.x - len * 0.5);
+        node.top = Val::Px(mid.y - 1.0);
+        // Rotation is applied about the node's center, so the centered bar pivots onto a→b.
+        tf.rotation = Rot2::radians(d.y.atan2(d.x));
+    }
 }
 
 fn spawn_graphs_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) {
