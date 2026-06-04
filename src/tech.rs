@@ -116,12 +116,23 @@ impl TechInput {
     }
 }
 
+/// A reference to a **prerequisite tech**: to construct the new tech you must hold `qty` of the
+/// tech with this `tech` id. This is what turns the flat list into a real, multi-level tree —
+/// a tech can be built only after its prerequisite techs have been constructed.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct TechRef {
+    pub tech: u64,
+    pub qty: u8,
+}
+
 /// The randomized core of a new tech, before it's assigned an id, a name, and a timestamp.
 /// Produced purely from demand + an RNG so it's unit-testable; the server turns it into a
 /// [`Tech`].
 #[derive(Clone, PartialEq, Debug)]
 pub struct TechDraft {
     pub inputs: Vec<TechInput>,
+    /// Prerequisite techs (the tree edges).
+    pub tech_inputs: Vec<TechRef>,
     pub effect: TechEffect,
     pub magnitude: f32,
     pub consumable: bool,
@@ -136,6 +147,10 @@ pub struct Tech {
     pub id: u64,
     pub name: String,
     pub inputs: Vec<TechInput>,
+    /// Prerequisite techs that must be constructed first (the tree edges). `#[serde(default)]`
+    /// so pre-tree techs (base-goods-only recipes) load with no prerequisites.
+    #[serde(default)]
+    pub tech_inputs: Vec<TechRef>,
     pub effect: TechEffect,
     pub magnitude: f32,
     pub consumable: bool,
@@ -152,6 +167,7 @@ impl Tech {
             id,
             name,
             inputs: draft.inputs,
+            tech_inputs: draft.tech_inputs,
             effect: draft.effect,
             magnitude: draft.magnitude,
             consumable: draft.consumable,
@@ -161,7 +177,7 @@ impl Tech {
         }
     }
 
-    /// `"Iron + Plank"` style recipe rendering.
+    /// `"Iron + Plank"` style recipe rendering — base goods only.
     pub fn inputs_label(&self) -> String {
         self.inputs
             .iter()
@@ -175,6 +191,35 @@ impl Tech {
             .collect::<Vec<_>>()
             .join(" + ")
     }
+
+    /// Full recipe including prerequisite tech names (resolved against `all`), e.g.
+    /// `"Iron + 2×Lantern Oil"`.
+    pub fn recipe_label(&self, all: &[Tech]) -> String {
+        let mut parts: Vec<String> = self
+            .inputs
+            .iter()
+            .map(|i| {
+                if i.qty > 1 {
+                    format!("{}×{}", i.qty, i.good_name())
+                } else {
+                    i.good_name().to_string()
+                }
+            })
+            .collect();
+        for r in &self.tech_inputs {
+            let name = all
+                .iter()
+                .find(|t| t.id == r.tech)
+                .map(|t| t.name.as_str())
+                .unwrap_or("?");
+            parts.push(if r.qty > 1 {
+                format!("{}×{}", r.qty, name)
+            } else {
+                name.to_string()
+            });
+        }
+        parts.join(" + ")
+    }
 }
 
 /// The tree the server serves and the client fetches.
@@ -185,8 +230,12 @@ pub struct TechTree {
 
 // --- Growth (pure, deterministic given the RNG) -----------------------------
 
-/// Up to this many inputs per tech recipe.
+/// Up to this many base-good inputs per tech recipe.
 const MAX_INPUTS: usize = 3;
+/// Once techs exist, the chance a new tech also builds on prerequisite techs (the tree edges).
+const TECH_PREREQ_CHANCE: f32 = 0.55;
+/// Up to this many prerequisite techs per recipe.
+const MAX_TECH_PREREQS: usize = 2;
 /// Demand at which the per-attempt growth chance reaches half of [`MAX_GROW_CHANCE`]
 /// (logistic in total demand). Research demand accrues fast (~thousands per world over a few
 /// thousand ticks), so this is set high enough that a lone, briefly-running world doesn't
@@ -234,18 +283,40 @@ pub fn weighted_pick(demand: &[f64], exclude: &[usize], rng: &mut Rng) -> Option
         .find(|i| !exclude.contains(i) && demand[*i] > 0.0)
 }
 
-/// Draft a new tech from the aggregate demand histogram: 1–[`MAX_INPUTS`] distinct inputs
-/// sampled ∝ demand, then randomized attributes. `None` when there's no demand to draw from.
-pub fn draft_tech(demand: &[f64], rng: &mut Rng) -> Option<TechDraft> {
-    let n_inputs = 1 + rng.below(MAX_INPUTS);
+/// Draft a new tech from the aggregate demand histogram and the existing tree: base-good
+/// inputs sampled ∝ demand, plus (once techs exist) a chance of prerequisite techs — which is
+/// what gives the tree depth. Tier = one above its deepest prerequisite. `None` when there's
+/// nothing to draw from.
+pub fn draft_tech(demand: &[f64], existing: &[Tech], rng: &mut Rng) -> Option<TechDraft> {
+    // Prerequisite techs first: a new tech may build on up to MAX_TECH_PREREQS existing ones.
+    let mut tech_inputs: Vec<TechRef> = Vec::new();
+    if !existing.is_empty() && rng.chance(TECH_PREREQ_CHANCE) {
+        let n = 1 + rng.below(MAX_TECH_PREREQS);
+        let mut used: Vec<usize> = Vec::new();
+        for _ in 0..n {
+            let candidates: Vec<usize> = (0..existing.len()).filter(|i| !used.contains(i)).collect();
+            if candidates.is_empty() {
+                break;
+            }
+            let idx = candidates[rng.below(candidates.len())];
+            used.push(idx);
+            tech_inputs.push(TechRef {
+                tech: existing[idx].id,
+                qty: 1 + rng.below(2) as u8,
+            });
+        }
+    }
+    // Base goods: at least one if there are no tech prerequisites, else zero or more.
+    let min_base = usize::from(tech_inputs.is_empty());
+    let n_base = min_base + rng.below(MAX_INPUTS + 1 - min_base);
     let mut chosen: Vec<usize> = Vec::new();
-    for _ in 0..n_inputs {
+    for _ in 0..n_base {
         match weighted_pick(demand, &chosen, rng) {
             Some(gi) => chosen.push(gi),
             None => break,
         }
     }
-    if chosen.is_empty() {
+    if chosen.is_empty() && tech_inputs.is_empty() {
         return None;
     }
     let inputs: Vec<TechInput> = chosen
@@ -260,7 +331,14 @@ pub fn draft_tech(demand: &[f64], rng: &mut Rng) -> Option<TechDraft> {
         })
         .collect();
     let effect = EFFECTS[rng.below(EFFECTS.len())];
-    let tier = 1 + inputs.iter().filter(|i| i.form == GoodForm::Refined).count() as u8;
+    let base_tier = 1 + inputs.iter().filter(|i| i.form == GoodForm::Refined).count() as u16;
+    let prereq_tier = tech_inputs
+        .iter()
+        .filter_map(|r| existing.iter().find(|t| t.id == r.tech))
+        .map(|t| t.tier as u16 + 1)
+        .max()
+        .unwrap_or(0);
+    let tier = base_tier.max(prereq_tier).min(u8::MAX as u16) as u8;
     Some(TechDraft {
         magnitude: effect.random_magnitude(rng),
         effect,
@@ -272,32 +350,39 @@ pub fn draft_tech(demand: &[f64], rng: &mut Rng) -> Option<TechDraft> {
         },
         tier,
         inputs,
+        tech_inputs,
     })
+}
+
+/// The recipe ingredients of a draft as display names (base goods + prerequisite tech names,
+/// resolved against `existing`).
+fn draft_ingredients(draft: &TechDraft, existing: &[Tech]) -> Vec<String> {
+    let mut parts: Vec<String> = draft.inputs.iter().map(|i| i.good_name().to_string()).collect();
+    for r in &draft.tech_inputs {
+        if let Some(t) = existing.iter().find(|t| t.id == r.tech) {
+            parts.push(t.name.clone());
+        }
+    }
+    parts
 }
 
 // --- Naming -----------------------------------------------------------------
 
-/// Deterministic fallback name when the LLM is unavailable: the primary input's good name +
-/// an effect-evoking suffix, e.g. `Iron Drill`, `Plank Ration`.
-pub fn procedural_name(draft: &TechDraft) -> String {
-    let primary = draft
-        .inputs
-        .first()
-        .map(|i| i.good_name())
-        .unwrap_or("Curio");
+/// Deterministic fallback name when the LLM is unavailable: the primary ingredient's name +
+/// an effect-evoking suffix, e.g. `Iron Drill`, `Lantern Oil Forge`.
+pub fn procedural_name(draft: &TechDraft, existing: &[Tech]) -> String {
+    let primary = draft_ingredients(draft, existing)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "Curio".to_string());
     format!("{} {}", primary, draft.effect.suffix())
 }
 
 /// The user-prompt half of the LLM naming request (the server adds the system instruction and
 /// the HTTP plumbing). Describes the recipe and rolled attributes and asks for one short,
 /// plausible item name — the example the user gave: `durable stick + iron → shovel`.
-pub fn naming_prompt(draft: &TechDraft) -> String {
-    let ingredients = draft
-        .inputs
-        .iter()
-        .map(|i| i.good_name())
-        .collect::<Vec<_>>()
-        .join(" + ");
+pub fn naming_prompt(draft: &TechDraft, existing: &[Tech]) -> String {
+    let ingredients = draft_ingredients(draft, existing).join(" + ");
     let durability = if draft.consumable {
         "consumable"
     } else {
@@ -374,19 +459,52 @@ mod tests {
         demand[3] = 50.0;
         let mut rng = Rng::new(42);
         for _ in 0..200 {
-            let d = draft_tech(&demand, &mut rng).expect("demand present");
+            // No existing techs ⇒ base-goods-only recipe (no prerequisites).
+            let d = draft_tech(&demand, &[], &mut rng).expect("demand present");
             assert!(!d.inputs.is_empty() && d.inputs.len() <= MAX_INPUTS);
+            assert!(d.tech_inputs.is_empty());
             for i in &d.inputs {
                 let gi = global_index(i.element, i.form);
                 assert!(gi == 2 || gi == 3, "input from zero-demand slot: {gi}");
                 assert!(i.qty >= 1 && i.qty <= 3);
             }
             assert!(d.magnitude > 0.0);
-            assert!(!procedural_name(&d).is_empty());
-            assert!(!naming_prompt(&d).is_empty());
+            assert!(!procedural_name(&d, &[]).is_empty());
+            assert!(!naming_prompt(&d, &[]).is_empty());
         }
-        // No demand ⇒ no draft.
-        assert!(draft_tech(&vec![0.0; N_GLOBAL_ITEMS], &mut rng).is_none());
+        // No demand and no techs ⇒ no draft.
+        assert!(draft_tech(&vec![0.0; N_GLOBAL_ITEMS], &[], &mut rng).is_none());
+    }
+
+    #[test]
+    fn draft_tech_can_depend_on_existing_techs() {
+        let mut demand = vec![0.0; N_GLOBAL_ITEMS];
+        demand[2] = 100.0;
+        // A tier-2 existing tech: a new tech building on it should be tier ≥ 3.
+        let base = Tech {
+            id: 7,
+            name: "Lantern Oil".into(),
+            inputs: vec![TechInput { element: ElementId(1), form: GoodForm::Raw, qty: 1 }],
+            tech_inputs: vec![],
+            effect: TechEffect::Esteem,
+            magnitude: 2.0,
+            consumable: false,
+            category: GoodCategory::Positional,
+            tier: 2,
+            created_unix: 0,
+        };
+        let mut rng = Rng::new(99);
+        let mut saw_prereq = false;
+        for _ in 0..400 {
+            let d = draft_tech(&demand, std::slice::from_ref(&base), &mut rng).unwrap();
+            if let Some(r) = d.tech_inputs.first() {
+                saw_prereq = true;
+                assert_eq!(r.tech, 7);
+                assert!(d.tier >= 3, "tier {} should exceed prereq tier 2", d.tier);
+                assert!(naming_prompt(&d, std::slice::from_ref(&base)).contains("Lantern Oil"));
+            }
+        }
+        assert!(saw_prereq, "never drafted a tech that depends on an existing one");
     }
 
     #[test]

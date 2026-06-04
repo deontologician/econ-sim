@@ -152,31 +152,32 @@ async fn grow_loop(app: App) {
         ticker.tick().await;
         let now = now_unix();
         // Decide and reserve an id under the locks; drop them before the (slow) naming call.
-        let prepared: Option<(TechDraft, u64)> = {
+        let prepared: Option<(TechDraft, u64, Vec<Tech>)> = {
             let mut shared = app.tech.lock().unwrap();
             let demand = global_demand(&shared);
             let total: f64 = demand.iter().sum();
+            let existing = shared.techs.clone();
             let mut rng = app.rng.lock().unwrap();
             if rng.chance(tech::growth_chance(total)) {
-                tech::draft_tech(&demand, &mut rng).map(|d| {
+                tech::draft_tech(&demand, &existing, &mut rng).map(|d| {
                     let id = shared.next_id;
                     shared.next_id += 1;
                     shared.last_grow_unix = now;
-                    (d, id)
+                    (d, id, existing)
                 })
             } else {
                 None
             }
         };
-        let Some((draft, id)) = prepared else {
+        let Some((draft, id, existing)) = prepared else {
             continue;
         };
-        let name = name_tech(&draft).await;
+        let name = name_tech(&draft, &existing).await;
         let grown = Tech::from_draft(draft, id, name, now);
         println!(
             "grew tech #{id} '{}'  [{}]  {} ×{:.2}  ({}, tier {})",
             grown.name,
-            grown.inputs_label(),
+            grown.recipe_label(&existing),
             grown.effect.label(),
             grown.magnitude,
             if grown.consumable { "consumable" } else { "durable" },
@@ -195,14 +196,14 @@ async fn grow_loop(app: App) {
 
 /// Name a drafted tech via OpenRouter; fall back to a procedural name when the key is unset
 /// or the call fails. The blocking HTTP call runs off the async runtime.
-async fn name_tech(draft: &TechDraft) -> String {
+async fn name_tech(draft: &TechDraft, existing: &[Tech]) -> String {
     let key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
-    let fallback = tech::procedural_name(draft);
+    let fallback = tech::procedural_name(draft, existing);
     if key.trim().is_empty() {
         return fallback;
     }
     let model = std::env::var("OPENROUTER_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
-    let prompt = tech::naming_prompt(draft);
+    let prompt = tech::naming_prompt(draft, existing);
     match tokio::task::spawn_blocking(move || openrouter_name(&key, &model, &prompt)).await {
         Ok(Some(name)) => name,
         _ => fallback,
@@ -378,7 +379,7 @@ fn render_techs(techs: &[Tech]) -> String {
             "<tr><td class=name>{}</td><td class=tech>{}</td><td>{} ×{:.2}</td>\
              <td>{}</td><td>{}</td><td class=num>{}</td></tr>",
             esc(&t.name),
-            esc(&t.inputs_label()),
+            esc(&t.recipe_label(techs)),
             t.effect.label(),
             t.magnitude,
             if t.consumable { "consumable" } else { "durable" },

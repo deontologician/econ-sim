@@ -1848,19 +1848,27 @@ pub fn construct(
         if world.structure_kind(tile) != Some(crate::world::StructureKind::Workshop) {
             continue;
         }
+        // Prefer the most advanced (highest-tier) buildable tech, breaking ties toward the
+        // lowest id — so an early prerequisite tech still gets built (bootstrapping the deeper
+        // techs that depend on it) rather than always re-making the same tier-1 one.
         let pick = world
             .tech_catalog
             .iter()
-            .filter(|t| world.is_discovered(t.id))
-            .find_map(|t| {
-                world
-                    .tech_local_inputs(t)
-                    .filter(|reqs| reqs.iter().all(|&(i, q)| inv.items[i] >= q))
-                    .map(|reqs| (t.id, reqs))
-            });
-        if let Some((id, reqs)) = pick {
-            for (i, q) in reqs {
-                inv.items[i] -= q;
+            .filter(|t| world.is_discovered(t.id) && holds_inputs(world, &inv, t))
+            .max_by_key(|t| (t.tier, std::cmp::Reverse(t.id)))
+            .map(|t| t.id);
+        if let Some(id) = pick {
+            let tech = world.tech_by_id(id).expect("picked tech is in catalog");
+            // Consume base goods and prerequisite tech items, then mint one output tech item.
+            if let Some(reqs) = world.tech_local_inputs(tech) {
+                for (i, q) in reqs {
+                    inv.items[i] -= q;
+                }
+            }
+            for r in &tech.tech_inputs {
+                if let Some(v) = inv.tech.get_mut(&r.tech) {
+                    *v -= r.qty as f32;
+                }
             }
             inv.add_tech(id, 1.0);
             meta.experience += 1.0;
@@ -1986,11 +1994,17 @@ fn carry_cap(world: &World, inv: &Inventory) -> f32 {
     CARRY_CAP * tech_boost(world, inv, crate::tech::TechEffect::CarryBoost)
 }
 
-/// Whether a discovered, buildable tech's full input set is held (the construct precondition).
+/// Whether a discovered, buildable tech's full input set is held — both its base goods (mapped
+/// to this world's items) and its prerequisite tech items (the tree edges).
 fn holds_inputs(world: &World, inv: &Inventory, tech: &crate::tech::Tech) -> bool {
-    world
+    let base_ok = world
         .tech_local_inputs(tech)
-        .is_some_and(|reqs| reqs.iter().all(|&(i, q)| inv.items[i] >= q))
+        .is_some_and(|reqs| reqs.iter().all(|&(i, q)| inv.items[i] >= q));
+    let tech_ok = tech
+        .tech_inputs
+        .iter()
+        .all(|r| inv.tech_qty(r.tech) >= r.qty as f32);
+    base_ok && tech_ok
 }
 
 /// Whether the noot can construct *some* discovered tech right now (holds its inputs).

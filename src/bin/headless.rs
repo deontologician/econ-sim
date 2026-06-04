@@ -118,28 +118,44 @@ fn parse_cli() -> Cli {
     }
 }
 
-/// Build a synthetic catalog (one tech per effect) whose single input is the raw form of the
-/// world's first element — guaranteed buildable in this world. Lets the headless harness drive
-/// the Phase-3 discover/construct/effect path without a live server.
+/// Build a synthetic catalog whose inputs are the raw form of the world's first element —
+/// guaranteed buildable here. One tech per effect (tier 1) plus one **tier-2 tech that
+/// requires the tier-1 Nourish tech as a prerequisite**, so the harness exercises the full
+/// tech-depends-on-tech construct path without a live server.
 fn synth_catalog(world: &econ_sim::world::World) -> Vec<econ_sim::tech::Tech> {
     use econ_sim::goods::{GoodCategory, GoodForm};
-    use econ_sim::tech::{Tech, TechInput, EFFECTS};
+    use econ_sim::tech::{Tech, TechEffect, TechInput, TechRef, EFFECTS};
     let element = world.chosen[0].id;
-    EFFECTS
+    let mut techs: Vec<Tech> = EFFECTS
         .iter()
         .enumerate()
         .map(|(i, &effect)| Tech {
             id: i as u64,
             name: format!("Test {}", effect.label()),
             inputs: vec![TechInput { element, form: GoodForm::Raw, qty: 1 }],
+            tech_inputs: vec![],
             effect,
             magnitude: 1.5,
-            consumable: matches!(effect, econ_sim::tech::TechEffect::Nourish),
+            consumable: matches!(effect, TechEffect::Nourish),
             category: GoodCategory::Positional,
             tier: 1,
             created_unix: 0,
         })
-        .collect()
+        .collect();
+    // A tier-2 tech: needs one base good plus one of tech #0 (the tier-1 Nourish tech).
+    techs.push(Tech {
+        id: EFFECTS.len() as u64,
+        name: "Test compound".into(),
+        inputs: vec![TechInput { element, form: GoodForm::Raw, qty: 1 }],
+        tech_inputs: vec![TechRef { tech: 0, qty: 1 }],
+        effect: TechEffect::Esteem,
+        magnitude: 2.0,
+        consumable: false,
+        category: GoodCategory::Positional,
+        tier: 2,
+        created_unix: 0,
+    });
+    techs
 }
 
 fn main() {
