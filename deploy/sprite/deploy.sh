@@ -55,7 +55,14 @@ sprite exec -- bash -c "
 # the server still grows techs, just with procedural names. GROW_TICK_SECS / OPENROUTER_MODEL
 # are optional tuning overrides.
 ENVPAIRS=""; ENVKEYS=""
-add_env() { [ -n "$2" ] && { ENVPAIRS="${ENVPAIRS:+$ENVPAIRS,}$1=$2"; ENVKEYS="${ENVKEYS:+$ENVKEYS,}$1"; }; }
+# `if` (not `&&`) so an empty value returns 0 — under `set -e` a function ending in a false
+# test would abort the whole script.
+add_env() {
+  if [ -n "$2" ]; then
+    ENVPAIRS="${ENVPAIRS:+$ENVPAIRS,}$1=$2"
+    ENVKEYS="${ENVKEYS:+$ENVKEYS,}$1"
+  fi
+}
 add_env OPENROUTER_API_KEY "${OPENROUTER_API_KEY:-}"
 add_env OPENROUTER_MODEL "${OPENROUTER_MODEL:-}"
 add_env GROW_TICK_SECS "${GROW_TICK_SECS:-}"
