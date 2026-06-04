@@ -51,3 +51,9 @@ pub fn element(id: ElementId) -> &'static ElementDef {
 pub fn element_count() -> usize {
     ELEMENTS.len()
 }
+
+/// Look up an element by its (raw) name — used server-side to map a reported research-demand
+/// label back to its global [`ElementId`]. Linear scan over 25 entries.
+pub fn id_by_name(name: &str) -> Option<ElementId> {
+    ELEMENTS.iter().position(|e| e.name == name).map(ElementId)
+}

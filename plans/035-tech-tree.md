@@ -1,7 +1,16 @@
 # 035 — Server-grown tech tree (research → discover → construct)
 
-Status: **Phase 1 building**, Phases 2–3 designed. Three-phase feature; this doc is the
-contract for all three, with Phase 1 implemented first.
+Status: **Phases 1–2 shipped**, Phase 3 designed. Three-phase feature; this doc is the
+contract for all three.
+
+- **Phase 1 (shipped)**: client `Research` action + per-resource demand reporting.
+- **Phase 2 (shipped)**: server aggregates demand, grows + names the global tech tree
+  (`src/tech.rs` pure logic; `src/bin/server.rs` growth task, OpenRouter naming with
+  procedural fallback, `GET /tech`, tree in the `/submit` response, HTML section,
+  `tech_state.json` persistence). Verified live end-to-end (procedural naming; LLM kicks in
+  once `OPENROUTER_API_KEY` is set on the Sprite).
+- **Phase 3 (next)**: client fetches the tree, discovery-on-research, workshop construction,
+  tech-item effects.
 
 ## Goal (user's framing)
 

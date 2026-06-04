@@ -15,6 +15,7 @@ pub mod noot;
 pub mod policy;
 pub mod rng;
 pub mod save;
+pub mod tech;
 pub mod world;
 pub mod worldname;
 

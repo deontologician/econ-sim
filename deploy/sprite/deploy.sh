@@ -50,13 +50,25 @@ sprite exec -- bash -c "
   cargo build --release --no-default-features --features server --bin server
 "
 
+# Forward the LLM tech-naming config to the service env *if present in this shell* — so the
+# secret never lives in the repo, only in your deploy environment. Without OPENROUTER_API_KEY
+# the server still grows techs, just with procedural names. GROW_TICK_SECS / OPENROUTER_MODEL
+# are optional tuning overrides.
+ENVPAIRS=""; ENVKEYS=""
+add_env() { [ -n "$2" ] && { ENVPAIRS="${ENVPAIRS:+$ENVPAIRS,}$1=$2"; ENVKEYS="${ENVKEYS:+$ENVKEYS,}$1"; }; }
+add_env OPENROUTER_API_KEY "${OPENROUTER_API_KEY:-}"
+add_env OPENROUTER_MODEL "${OPENROUTER_MODEL:-}"
+add_env GROW_TICK_SECS "${GROW_TICK_SECS:-}"
+ENVFLAG=""
+[ -n "$ENVPAIRS" ] && ENVFLAG="--env '$ENVPAIRS'"
+
 # `--http-port 8080` tells the Sprite proxy to route inbound HTTP to the server and
 # auto-start it on the first request after an idle sleep. `--dir /home/sprite` keeps the
 # cwd at the persistent home dir so leaderboard.json lands at /home/sprite/leaderboard.json.
-echo "==> (Re)registering the '$SERVICE' service on :8080"
+echo "==> (Re)registering the '$SERVICE' service on :8080${ENVKEYS:+ (env: $ENVKEYS)}"
 sprite exec -- bash -c "
   sprite-env services delete '$SERVICE' >/dev/null 2>&1 || true
-  sprite-env services create '$SERVICE' --cmd '$BIN' --dir /home/sprite --http-port 8080 --no-stream
+  sprite-env services create '$SERVICE' --cmd '$BIN' --dir /home/sprite --http-port 8080 $ENVFLAG --no-stream
 "
 
 echo "==> Making the URL public (so browser sims can POST without a token)"

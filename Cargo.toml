@@ -13,14 +13,17 @@ default = ["gui"]
 gui = ["bevy/default"]
 headless = []
 # Native leaderboard server. Build with `--no-default-features --features server` so it
-# pulls core Bevy (for the shared save types) plus axum/tokio, never the GUI/wasm libs.
-server = ["dep:axum", "dep:tokio"]
+# pulls core Bevy (for the shared save types) plus axum/tokio/ureq, never the GUI/wasm libs.
+server = ["dep:axum", "dep:tokio", "dep:ureq"]
 
 [dependencies]
 bevy = { version = "0.18", default-features = false }
 # Leaderboard server only (feature = "server"); never in the wasm/phone build.
 axum = { version = "0.7", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"], optional = true }
+# Tiny blocking HTTP client (rustls) for the server's one outbound call: the LLM tech-naming
+# request to OpenRouter. Server feature only — never in the wasm/phone bundle.
+ureq = { version = "2", features = ["json"], optional = true }
 # Save/load only. Both are already in Bevy's dependency tree, so this adds no real
 # bundle or compile cost — see CLAUDE.md. JSON (not RON) because serde_json::Value
 # round-trips enums faithfully, which the save migration replay relies on.

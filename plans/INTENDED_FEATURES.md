@@ -397,20 +397,25 @@ design. Newest first within each section.
   currency mark.
 - **STATUS**: partial
 
-### Tech tree — research action + demand reporting (Phase 1 of plans/035)
-- **NOW**: noots have a **Research** action (policy `A_RESEARCH`, masked legal when carrying
-  ≥1 non-junk unit). It studies held goods in place; the `economy::research` system tallies
+### Tech tree — research + server-grown tree (plans/035, Phases 1–2 shipped)
+- **NOW (Phase 1, client)**: noots have a **Research** action (policy `A_RESEARCH`, legal when
+  carrying ≥1 non-junk unit). It studies held goods in place; `economy::research` tallies
   per-item `EconStats::research_demand`, which `leaderboard::summarize` maps to global
-  `(element, form)` identity and ships in the submit `Summary` for the server to aggregate.
-  Save migrated v2→v3 (grows the actor head by one zero block — trained brain preserved).
-  Verified headless: research fires, demand accrues per-resource, economy stays healthy.
-- **STUB**: the research reward is a small fixed `RESEARCH_BONUS` (0.03/option, gated on
-  legality) — a placeholder to keep the action in the learned repertoire. There is **no real
-  payoff yet**: nothing is discovered or built, and tech items don't exist.
-- **INTENDED** (plans/035 Phases 2–3): the server grows a **global, live** tech tree from
-  aggregated demand, randomizes each tech's attributes, and names it via a cheap LLM
-  (OpenRouter/Qwen, procedural fallback); the client fetches the tree, lets a noot **discover**
-  a tech by researching with its prerequisites, then **build a workshop** that constructs the
-  tech as a new good whose attributes feed utility/efficiency. The real research reward
-  replaces the stand-in then.
-- **STATUS**: partial (Phase 1 shipped)
+  `(element, form)` identity and ships in the submit `Summary`. Save migrated v2→v3 (grows the
+  actor head by one zero block — trained brain preserved).
+- **NOW (Phase 2, server)**: `src/tech.rs` holds the shared `Tech`/`TechTree` types and pure,
+  deterministic growth logic (demand-weighted input sampling, attribute randomization,
+  procedural namer, prompt builder; unit-tested). `src/bin/server.rs` aggregates each world's
+  latest demand, and a background task grows new techs slowly over time (`growth_chance`
+  rising with total demand, `GROW_TICK_SECS` cadence), names them via OpenRouter (Qwen-class,
+  `OPENROUTER_API_KEY`/`OPENROUTER_MODEL`) with a procedural fallback, persists
+  `tech_state.json`, and serves `GET /tech` + the tree in the `/submit` response + an HTML
+  section. Verified live end-to-end (procedural naming).
+- **STUB**: the research reward is still a small fixed `RESEARCH_BONUS` (0.03/option) — no real
+  payoff until Phase 3. Demand decay over time isn't implemented (global demand is the sum of
+  worlds' latest cumulative). The LLM only names if `OPENROUTER_API_KEY` is set on the Sprite.
+- **INTENDED** (Phase 3, client): fetch the tree from the `/submit` response, let a noot
+  **discover** a tech by researching with its prerequisites, **build a workshop** that
+  constructs the tech as a new good, and apply tech attributes (nourish/esteem/efficiency).
+  The real research reward replaces the stand-in then.
+- **STATUS**: partial (Phases 1–2 shipped)
