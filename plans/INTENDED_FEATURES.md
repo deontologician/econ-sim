@@ -431,3 +431,20 @@ design. Newest first within each section.
   trading + pricing; stacking/diminishing boost combos; a workshop emblem + HUD/leaderboard
   tech panel; demand decay; rewarding discovery directly.
 - **STATUS**: partial (Phases 1–3 shipped; refinements above outstanding)
+
+### Mobile UI: collapsible sidebar, hidden stats, tech-tree panel
+- **NOW**: the stats sparkline strip is **hidden by default** ("Show stats" to reveal). The
+  right-side buttons (Overlay, Noots, Save, New, Graphs, Prices, Wealth, Tech) are collapsed
+  into an anchored **sidebar behind a "Menu" toggle** (starts collapsed for a clean play area),
+  fixing the button overlap. New **Tech** button opens a full-screen **tech-tree panel** laid
+  out left→right in tier columns; each discovered tech is a card with its effect and full
+  recipe (`needs: <base goods + prerequisite tech names>`). The panel rebuilds when the
+  discovered set changes; taps over it / the open sidebar don't fall through to the map.
+- **STUB**: tier columns convey progression left→right but there are **no drawn connector
+  lines** between a tech and its prerequisite techs (recipes are listed textually per card).
+  The workshop still reuses the refinery emblem. Only **discovered** techs show (undiscovered
+  catalog techs aren't greyed-in). Compile-checked on the wasm gate only — the GUI can't run in
+  the sandbox, so the actual layout/legibility needs an on-device look after deploy.
+- **INTENDED**: SVG/line connectors between prereqs (true Civ tree); show undiscovered techs
+  dimmed with lock state; a workshop emblem; per-tier scroll for many techs.
+- **STATUS**: partial

@@ -77,17 +77,15 @@ const XPORT_READOUT_W: f32 = 104.0;
 const XPORT_GAP: f32 = 6.0;
 const XPORT_BAR_W: f32 = XPORT_SIDE_W * 2.0 + XPORT_MID_W + XPORT_READOUT_W + XPORT_GAP * 3.0;
 
-// The toggle column begins one transport-bar height below the top margin, so its first
-// button lines up just under the transport bar.
+// The collapsible sidebar begins one transport-bar height below the top margin, so its
+// toggle lines up just under the transport bar.
 const OVERLAY_BTN_TOP: f32 = PAUSE_BTN_MARGIN + PAUSE_BTN_H + BTN_GAP;
-const NOOT_BTN_TOP: f32 = OVERLAY_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
-const SAVE_BTN_TOP: f32 = NOOT_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
-const NEW_BTN_TOP: f32 = SAVE_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
-const GRAPHS_BTN_TOP: f32 = NEW_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
-const PRICES_BTN_TOP: f32 = GRAPHS_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
-const WEALTH_BTN_TOP: f32 = PRICES_BTN_TOP + PAUSE_BTN_H + BTN_GAP;
-/// Bottom edge of the toggle column (taps above this in the column are UI, not map).
-const BTN_COLUMN_BOTTOM: f32 = WEALTH_BTN_TOP + PAUSE_BTN_H;
+/// Rows in the sidebar when open: the toggle plus the 8 menu buttons (Overlay, Noots, Save,
+/// New, Graphs, Prices, Wealth, Tech).
+const SIDEBAR_ROWS: f32 = 9.0;
+/// Bottom edge of the sidebar when fully expanded (taps above this in the column are UI, not
+/// map — see `pick_selection`, which only applies it while the sidebar is open).
+const BTN_COLUMN_BOTTOM: f32 = OVERLAY_BTN_TOP + SIDEBAR_ROWS * (PAUSE_BTN_H + BTN_GAP);
 
 // --- Graphs overlay ---------------------------------------------------------
 /// Size of the big correlation (overlay) chart texture, and of each per-stat sparkline.
@@ -317,16 +315,24 @@ struct Overlays {
     graphs: bool,
     prices: bool,
     wealth: bool,
+    /// Whether the right-side button sidebar is expanded (starts collapsed for a clean play
+    /// area; opened with the Menu toggle).
+    sidebar: bool,
+    /// Whether the full-screen tech-tree panel is open.
+    tech: bool,
 }
 
 impl Default for Overlays {
     fn default() -> Self {
         Self {
             map: MapOverlayMode::None,
-            strip: true,
+            // The stats sparkline strip starts hidden — it's opt-in via "Show stats".
+            strip: false,
             graphs: false,
             prices: false,
             wealth: false,
+            sidebar: false,
+            tech: false,
         }
     }
 }
@@ -400,6 +406,27 @@ struct StatStripBody;
 struct StripToggle;
 #[derive(Component)]
 struct StripToggleLabel;
+/// The right-side menu sidebar: its toggle button, the toggle caption, and the collapsible
+/// column of buttons.
+#[derive(Component)]
+struct SidebarToggle;
+#[derive(Component)]
+struct SidebarToggleLabel;
+#[derive(Component)]
+struct SidebarBody;
+/// The "Tech" menu button, the tech-tree panel root (shown/hidden), and its scrollable body
+/// that the tier columns are rebuilt into.
+#[derive(Component)]
+struct TechButton;
+#[derive(Component)]
+struct TechPanel;
+#[derive(Component)]
+struct TechPanelBody;
+
+/// The embedded UI font handle, kept as a resource so runtime-rebuilt UI (the tech panel) can
+/// spawn text without re-loading it.
+#[derive(Resource, Clone)]
+struct UiFont(Handle<Font>);
 /// A tappable per-stat cell; tapping toggles the stat onto the correlation chart.
 #[derive(Component)]
 struct GraphCell {
@@ -563,6 +590,9 @@ fn main() {
                     render_wealth,
                     graph_select,
                     strip_controls,
+                    sidebar_controls,
+                    tech_controls,
+                    update_tech_panel,
                     hide_loading_screen,
                 ),
             )
@@ -645,6 +675,8 @@ fn setup(
         Font::try_from_bytes(include_bytes!("../assets/fonts/DejaVuSansMono.ttf").to_vec())
             .expect("embedded UI font should parse"),
     );
+    // Keep the font handle around for UI that's rebuilt at runtime (the tech-tree panel).
+    commands.insert_resource(UiFont(ui_font.clone()));
 
     // One thematic icon texture per chosen element (used on the map and in the HUD).
     let icons: [Handle<Image>; 4] =
@@ -1183,6 +1215,7 @@ fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets, 
     // Graphs panel (hidden until toggled). Spawned before the buttons so the toggle
     // column renders on top of it and stays tappable while the panel is open.
     spawn_graphs_panel(commands, font, graphs);
+    spawn_tech_panel(commands, font);
 
     // Transport bar, pinned top-right (absolute so it floats over the panels): a row of
     // [<<] [Play/Pause] [>>] with the ticks/s readout. Touch-target-sized buttons.
@@ -1243,116 +1276,95 @@ fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets, 
             ));
         });
 
-    // Map-overlay cycle button (caption shows the active mode): off → terrain → trades.
+    // Right-side menu: a collapsible sidebar anchored below the transport bar. The toggle is
+    // always visible; the button column starts collapsed (clean play area) and opens on tap.
+    // Buttons keep their marker components, so their click systems work regardless of
+    // hierarchy. Spawned after the panels so it renders on top and stays tappable.
     commands
-        .spawn((
-            Button,
-            Node {
-                position_type: PositionType::Absolute,
-                right: Val::Px(PAUSE_BTN_MARGIN),
-                top: Val::Px(OVERLAY_BTN_TOP),
-                width: Val::Px(PAUSE_BTN_W),
-                height: Val::Px(PAUSE_BTN_H),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            BackgroundColor(BTN_OFF),
-            MapOverlayButton,
-        ))
-        .with_children(|b| {
-            b.spawn((
-                Text::new(MapOverlayMode::default().label()),
-                TextFont {
-                    font: font.clone(),
-                    font_size: 15.0,
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(PAUSE_BTN_MARGIN),
+            top: Val::Px(OVERLAY_BTN_TOP),
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::End,
+            row_gap: Val::Px(BTN_GAP),
+            ..default()
+        })
+        .with_children(|side| {
+            // Always-visible toggle.
+            side.spawn((
+                Button,
+                Node {
+                    width: Val::Px(PAUSE_BTN_W),
+                    height: Val::Px(PAUSE_BTN_H),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
                     ..default()
                 },
-                TextColor(Color::WHITE),
-                MapOverlayLabel,
-            ));
-        });
-    // Save button spawned manually (not via the helper) so its caption carries a
-    // `SaveLabel` marker — `save_game` flips it to "Saved!" as save confirmation.
-    commands
-        .spawn((
-            Button,
-            Node {
-                position_type: PositionType::Absolute,
-                right: Val::Px(PAUSE_BTN_MARGIN),
-                top: Val::Px(SAVE_BTN_TOP),
-                width: Val::Px(PAUSE_BTN_W),
-                height: Val::Px(PAUSE_BTN_H),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            BackgroundColor(BTN_OFF),
-            SaveButton,
-        ))
-        .with_children(|b| {
-            b.spawn((
-                Text::new("Save"),
-                TextFont {
-                    font: font.clone(),
-                    font_size: 16.0,
+                BackgroundColor(BTN_OFF),
+                SidebarToggle,
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("Menu"),
+                    TextFont {
+                        font: font.clone(),
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                    SidebarToggleLabel,
+                ));
+            });
+            // The collapsible button column (hidden by default).
+            side.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::End,
+                    row_gap: Val::Px(BTN_GAP),
+                    display: Display::None,
                     ..default()
                 },
-                TextColor(Color::WHITE),
-                SaveLabel,
-            ));
-        });
-    spawn_overlay_button(commands, font, "New", NEW_BTN_TOP, NewWorldButton);
-    spawn_overlay_button(commands, font, "Graphs", GRAPHS_BTN_TOP, GraphsButton);
-    spawn_overlay_button(commands, font, "Prices", PRICES_BTN_TOP, PricesButton);
-    spawn_overlay_button(commands, font, "Wealth", WEALTH_BTN_TOP, WealthButton);
-
-    // Noot-colouring cycle button (caption shows the active mode).
-    commands
-        .spawn((
-            Button,
-            Node {
-                position_type: PositionType::Absolute,
-                right: Val::Px(PAUSE_BTN_MARGIN),
-                top: Val::Px(NOOT_BTN_TOP),
-                width: Val::Px(PAUSE_BTN_W),
-                height: Val::Px(PAUSE_BTN_H),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            BackgroundColor(BTN_OFF),
-            NootColorButton,
-        ))
-        .with_children(|b| {
-            b.spawn((
-                Text::new(NootColorMode::default().label()),
-                TextFont {
-                    font: font.clone(),
-                    font_size: 15.0,
-                    ..default()
-                },
-                TextColor(Color::WHITE),
-                NootColorLabel,
-            ));
+                SidebarBody,
+            ))
+            .with_children(|body| {
+                // Map-overlay and noot-colour cyclers carry label markers (caption updated).
+                spawn_menu_button_labeled(
+                    body,
+                    font,
+                    MapOverlayMode::default().label(),
+                    MapOverlayButton,
+                    MapOverlayLabel,
+                );
+                spawn_menu_button_labeled(
+                    body,
+                    font,
+                    NootColorMode::default().label(),
+                    NootColorButton,
+                    NootColorLabel,
+                );
+                // Save's caption flips to "Saved!" (SaveLabel).
+                spawn_menu_button_labeled(body, font, "Save", SaveButton, SaveLabel);
+                spawn_menu_button(body, font, "New", NewWorldButton);
+                spawn_menu_button(body, font, "Graphs", GraphsButton);
+                spawn_menu_button(body, font, "Prices", PricesButton);
+                spawn_menu_button(body, font, "Wealth", WealthButton);
+                spawn_menu_button(body, font, "Tech", TechButton);
+            });
         });
 }
 
-/// Spawn one top-right overlay toggle button at vertical offset `top`.
-fn spawn_overlay_button(
-    commands: &mut Commands,
+/// Spawn a sidebar menu button (a child of the menu column) carrying `marker`.
+fn spawn_menu_button(
+    parent: &mut bevy::ecs::hierarchy::ChildSpawnerCommands,
     font: &Handle<Font>,
     label: &str,
-    top: f32,
     marker: impl Component,
 ) {
-    commands
+    parent
         .spawn((
             Button,
             Node {
-                position_type: PositionType::Absolute,
-                right: Val::Px(PAUSE_BTN_MARGIN),
-                top: Val::Px(top),
                 width: Val::Px(PAUSE_BTN_W),
                 height: Val::Px(PAUSE_BTN_H),
                 justify_content: JustifyContent::Center,
@@ -1371,6 +1383,41 @@ fn spawn_overlay_button(
                     ..default()
                 },
                 TextColor(Color::WHITE),
+            ));
+        });
+}
+
+/// Like [`spawn_menu_button`] but the caption carries `label_marker` so a system can rewrite it.
+fn spawn_menu_button_labeled(
+    parent: &mut bevy::ecs::hierarchy::ChildSpawnerCommands,
+    font: &Handle<Font>,
+    label: &str,
+    marker: impl Component,
+    label_marker: impl Component,
+) {
+    parent
+        .spawn((
+            Button,
+            Node {
+                width: Val::Px(PAUSE_BTN_W),
+                height: Val::Px(PAUSE_BTN_H),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(BTN_OFF),
+            marker,
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(label),
+                TextFont {
+                    font: font.clone(),
+                    font_size: 15.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+                label_marker,
             ));
         });
 }
@@ -1415,6 +1462,209 @@ fn speed_label(tps: f32) -> String {
 
 /// Build the (initially hidden) graphs panel: the big correlation chart on top, then a
 /// wrap-grid of tappable per-stat sparkline cells below.
+/// The (hidden) full-screen tech-tree panel: a header plus a row body that `update_tech_panel`
+/// fills with one column per tier (left→right), each holding the discovered techs of that tier.
+fn spawn_tech_panel(commands: &mut Commands, font: &Handle<Font>) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(8.0),
+                right: Val::Px(8.0),
+                top: Val::Px(8.0),
+                bottom: Val::Px(8.0),
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::all(Val::Px(10.0)),
+                row_gap: Val::Px(8.0),
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.05, 0.06, 0.08, 0.97)),
+            TechPanel,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Text::new("Tech tree — discovered technologies (tap Tech to close)"),
+                TextFont {
+                    font: font.clone(),
+                    font_size: 16.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.94, 0.84, 0.52)),
+            ));
+            p.spawn((
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(12.0),
+                    row_gap: Val::Px(12.0),
+                    flex_wrap: FlexWrap::Wrap,
+                    align_items: AlignItems::FlexStart,
+                    ..default()
+                },
+                TechPanelBody,
+            ));
+        });
+}
+
+/// Collapse/expand the right-side menu sidebar from its toggle, syncing display and caption.
+fn sidebar_controls(
+    button: Query<&Interaction, (Changed<Interaction>, With<SidebarToggle>)>,
+    mut overlays: ResMut<Overlays>,
+    mut body: Query<&mut Node, With<SidebarBody>>,
+    mut label: Query<&mut Text, With<SidebarToggleLabel>>,
+) {
+    if button.iter().any(|i| *i == Interaction::Pressed) {
+        overlays.sidebar = !overlays.sidebar;
+        if let Ok(mut node) = body.single_mut() {
+            node.display = if overlays.sidebar {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+        if let Ok(mut text) = label.single_mut() {
+            text.0 = if overlays.sidebar { "Close" } else { "Menu" }.into();
+        }
+    }
+}
+
+/// Show/hide the tech-tree panel from the "Tech" menu button.
+fn tech_controls(
+    button: Query<&Interaction, (Changed<Interaction>, With<TechButton>)>,
+    mut overlays: ResMut<Overlays>,
+    mut panel: Query<&mut Node, With<TechPanel>>,
+) {
+    if button.iter().any(|i| *i == Interaction::Pressed) {
+        overlays.tech = !overlays.tech;
+        if let Ok(mut node) = panel.single_mut() {
+            node.display = if overlays.tech {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+    }
+}
+
+/// While the tech panel is open, (re)build its tier columns from the world's discovered techs.
+/// Rebuilds only when the catalog/discovered set changes (tracked in a `Local` signature).
+fn update_tech_panel(
+    mut commands: Commands,
+    overlays: Res<Overlays>,
+    sim: Res<Sim>,
+    ui_font: Res<UiFont>,
+    body: Query<Entity, With<TechPanelBody>>,
+    children: Query<&Children>,
+    mut last_sig: Local<usize>,
+) {
+    if !overlays.tech {
+        // Force a rebuild next time it opens (the world may have changed while closed).
+        *last_sig = usize::MAX;
+        return;
+    }
+    let world = &sim.0;
+    let sig = world
+        .tech_catalog
+        .len()
+        .wrapping_mul(100_003)
+        .wrapping_add(world.discovered.len());
+    if sig == *last_sig {
+        return;
+    }
+    *last_sig = sig;
+    let Ok(body_e) = body.single() else {
+        return;
+    };
+    if let Ok(ch) = children.get(body_e) {
+        for c in ch.iter() {
+            commands.entity(c).despawn();
+        }
+    }
+    let font = ui_font.0.clone();
+    let discovered: Vec<&econ_sim::tech::Tech> = world
+        .tech_catalog
+        .iter()
+        .filter(|t| world.is_discovered(t.id))
+        .collect();
+    if discovered.is_empty() {
+        let font = font.clone();
+        commands.entity(body_e).with_children(|b| {
+            b.spawn((
+                Text::new(
+                    "No techs discovered yet — research while holding a recipe's inputs to \
+                     discover it. New techs grow on the server over time.",
+                ),
+                TextFont { font, font_size: 14.0, ..default() },
+                TextColor(Color::srgb(0.6, 0.65, 0.72)),
+            ));
+        });
+        return;
+    }
+    let max_tier = discovered.iter().map(|t| t.tier).max().unwrap_or(1);
+    let catalog = world.tech_catalog.clone();
+    commands.entity(body_e).with_children(|row| {
+        for tier in 1..=max_tier {
+            let col_techs: Vec<&econ_sim::tech::Tech> =
+                discovered.iter().copied().filter(|t| t.tier == tier).collect();
+            if col_techs.is_empty() {
+                continue;
+            }
+            let font = font.clone();
+            let catalog = catalog.clone();
+            row.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                width: Val::Px(180.0),
+                row_gap: Val::Px(6.0),
+                ..default()
+            })
+            .with_children(|col| {
+                col.spawn((
+                    Text::new(format!("Tier {tier}")),
+                    TextFont { font: font.clone(), font_size: 15.0, ..default() },
+                    TextColor(Color::srgb(0.94, 0.84, 0.52)),
+                ));
+                for t in col_techs {
+                    let font = font.clone();
+                    let recipe = t.recipe_label(&catalog);
+                    let sub = format!(
+                        "{} ×{:.1} · {}",
+                        t.effect.label(),
+                        t.magnitude,
+                        if t.consumable { "consumable" } else { "durable" },
+                    );
+                    let name = t.name.clone();
+                    col.spawn((
+                        Node {
+                            flex_direction: FlexDirection::Column,
+                            padding: UiRect::all(Val::Px(6.0)),
+                            row_gap: Val::Px(2.0),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.06)),
+                    ))
+                    .with_children(|card| {
+                        card.spawn((
+                            Text::new(name),
+                            TextFont { font: font.clone(), font_size: 14.0, ..default() },
+                            TextColor(Color::WHITE),
+                        ));
+                        card.spawn((
+                            Text::new(sub),
+                            TextFont { font: font.clone(), font_size: 10.0, ..default() },
+                            TextColor(Color::srgb(0.6, 0.65, 0.72)),
+                        ));
+                        card.spawn((
+                            Text::new(format!("needs: {recipe}")),
+                            TextFont { font, font_size: 10.0, ..default() },
+                            TextColor(Color::srgb(0.60, 0.84, 0.75)),
+                        ));
+                    });
+                }
+            });
+        }
+    });
+}
+
 fn spawn_graphs_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) {
     // --- Top sparkline strip (always docked at the top, collapsible) ---------
     // Spans the width but leaves the right button column clear; the collapse toggle
@@ -1453,7 +1703,7 @@ fn spawn_graphs_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &Gra
                 ))
                 .with_children(|b| {
                     b.spawn((
-                        Text::new("Hide stats"),
+                        Text::new("Show stats"),
                         TextFont {
                             font: font.clone(),
                             font_size: 13.0,
@@ -1464,7 +1714,7 @@ fn spawn_graphs_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &Gra
                     ));
                 });
 
-            // The wrapping row of tappable stat cells (hidden when collapsed).
+            // The wrapping row of tappable stat cells (hidden when collapsed — starts hidden).
             strip
                 .spawn((
                     Node {
@@ -1474,6 +1724,7 @@ fn spawn_graphs_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &Gra
                         align_items: AlignItems::FlexStart,
                         column_gap: Val::Px(5.0),
                         row_gap: Val::Px(5.0),
+                        display: Display::None,
                         ..default()
                     },
                     StatStripBody,
@@ -2260,22 +2511,29 @@ fn pick_selection(
     };
     let window = windows.single().ok();
 
-    // A click/tap on the top-right controls (the wide transport bar on the top row, or
-    // the narrower toggle column below it) must not be read as an empty map hit (which
-    // would clear the selection). Skip those two zones.
+    // A click/tap on the top-right controls (the wide transport bar, the always-visible Menu
+    // toggle, or — when open — the sidebar column) must not be read as an empty map hit (which
+    // would clear the selection). The tech panel, when open, covers the screen, so swallow all.
     let over_buttons = |p: Vec2| {
-        window.is_some_and(|w| {
-            let right = w.width() - PAUSE_BTN_MARGIN;
-            let bar = p.x >= right - XPORT_BAR_W
-                && p.x <= right
-                && p.y >= PAUSE_BTN_MARGIN
-                && p.y <= PAUSE_BTN_MARGIN + PAUSE_BTN_H;
-            let column = p.x >= right - PAUSE_BTN_W
-                && p.x <= right
-                && p.y >= OVERLAY_BTN_TOP
-                && p.y <= BTN_COLUMN_BOTTOM;
-            bar || column
-        })
+        overlays.tech
+            || window.is_some_and(|w| {
+                let right = w.width() - PAUSE_BTN_MARGIN;
+                let bar = p.x >= right - XPORT_BAR_W
+                    && p.x <= right
+                    && p.y >= PAUSE_BTN_MARGIN
+                    && p.y <= PAUSE_BTN_MARGIN + PAUSE_BTN_H;
+                // The Menu toggle is always present; the button column only when expanded.
+                let col_bottom = if overlays.sidebar {
+                    BTN_COLUMN_BOTTOM
+                } else {
+                    OVERLAY_BTN_TOP + PAUSE_BTN_H
+                };
+                let column = p.x >= right - PAUSE_BTN_W
+                    && p.x <= right
+                    && p.y >= OVERLAY_BTN_TOP
+                    && p.y <= col_bottom;
+                bar || column
+            })
     };
 
     // Collect this frame's pick points in screen space.
