@@ -108,14 +108,25 @@ pub fn assign(rng: &mut Rng) -> WorldGoods {
                 s
             }
         };
-
-        let consumable = item_index(slot, form);
-        item_roles[consumable] = match category {
+        let role = match category {
             GoodCategory::Staple => ItemRole::Staple(sub),
             GoodCategory::Positional => ItemRole::Positional(sub),
         };
-        if form == GoodForm::Refined {
-            item_roles[item_index(slot, GoodForm::Raw)] = ItemRole::Intermediate;
+
+        let consumable = item_index(slot, form);
+        item_roles[consumable] = role;
+        match form {
+            // Consumed refined: the raw grade is an *intermediate* — only useful once refined
+            // into the consumable, the input a refiner buys.
+            GoodForm::Refined => {
+                item_roles[item_index(slot, GoodForm::Raw)] = ItemRole::Intermediate;
+            }
+            // Consumed raw: its refined grade is the *premium* of the same good — not junk.
+            // It carries the same role/sub and is worth more (more satiation for a staple,
+            // more esteem for a luxury — see economy.rs), so refining and buying it pay off.
+            GoodForm::Raw => {
+                item_roles[item_index(slot, GoodForm::Refined)] = role;
+            }
         }
 
         ConsumableGood {

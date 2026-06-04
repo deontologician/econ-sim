@@ -35,7 +35,9 @@ const W_PHYS: f32 = 1.0;
 const W_SAFE: f32 = 0.6;
 const W_ESTEEM: f32 = 0.4;
 const SAFETY_BUCKS: f32 = 60.0;
-const ESTEEM_NORM: f32 = 4.0;
+// Larger than the old 4.0: esteem now spans both grades of both luxury elements (four
+// positional items, refined weighted by `POSITIONAL_REFINED_MULT`), so the raw total is ~3×.
+const ESTEEM_NORM: f32 = 12.0;
 /// Reward penalty applied to the transition that ends in starvation death.
 const DEATH_PENALTY: f32 = 2.0;
 /// Small per-option reward for a completed Research option (only when it was legal, i.e. the
@@ -140,8 +142,14 @@ const FOOD_BUFFER_WTP_FRAC: f32 = 0.25;
 // STUB: universal income so consumers don't go broke. See INTENDED_FEATURES.md.
 pub const BUCKS_INCOME: f32 = 0.6;
 
-// Consumption.
-const EAT_VALUE: f32 = 4.0; // appetite removed per staple unit eaten
+// Consumption. Refining is an upgrade: a refined staple unit clears more appetite than a raw
+// one, and a refined luxury confers more esteem (see `POSITIONAL_REFINED_MULT`), so refining
+// and buying refined goods are both worthwhile.
+const EAT_VALUE_RAW: f32 = 4.0; // appetite removed per raw staple unit eaten
+const EAT_VALUE_REFINED: f32 = 8.0; // a refined staple unit satiates twice as much
+/// Esteem (and luxury WTP) multiplier for the refined grade of a positional good vs. its raw
+/// grade — the premium that makes refining luxuries, and paying up for them, worthwhile.
+const POSITIONAL_REFINED_MULT: f32 = 2.0;
 
 /// Smoothing for the per-item sale-price EWMA (higher = tracks recent trades faster).
 const PRICE_EWMA_ALPHA: f32 = 0.12;
@@ -632,11 +640,20 @@ pub fn gini(values: &[f32]) -> f32 {
 pub fn maslow_utility(hunger: &Hunger, inv: &Inventory, wallet: &Wallet, world: &World) -> f32 {
     let goods = &world.goods;
     let phys = hunger.utility() / N_STAPLES as f32; // ∈[0,1]
-    let min_food = (0..N_ITEMS)
-        .filter_map(|i| match goods.role_of(i) {
-            ItemRole::Staple(_) => Some(inv.items[i]),
-            _ => None,
-        })
+    // Food buffer is per staple *element* (appetite sub), summing both grades — holding lots
+    // of one element's food can't paper over a total lack of the other's. The thinnest
+    // element's reserve sets safety, so the buffer rewards a balanced larder.
+    let mut food_by_sub = [0.0f32; N_STAPLES];
+    let mut have_sub = [false; N_STAPLES];
+    for i in 0..N_ITEMS {
+        if let ItemRole::Staple(sub) = goods.role_of(i) {
+            food_by_sub[sub] += inv.items[i];
+            have_sub[sub] = true;
+        }
+    }
+    let min_food = (0..N_STAPLES)
+        .filter(|&s| have_sub[s])
+        .map(|s| food_by_sub[s])
         .fold(f32::MAX, f32::min);
     let min_food = if min_food.is_finite() { min_food } else { 0.0 };
     let safety = 0.5 * (min_food / FOOD_RESERVE).clamp(0.0, 1.0)
@@ -1085,10 +1102,15 @@ fn sellable_units(world: &crate::world::World, inv: &Inventory) -> f32 {
         .sum()
 }
 
-/// Whether the noot holds any unrefined intermediate (the precondition for `refine`).
-fn has_intermediate(world: &crate::world::World, inv: &Inventory) -> bool {
-    (0..N_ITEMS)
-        .any(|i| matches!(world.goods.role_of(i), ItemRole::Intermediate) && inv.items[i] > 0.0)
+/// Whether the noot holds any raw good worth refining (the precondition for `refine`). Every
+/// raw grade now refines into a premium grade, so any non-junk raw the noot carries qualifies
+/// (legacy `Intermediate` raws included, for old saves).
+fn has_refinable(world: &crate::world::World, inv: &Inventory) -> bool {
+    (0..N_ITEMS).any(|i| {
+        form_of(i) == GoodForm::Raw
+            && !matches!(world.goods.role_of(i), ItemRole::Junk)
+            && inv.items[i] > 0.0
+    })
 }
 
 /// Total non-junk units a noot is carrying (its haul load).
@@ -1101,7 +1123,7 @@ fn carried_units(world: &crate::world::World, inv: &Inventory) -> f32 {
 
 /// Which committed options the policy may choose from this state, given one-hex ownership.
 /// Mine: owns a deposit, or is unowned and an unclaimed deposit exists. Sell: has surplus.
-/// Refine: holds an intermediate and a refinery exists to use. Build shop/refinery: owns
+/// Refine: holds a refinable raw good and a refinery exists to use. Build shop/refinery: owns
 /// nothing yet and can afford it. Explore: always (the fallback).
 #[allow(clippy::too_many_arguments)]
 fn option_mask(
@@ -1116,7 +1138,7 @@ fn option_mask(
     let mut mask = [false; N_ACT];
     mask[policy::A_MINE] = owned_deposit(world, claim).is_some() || (owns_nothing && free_deposit);
     mask[policy::A_SELL] = sellable_units(world, inv) >= 1.0;
-    mask[policy::A_REFINE] = any_refinery && has_intermediate(world, inv);
+    mask[policy::A_REFINE] = any_refinery && has_refinable(world, inv);
     mask[policy::A_BUILD_SHOP] = owns_nothing && wallet.bucks >= SHOP_COST + SHOP_BUILD_BUFFER;
     mask[policy::A_BUILD_REFINERY] =
         owns_nothing && wallet.bucks >= REFINERY_COST + SHOP_BUILD_BUFFER;
@@ -1182,7 +1204,7 @@ fn option_done(
     match act {
         policy::A_MINE => carried_units(world, inv) >= LOAD_THRESHOLD,
         policy::A_SELL => sellable_units(world, inv) < 1.0,
-        policy::A_REFINE => !has_intermediate(world, inv),
+        policy::A_REFINE => !has_refinable(world, inv),
         policy::A_BUILD_SHOP | policy::A_BUILD_REFINERY | policy::A_BUILD_WORKSHOP => {
             claim.hex.is_some()
         }
@@ -1761,7 +1783,8 @@ pub fn refine(sim: Res<Sim>, mut q: Query<(&Action, &TilePos, &mut Inventory, &m
             * tech_boost(&sim.0, &inv, crate::tech::TechEffect::RefineBoost);
         for slot in 0..4 {
             let raw = goods::item_index(slot, GoodForm::Raw);
-            if sim.0.goods.role_of(raw) != ItemRole::Intermediate || inv.items[raw] <= 0.0 {
+            // Refining lifts any held raw grade to its premium refined grade.
+            if matches!(sim.0.goods.role_of(raw), ItemRole::Junk) || inv.items[raw] <= 0.0 {
                 continue;
             }
             let refined = goods::item_index(slot, GoodForm::Refined);
@@ -1892,13 +1915,17 @@ pub fn consume(
         for item in 0..N_ITEMS {
             if let ItemRole::Staple(sub) = dt_goods.role_of(item) {
                 if inv.items[item] > 0.0 && hunger.staple[sub] > 0.0 {
-                    let needed = hunger.staple[sub] / EAT_VALUE;
+                    // Both grades feed the same appetite; the refined grade clears more per
+                    // unit (see `eat_value`). Raw items come first in index order, so a noot
+                    // eats cheap raw food before dipping into refined.
+                    let ev = eat_value(item);
+                    let needed = hunger.staple[sub] / ev;
                     let eat = inv.items[item].min(needed);
                     inv.items[item] -= eat;
-                    hunger.staple[sub] = (hunger.staple[sub] - eat * EAT_VALUE).max(0.0);
+                    hunger.staple[sub] = (hunger.staple[sub] - eat * ev).max(0.0);
                     eaten += eat;
                     // Welfare (also feeds the policy reward via the utility delta).
-                    utility_gained += (eat * EAT_VALUE) / STAPLE_SATIATION;
+                    utility_gained += (eat * ev) / STAPLE_SATIATION;
                 }
             }
         }
@@ -1954,8 +1981,26 @@ pub fn consume(
 pub fn positional_utility(goods: &goods::WorldGoods, inv: &Inventory) -> f32 {
     (0..N_ITEMS)
         .filter(|&i| matches!(goods.role_of(i), ItemRole::Positional(_)))
-        .map(|i| (1.0 + inv.items[i]).ln())
+        .map(|i| positional_grade(i) * (1.0 + inv.items[i]).ln())
         .sum()
+}
+
+/// Appetite cleared per unit eaten of a staple item — the refined grade satiates more, which
+/// is the whole reason to refine or buy it.
+fn eat_value(item: usize) -> f32 {
+    match form_of(item) {
+        GoodForm::Raw => EAT_VALUE_RAW,
+        GoodForm::Refined => EAT_VALUE_REFINED,
+    }
+}
+
+/// Esteem (and luxury-WTP) weight of a positional item by grade: refined luxuries are the
+/// premium, so they confer `POSITIONAL_REFINED_MULT`× the raw grade.
+fn positional_grade(item: usize) -> f32 {
+    match form_of(item) {
+        GoodForm::Raw => 1.0,
+        GoodForm::Refined => POSITIONAL_REFINED_MULT,
+    }
 }
 
 // --- Tech-item effects (plans/035, Phase 3) ---------------------------------
@@ -2035,20 +2080,22 @@ struct Snap {
 fn wtp(goods: &goods::WorldGoods, item: usize, s: &Snap) -> f32 {
     let consumption = match goods.role_of(item) {
         ItemRole::Staple(sub) => {
-            let hunger_val = STAPLE_VALUE * (s.hunger[sub] / STAPLE_SATIATION);
+            // A refined unit clears more appetite, so a buyer pays proportionally more for it.
+            let potency = eat_value(item) / EAT_VALUE_RAW;
+            let hunger_val = STAPLE_VALUE * potency * (s.hunger[sub] / STAPLE_SATIATION);
             // Below the reserve, also stock up (even when not hungry) so a buffer of
             // food can accumulate when it's cheap.
             if s.inv[item] < FOOD_RESERVE {
-                hunger_val.max(STAPLE_VALUE * FOOD_BUFFER_WTP_FRAC)
+                hunger_val.max(STAPLE_VALUE * potency * FOOD_BUFFER_WTP_FRAC)
             } else {
                 hunger_val
             }
         }
-        // Durable luxuries are only bought once fed; marginal worth falls as the
-        // noot's *held* stock of that good grows.
+        // Durable luxuries are only bought once fed; marginal worth falls as the noot's
+        // *held* stock of that good grows, and the refined grade is worth the premium.
         ItemRole::Positional(_) => {
             if s.satisfied {
-                POSITIONAL_VALUE / (1.0 + s.inv[item])
+                POSITIONAL_VALUE * positional_grade(item) / (1.0 + s.inv[item])
             } else {
                 0.0
             }
@@ -2080,14 +2127,16 @@ fn reservation(goods: &goods::WorldGoods, item: usize, s: &Snap) -> f32 {
         // Won't part with food up to its reserve (held at full staple value, so the
         // buffer never clears); only true surplus beyond it sells, cheaply when fed.
         ItemRole::Staple(sub) => {
+            // A refined unit is worth more to keep, in step with its higher satiation.
+            let potency = eat_value(item) / EAT_VALUE_RAW;
             if s.inv[item] <= FOOD_RESERVE {
-                STAPLE_VALUE
+                STAPLE_VALUE * potency
             } else {
-                STAPLE_VALUE * (s.hunger[sub] / STAPLE_SATIATION)
+                STAPLE_VALUE * potency * (s.hunger[sub] / STAPLE_SATIATION)
             }
         }
         ItemRole::Positional(_) => {
-            let marginal = POSITIONAL_VALUE / (1.0 + s.inv[item]);
+            let marginal = POSITIONAL_VALUE * positional_grade(item) / (1.0 + s.inv[item]);
             let hunger_frac = s.hunger.iter().copied().fold(0.0f32, f32::max) / STAPLE_SATIATION;
             marginal * (1.0 - POSITIONAL_SELL_URGENCY * hunger_frac).max(0.0)
         }

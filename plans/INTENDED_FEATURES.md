@@ -88,14 +88,27 @@ design. Newest first within each section.
 - **STATUS**: partial
 
 ### Refining
-- **NOW**: refining converts a raw intermediate into the element's hardcoded refined
-  good at a fixed 1:1 ratio, and now happens **only inside a refinery** (a built site;
-  see *Generic hex ownership*) — a noot must stand on one to refine (any refinery,
-  shared). *(partial)*
+- **NOW**: refining converts a raw good into the element's refined grade at a fixed 1:1
+  ratio, **only inside a refinery** (a built site; see *Generic hex ownership*) — a noot
+  must stand on one (any refinery, shared). Every non-junk raw is refinable, and the
+  refined grade is the *premium*: a refined staple satiates 2× a raw one and a refined
+  luxury confers 2× esteem (plans/036), so no good is dead and refining always pays. *(partial)*
 - **INTENDED**: recipes with real input ratios and byproducts, multi-step chains, and
   an LLM-generated tech tree feeding the refined-product definitions (currently
   hardcoded in `elements.rs`).
 - **STATUS**: partial
+
+### Refinery bootstrapping (some seeds never refine)
+- **NOW**: building a refinery and choosing Refine are learned actions. In most seeds the
+  policy discovers them and the full raw→refined economy runs, but in a minority (e.g. seed
+  123) **no refinery is ever built across 500k ticks**, so that world's entire refined class
+  — every refined-consumed staple and premium grade — stays unproduced and untraded while the
+  raw economy thrives. A chicken-and-egg cold start: refining is only worthwhile once a
+  refinery exists, and nobody pays the build cost first. *(partial)*
+- **INTENDED**: a reliable bootstrap — e.g. a small intrinsic/shaped reward for the first
+  refinery in a world, a cheaper first build, or a starter refinery — so every world develops
+  refining instead of leaving it to chance.
+- **STATUS**: deferred
 
 ### Ownership
 - **NOW**: emergent claims, now unified into **one improved hex per noot** (see
