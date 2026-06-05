@@ -706,6 +706,10 @@ pub struct PolicyMemory {
     pub last_act: usize,
     pub last_u: f32,
     pub died: bool,
+    /// Set by `economy::discover` when this noot's Research action unlocks a new tech world-
+    /// wide; consumed in `policy_step` to add a one-time discovery reward to the closing
+    /// option, then cleared. Mirrors `died`'s set-elsewhere/consume-in-policy-step pattern.
+    pub discovered: bool,
     /// A committed option (the value in `last_act`) is mid-execution: the deterministic
     /// executor drives it and the policy does not re-decide until it terminates.
     pub committed: bool,
@@ -735,6 +739,7 @@ impl PolicyMemory {
             last_act: 0,
             last_u: 0.0,
             died: false,
+            discovered: false,
             committed: false,
             plan_target: None,
             plan_ticks: 0,

@@ -320,6 +320,8 @@ struct Overlays {
     sidebar: bool,
     /// Whether the full-screen tech-tree panel is open.
     tech: bool,
+    /// Whether the full-screen research panel is open.
+    research: bool,
 }
 
 impl Default for Overlays {
@@ -333,6 +335,7 @@ impl Default for Overlays {
             wealth: false,
             sidebar: false,
             tech: false,
+            research: false,
         }
     }
 }
@@ -370,7 +373,18 @@ struct GraphAssets {
     price_sparks: Vec<Handle<Image>>,
     /// The sorted money-per-noot distribution chart (the Wealth panel).
     wealth: Handle<Image>,
+    /// The research-rate-over-time trend chart (the Research panel).
+    research: Handle<Image>,
 }
+
+/// Live history of the research rate (effort/sec), oldest → newest, for the Research panel's
+/// trend sparkline. Capped, not persisted — a fresh trend each session is fine for a live
+/// readout (the cumulative totals it summarizes *are* persisted in `EconStats`).
+#[derive(Resource, Default)]
+struct ResearchTrend(Vec<f32>);
+
+/// Longest research-trend history kept; `render_sparkline` downsamples to the texture width.
+const RESEARCH_TREND_CAP: usize = 512;
 
 /// Root of the correlation-chart panel (shown/hidden by the Graphs toggle).
 #[derive(Component)]
@@ -437,6 +451,22 @@ struct TechEdge {
     from: u64,
     to: u64,
 }
+
+/// The "Research" sidebar button, the research panel root, and its live sub-parts: the
+/// activity headline, the per-good study-demand bar fills (one per item) and their captions,
+/// and the body that lists undiscovered ("coming up") catalog techs.
+#[derive(Component)]
+struct ResearchButton;
+#[derive(Component)]
+struct ResearchPanel;
+#[derive(Component)]
+struct ResearchActivityText;
+#[derive(Component)]
+struct ResearchDemandBar(usize);
+#[derive(Component)]
+struct ResearchDemandLabel(usize);
+#[derive(Component)]
+struct ResearchUndiscoveredBody;
 
 /// The embedded UI font handle, kept as a resource so runtime-rebuilt UI (the tech panel) can
 /// spawn text without re-loading it.
@@ -608,7 +638,12 @@ fn main() {
                     sidebar_controls,
                     tech_controls,
                     update_tech_panel,
-                    (position_tech_edges, hide_loading_screen),
+                    (
+                        position_tech_edges,
+                        research_controls,
+                        update_research_panel,
+                        hide_loading_screen,
+                    ),
                 ),
             )
                 .after(SimDriver),
@@ -707,8 +742,10 @@ fn setup(
             .map(|_| images.add(graph::blank_image(SPARK_W, SPARK_H)))
             .collect(),
         wealth: images.add(graph::blank_image(OVERLAY_W, OVERLAY_H)),
+        research: images.add(graph::blank_image(OVERLAY_W, OVERLAY_H)),
     };
     commands.insert_resource(graph_assets.clone());
+    commands.insert_resource(ResearchTrend::default());
 
     // Centre the map on the origin. `fit_camera_to_screen` does the real framing
     // once the window size is known; this is just a sane portrait fallback for the
@@ -1231,6 +1268,7 @@ fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets, 
     // column renders on top of it and stays tappable while the panel is open.
     spawn_graphs_panel(commands, font, graphs);
     spawn_tech_panel(commands, font);
+    spawn_research_panel(commands, font, graphs);
 
     // Transport bar, pinned top-right (absolute so it floats over the panels): a row of
     // [<<] [Play/Pause] [>>] with the ticks/s readout. Touch-target-sized buttons.
@@ -1365,6 +1403,7 @@ fn spawn_ui(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets, 
                 spawn_menu_button(body, font, "Prices", PricesButton);
                 spawn_menu_button(body, font, "Wealth", WealthButton);
                 spawn_menu_button(body, font, "Tech", TechButton);
+                spawn_menu_button(body, font, "Research", ResearchButton);
             });
         });
 }
@@ -1787,6 +1826,230 @@ fn position_tech_edges(
     }
 }
 
+/// Width of a study-demand bar's track (the full-scale extent of the longest bar), in px.
+const RESEARCH_BAR_W: f32 = 240.0;
+
+/// The (hidden) full-screen research panel: an activity headline, a research-rate trend chart,
+/// a fixed row of per-good study-demand bars (filled live by `update_research_panel`), and a
+/// body listing the undiscovered "coming up" catalog techs.
+fn spawn_research_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) {
+    let subhead = |p: &mut bevy::ecs::hierarchy::ChildSpawnerCommands, text: &str| {
+        p.spawn((
+            Text::new(text.to_string()),
+            TextFont { font: font.clone(), font_size: 14.0, ..default() },
+            TextColor(Color::srgb(0.94, 0.84, 0.52)),
+        ));
+    };
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(8.0),
+                right: Val::Px(8.0),
+                top: Val::Px(8.0),
+                bottom: Val::Px(8.0),
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::all(Val::Px(10.0)),
+                row_gap: Val::Px(8.0),
+                overflow: Overflow::scroll_y(),
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.05, 0.06, 0.08, 0.97)),
+            ResearchPanel,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Text::new("Research — what noots are studying (tap Research to close)"),
+                TextFont { font: font.clone(), font_size: 16.0, ..default() },
+                TextColor(Color::srgb(0.94, 0.84, 0.52)),
+            ));
+            p.spawn((
+                Text::new("…"),
+                TextFont { font: font.clone(), font_size: 13.0, ..default() },
+                TextColor(Color::srgb(0.78, 0.84, 0.92)),
+                ResearchActivityText,
+            ));
+            subhead(p, "Research rate over time (effort/sec)");
+            p.spawn((
+                Node {
+                    width: Val::Px(OVERLAY_W as f32),
+                    height: Val::Px(OVERLAY_H as f32 * 0.5),
+                    ..default()
+                },
+                ImageNode::new(graphs.research.clone()),
+            ));
+            subhead(p, "Study demand by good (cumulative effort)");
+            // One fixed row per item: caption + a bar track holding a fill node whose width
+            // `update_research_panel` sets to the good's share of the busiest good's demand.
+            for item in 0..goods::N_ITEMS {
+                p.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(8.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn((
+                        Text::new(""),
+                        TextFont { font: font.clone(), font_size: 11.0, ..default() },
+                        TextColor(Color::srgb(0.82, 0.86, 0.92)),
+                        Node { width: Val::Px(150.0), ..default() },
+                        ResearchDemandLabel(item),
+                    ));
+                    row.spawn((
+                        Node {
+                            width: Val::Px(RESEARCH_BAR_W),
+                            height: Val::Px(12.0),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.07)),
+                    ))
+                    .with_children(|track| {
+                        track.spawn((
+                            Node { width: Val::Px(0.0), height: Val::Percent(100.0), ..default() },
+                            BackgroundColor(Color::srgb(0.4, 0.6, 0.85)),
+                            ResearchDemandBar(item),
+                        ));
+                    });
+                });
+            }
+            subhead(p, "Coming up — undiscovered techs the demand is unlocking");
+            p.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(6.0),
+                    ..default()
+                },
+                ResearchUndiscoveredBody,
+            ));
+        });
+}
+
+/// Show/hide the research panel from the "Research" menu button.
+fn research_controls(
+    button: Query<&Interaction, (Changed<Interaction>, With<ResearchButton>)>,
+    mut overlays: ResMut<Overlays>,
+    mut panel: Query<&mut Node, With<ResearchPanel>>,
+) {
+    if button.iter().any(|i| *i == Interaction::Pressed) {
+        overlays.research = !overlays.research;
+        if let Ok(mut node) = panel.single_mut() {
+            node.display = if overlays.research { Display::Flex } else { Display::None };
+        }
+    }
+}
+
+/// While the research panel is open: refresh the activity headline, re-rasterize the trend
+/// sparkline, set each good's demand-bar width, and (on change) rebuild the undiscovered-tech
+/// list. Bars/headline update every frame (cheap, modal); the tech list only on a signature
+/// change.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn update_research_panel(
+    mut commands: Commands,
+    overlays: Res<Overlays>,
+    sim: Res<Sim>,
+    stats: Res<EconStats>,
+    trend: Res<ResearchTrend>,
+    assets: Res<GraphAssets>,
+    mut images: ResMut<Assets<Image>>,
+    ui_font: Res<UiFont>,
+    actions: Query<&Action>,
+    mut activity: Query<&mut Text, With<ResearchActivityText>>,
+    mut bars: Query<(&ResearchDemandBar, &mut Node, &mut BackgroundColor), Without<ResearchDemandLabel>>,
+    mut labels: Query<(&ResearchDemandLabel, &mut Text), Without<ResearchActivityText>>,
+    body: Query<Entity, With<ResearchUndiscoveredBody>>,
+    children: Query<&Children>,
+    mut last_sig: Local<usize>,
+) {
+    if !overlays.research {
+        *last_sig = usize::MAX; // force a rebuild next open
+        return;
+    }
+    let world = &sim.0;
+
+    // Headline: cumulative effort, current rate, and how many noots are studying right now.
+    let researching = actions.iter().filter(|a| matches!(a, Action::Research)).count();
+    if let Ok(mut text) = activity.single_mut() {
+        text.0 = format!(
+            "total effort {:.0} · rate {:.1}/s · {researching} researching now · {} of {} techs discovered",
+            stats.research_total,
+            stats.research_rate,
+            world.discovered.len(),
+            world.tech_catalog.len(),
+        );
+    }
+
+    // Trend chart.
+    if let Some(img) = images.get_mut(&assets.research) {
+        graph::render_sparkline(img, &trend.0, [120, 200, 230]);
+    }
+
+    // Per-good demand bars, scaled to the busiest good so the tallest bar fills the track.
+    let max_demand = (0..goods::N_ITEMS)
+        .map(|i| stats.research_demand[i])
+        .fold(0.0f64, f64::max)
+        .max(1e-9);
+    for (bar, mut node, mut bg) in &mut bars {
+        let frac = (stats.research_demand[bar.0] / max_demand) as f32;
+        node.width = Val::Px(RESEARCH_BAR_W * frac.clamp(0.0, 1.0));
+        // Fill colour follows the good's role (green staple / gold luxury / tan intermediate),
+        // so the bars double as a role legend.
+        let [r, g, b] = role_color(world.goods.role_of(bar.0));
+        bg.0 = Color::srgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    }
+    for (lbl, mut text) in &mut labels {
+        let slot = lbl.0 / 2;
+        let name = match goods::form_of(lbl.0) {
+            GoodForm::Raw => elements::element(world.chosen[slot].id).name,
+            GoodForm::Refined => elements::element(world.chosen[slot].id).refined,
+        };
+        text.0 = format!("{name}  {:.0}", stats.research_demand[lbl.0]);
+    }
+
+    // Undiscovered-tech list — rebuild only when the catalog/discovered set changes.
+    let sig = world
+        .tech_catalog
+        .len()
+        .wrapping_mul(100_003)
+        .wrapping_add(world.discovered.len());
+    if sig == *last_sig {
+        return;
+    }
+    *last_sig = sig;
+    let Ok(body_e) = body.single() else { return };
+    if let Ok(ch) = children.get(body_e) {
+        for c in ch.iter() {
+            commands.entity(c).despawn();
+        }
+    }
+    let font = ui_font.0.clone();
+    let catalog = world.tech_catalog.clone();
+    let undiscovered: Vec<&econ_sim::tech::Tech> =
+        catalog.iter().filter(|t| !world.is_discovered(t.id)).collect();
+    commands.entity(body_e).with_children(|b| {
+        if undiscovered.is_empty() {
+            b.spawn((
+                Text::new(
+                    "All known techs discovered. New techs grow on the server over time — keep \
+                     researching to be first to unlock them.",
+                ),
+                TextFont { font: font.clone(), font_size: 12.0, ..default() },
+                TextColor(Color::srgb(0.6, 0.65, 0.72)),
+            ));
+            return;
+        }
+        for t in undiscovered {
+            let recipe = t.recipe_label(&catalog);
+            b.spawn((
+                Text::new(format!("T{} {}  —  needs: {recipe}", t.tier, t.name)),
+                TextFont { font: font.clone(), font_size: 12.0, ..default() },
+                TextColor(Color::srgb(0.74, 0.80, 0.88)),
+            ));
+        }
+    });
+}
+
 fn spawn_graphs_panel(commands: &mut Commands, font: &Handle<Font>, graphs: &GraphAssets) {
     // --- Top sparkline strip (always docked at the top, collapsible) ---------
     // Spans the width but leaves the right button column clear; the collapse toggle
@@ -2117,6 +2380,7 @@ fn sample_stats(
     noots: Query<(&Wallet, &Hunger, &Claim, &NootMeta, &TilePos)>,
     mut hist: ResMut<StatHistory>,
     mut phist: ResMut<PriceHistory>,
+    mut rtrend: ResMut<ResearchTrend>,
     mut timer: Local<f32>,
     mut prev_trades: Local<u64>,
 ) {
@@ -2174,6 +2438,11 @@ fn sample_stats(
 
     hist.0.push(s);
     phist.0.push(stats.last_sale_price);
+
+    rtrend.0.push(stats.research_rate);
+    if rtrend.0.len() > RESEARCH_TREND_CAP {
+        rtrend.0.remove(0);
+    }
 }
 
 /// Re-rasterize the chart textures and refresh the per-stat captions / selection tints
@@ -2635,9 +2904,11 @@ fn pick_selection(
 
     // A click/tap on the top-right controls (the wide transport bar, the always-visible Menu
     // toggle, or — when open — the sidebar column) must not be read as an empty map hit (which
-    // would clear the selection). The tech panel, when open, covers the screen, so swallow all.
+    // would clear the selection). The tech/research panels, when open, cover the screen, so
+    // swallow all taps.
     let over_buttons = |p: Vec2| {
         overlays.tech
+            || overlays.research
             || window.is_some_and(|w| {
                 let right = w.width() - PAUSE_BTN_MARGIN;
                 let bar = p.x >= right - XPORT_BAR_W

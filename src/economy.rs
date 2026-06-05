@@ -45,6 +45,11 @@ const DEATH_PENALTY: f32 = 2.0;
 /// real payoff — discovering/constructing tech — is still a later phase (see plans/035 and
 /// INTENDED_FEATURES). Kept tiny so it never out-competes feeding/earning; tuned in headless.
 const RESEARCH_BONUS: f32 = 0.03;
+/// One-time reward to the noot whose Research action *discovers* a new tech world-wide — a
+/// direct pull toward discovery (the flat `RESEARCH_BONUS` only rewards the act of studying).
+/// Non-farmable: a tech can be discovered once, so this can be large without being exploitable.
+/// Tuned in headless to sharpen discovery without out-competing feeding.
+const DISCOVERY_BONUS: f32 = 1.5;
 /// A noot must be carrying at least this many non-junk units for Research to be a legal
 /// option — there must be something in hand worth studying.
 const RESEARCH_MIN_HELD: f32 = 1.0;
@@ -1408,6 +1413,11 @@ pub fn policy_step(
                     if mem.last_act == policy::A_RESEARCH {
                         r += RESEARCH_BONUS;
                     }
+                    // A Research option that actually unlocked a tech earns the big one-time
+                    // discovery bonus (set by `discover`), reinforcing the path to it.
+                    if mem.discovered {
+                        r += DISCOVERY_BONUS;
+                    }
                     (r, false)
                 };
                 trainer.record(Transition {
@@ -1422,6 +1432,7 @@ pub fn policy_step(
                 });
             }
             mem.died = false;
+            mem.discovered = false;
 
             // Pick the next option: masked softmax, or an ε-chance uniform random option
             // (the per-noot exploration temperament). Uniform ε samples each valid option
@@ -1829,12 +1840,12 @@ pub fn research(
 pub fn discover(
     mut sim: ResMut<Sim>,
     mut stats: ResMut<EconStats>,
-    q: Query<(&Action, &Inventory)>,
+    mut q: Query<(&Action, &Inventory, &mut PolicyMemory)>,
 ) {
     let mut newly: Vec<u64> = Vec::new();
     {
         let world = &sim.0;
-        for (action, inv) in &q {
+        for (action, inv, mut mem) in &mut q {
             if *action != Action::Research {
                 continue;
             }
@@ -1844,6 +1855,9 @@ pub fn discover(
                 }
                 if holds_inputs(world, inv, t) {
                     newly.push(t.id);
+                    // Credit this noot so `policy_step` adds the discovery bonus when its
+                    // Research option closes (the first holder of a tech's inputs wins it).
+                    mem.discovered = true;
                 }
             }
         }
